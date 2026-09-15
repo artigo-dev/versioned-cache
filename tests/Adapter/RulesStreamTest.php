@@ -157,7 +157,16 @@ final class RulesStreamTest extends TestCase
         $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0);
         $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream');
 
-        $elsewhere->invalidateTags(['earlier']);
+        // The stream is opened by hand, on an id from 1970, so the item stamps
+        // on THAT rather than on the clock. Ids are milliseconds: a host quick
+        // enough to write the item, invalidate, drop the stream and rebuild it
+        // inside one of them reopens on the very id the item carries, and an
+        // opening rule that is not NEWER than the stamp says nothing was lost
+        // - correctly, since an item stamped on the opening rule of a stream
+        // that still holds it is the ordinary case. Sleeping to let the clock
+        // move is a bet on the runner; this is arithmetic. The fields are the
+        // shape the adapter's own XADD writes, and `first` opens the stream.
+        $this->other->xAdd('stream:@rules', '1-0', ['t' => 'seed', 'first' => '1']);
 
         $item = $pool->getItem('x');
         $item->set('v');
@@ -167,14 +176,9 @@ final class RulesStreamTest extends TestCase
         $elsewhere->invalidateTags(['t']);
         $this->other->del('stream:@rules');
 
-        // a reborn stream takes its ids from the server clock, so a host fast
-        // enough to run all of this inside one millisecond opens it on the id
-        // the item already carries - and an id that is not newer than the
-        // stamp says nothing was lost. Let the clock move first.
-        usleep(2_000);
-
         // the next invalidation, of anything at all, opens a new stream: the
-        // head is fresh again, and the rule for "t" is nowhere in it
+        // head is fresh again - at the server clock, decades past the stamp -
+        // and the rule for "t" is nowhere in it
         $elsewhere->invalidateTags(['unrelated']);
 
         self::assertFalse($pool->getItem('x')->isHit(), 'the stream opened after the item was written: what it lost may have invalidated the item');
