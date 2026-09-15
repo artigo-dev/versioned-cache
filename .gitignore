@@ -1,0 +1,12 @@
+/vendor/
+/composer.lock
+/.php-cs-fixer.cache
+/.phpunit.cache/
+/phpunit.xml
+/phpstan.neon
+/.idea/
+/.vscode/
+/docs/src/fonts/
+
+# internal planning notes, never published
+/docs/plans/

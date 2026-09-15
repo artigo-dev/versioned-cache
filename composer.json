@@ -1,0 +1,64 @@
+{
+    "name": "artigo/versioned-cache",
+    "description": "Tag invalidation that never gets slower: a tag-aware symfony/cache adapter for Redis 8.",
+    "keywords": [
+        "cache",
+        "redis",
+        "symfony",
+        "cache-invalidation",
+        "cache-stampede",
+        "thundering-herd",
+        "psr-6"
+    ],
+    "homepage": "https://github.com/artigo-dev/versioned-cache",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Marcin Gil",
+            "homepage": "https://github.com/marcing"
+        }
+    ],
+    "require": {
+        "php": ">=8.2",
+        "ext-redis": "*",
+        "psr/log": "^1.1|^2|^3",
+        "symfony/cache": "^6.4|^7.0|^8.0",
+        "symfony/cache-contracts": "^3.1"
+    },
+    "require-dev": {
+        "artigo/cache-stampede": "^1.0",
+        "cache/integration-tests": "^1.0.3",
+        "friendsofphp/php-cs-fixer": "^3.64",
+        "phpstan/phpstan": "^2.0",
+        "phpunit/phpunit": "^10.5|^11.0",
+        "psr/simple-cache": "^3.0"
+    },
+    "suggest": {
+        "artigo/cache-stampede": "Stampede protection that spans a fleet: Symfony's own guards one machine",
+        "ext-relay": "To use Relay instead of ext-redis, answering reads from a replica in the process"
+    },
+    "autoload": {
+        "psr-4": {
+            "Artigo\\Cache\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Artigo\\Cache\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "preferred-install": {
+            "symfony/cache": "source",
+            "*": "dist"
+        },
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "extra": {
+        "branch-alias": {
+            "dev-main": "0.1.x-dev"
+        }
+    }
+}

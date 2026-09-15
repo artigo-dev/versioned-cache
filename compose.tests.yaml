@@ -1,0 +1,106 @@
+# The environments the production-readiness harness needs, one profile per
+# hazard. Nothing here is built: they are stock images with flags.
+#
+#   docker compose -f compose.tests.yaml --profile lru-allkeys up -d
+#   REDIS_DSN=redis://127.0.0.1:6381 vendor/bin/phpunit --group eviction
+#
+# Ports are fixed per profile so several can run at once, and so a test can
+# name the one it means. See docs/plans/production-readiness-harness.md.
+
+x-evict: &evict
+    image: redis:8-alpine
+    # small enough that a few thousand items reach the ceiling in seconds
+    healthcheck:
+        test: ["CMD", "redis-cli", "ping"]
+        interval: 1s
+        timeout: 3s
+        retries: 30
+
+services:
+    # today's suite, unchanged
+    redis:
+        <<: *evict
+        profiles: ["baseline"]
+        command: redis-server --maxmemory-policy volatile-ttl --save ""
+        ports: ["6390:6379"]
+
+    # the floor: HSETEX is 8.0
+    redis80:
+        <<: *evict
+        image: redis:8.0-alpine
+        profiles: ["redis80"]
+        command: redis-server --maxmemory-policy volatile-ttl --save ""
+        ports: ["6391:6379"]
+
+    # the policy the README claims is safe here and Symfony rejects
+    redis-allkeys-lru:
+        <<: *evict
+        profiles: ["lru-allkeys", "eviction"]
+        command: redis-server --maxmemory 32mb --maxmemory-policy allkeys-lru --save ""
+        ports: ["6392:6379"]
+
+    # the policy we expect to recommend instead
+    redis-volatile-lru:
+        <<: *evict
+        profiles: ["lru-volatile", "eviction"]
+        command: redis-server --maxmemory 32mb --maxmemory-policy volatile-lru --save ""
+        ports: ["6393:6379"]
+
+    # the adversarial case: no hot-key argument survives random
+    redis-allkeys-random:
+        <<: *evict
+        profiles: ["random", "eviction"]
+        command: redis-server --maxmemory 32mb --maxmemory-policy allkeys-random --save ""
+        ports: ["6394:6379"]
+
+    # a full memory ceiling with no way out: writes must degrade, never corrupt
+    redis-noeviction:
+        <<: *evict
+        profiles: ["noeviction", "eviction"]
+        command: redis-server --maxmemory 32mb --maxmemory-policy noeviction --save ""
+        ports: ["6395:6379"]
+
+    # latency, drops and timeouts against a real server rather than a double
+    toxiproxy:
+        image: ghcr.io/shopify/toxiproxy:2.11.0
+        profiles: ["flaky"]
+        ports: ["8474:8474", "6397:6397"]
+        depends_on:
+            redis-behind-proxy:
+                condition: service_healthy
+
+    redis-behind-proxy:
+        <<: *evict
+        profiles: ["flaky"]
+        command: redis-server --maxmemory-policy volatile-ttl --save ""
+
+    # kill the primary mid-write and watch what the adapter does
+    redis-primary:
+        <<: *evict
+        profiles: ["failover"]
+        command: redis-server --maxmemory-policy volatile-ttl --save ""
+        ports: ["6396:6379"]
+
+    redis-replica:
+        <<: *evict
+        profiles: ["failover"]
+        command: redis-server --replicaof redis-primary 6379 --save ""
+        depends_on:
+            redis-primary:
+                condition: service_healthy
+
+    sentinel:
+        image: redis:8-alpine
+        profiles: ["failover"]
+        ports: ["26390:26379"]
+        depends_on:
+            redis-replica:
+                condition: service_started
+        command: >
+            sh -c 'printf "%s\n"
+            "port 26379"
+            "sentinel resolve-hostnames yes"
+            "sentinel monitor mymaster redis-primary 6379 1"
+            "sentinel down-after-milliseconds mymaster 1000"
+            "sentinel failover-timeout mymaster 5000"
+            > /tmp/sentinel.conf && redis-sentinel /tmp/sentinel.conf'

@@ -1,0 +1,9 @@
+parameters:
+    level: max
+    paths:
+        - src
+        - tests
+
+    # The benchmarks are procedural scripts whose input is a decoded JSON
+    # payload, so almost every value starts out mixed. They are held to the
+    # coding standard but not to level max; the library and its tests are.

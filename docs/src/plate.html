@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>artigo versioned-cache — README header</title>
+<style>
+@font-face { font-family: 'Rajdhani'; font-weight: 400; src: url('fonts/rajdhani-400.woff2') format('woff2'); }
+@font-face { font-family: 'Rajdhani'; font-weight: 600; src: url('fonts/rajdhani-600.woff2') format('woff2'); }
+@font-face { font-family: 'Rajdhani'; font-weight: 700; src: url('fonts/rajdhani-700.woff2') format('woff2'); }
+
+:root
+{
+	--bg: #0a0a12;
+	--border: #26263a;
+	--mint: #3ddc97;
+	--muted: #8b8ba7;
+	--text: #e8e8f0;
+	--mono: Consolas, "Courier New", monospace;
+	--display: 'Rajdhani', 'Segoe UI', sans-serif;
+}
+
+*
+{
+	box-sizing: border-box;
+}
+
+body
+{
+	margin: 0;
+	background: #000;
+}
+
+.plate
+{
+	position: relative;
+	width: 940px;
+	height: 250px;
+	overflow: hidden;
+	background: var(--bg);
+	border: 1px solid var(--border);
+	font-family: var(--display);
+	color: var(--text);
+}
+
+.plate::before
+{
+	content: '';
+	position: absolute;
+	inset: 0;
+	background-image:
+		linear-gradient(rgba(61, 220, 151, 0.05) 1px, transparent 1px),
+		linear-gradient(90deg, rgba(61, 220, 151, 0.05) 1px, transparent 1px);
+	background-size: 44px 44px, 44px 44px;
+}
+
+.plate::after
+{
+	content: '';
+	position: absolute;
+	inset: 0;
+	background:
+		radial-gradient(120% 120% at 80% 40%, rgba(61, 220, 151, 0.10), transparent 62%),
+		radial-gradient(80% 90% at 6% 10%, rgba(232, 232, 240, 0.04), transparent 60%),
+		linear-gradient(90deg, rgba(10, 10, 18, 0.9) 0%, rgba(10, 10, 18, 0.5) 60%, rgba(10, 10, 18, 0.2) 100%);
+}
+
+.ink
+{
+	position: relative;
+	z-index: 2;
+	padding: 26px 40px;
+}
+
+.eyebrow
+{
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: .42em;
+	color: var(--muted);
+	text-transform: uppercase;
+}
+
+.eyebrow .on
+{
+	color: var(--mint);
+	opacity: .85;
+}
+
+.word
+{
+	margin-top: 10px;
+	font-size: 46px;
+	font-weight: 700;
+	letter-spacing: .14em;
+	line-height: 1;
+}
+
+.word .a
+{
+	color: var(--text);
+	text-shadow: 0 0 22px rgba(232, 232, 240, 0.25);
+}
+
+.word .b
+{
+	color: var(--mint);
+	text-shadow: 0 0 22px rgba(61, 220, 151, 0.45);
+}
+
+.claim
+{
+	margin-top: 14px;
+	font-size: 26px;
+	font-weight: 600;
+	line-height: 1.15;
+	max-width: 600px;
+}
+
+.claim .g
+{
+	color: var(--mint);
+}
+
+.rule
+{
+	margin-top: 14px;
+	width: 470px;
+	height: 1px;
+	background: linear-gradient(90deg, var(--mint), rgba(38, 38, 58, 0.9) 30%, rgba(38, 38, 58, 0));
+}
+
+.sub
+{
+	margin-top: 11px;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	letter-spacing: .09em;
+	color: var(--muted);
+}
+
+.stamp
+{
+	position: absolute;
+	z-index: 2;
+	right: 44px;
+	top: 50%;
+	transform: translateY(-50%);
+	text-align: center;
+}
+
+.stamp .v
+{
+	font-size: 58px;
+	font-weight: 700;
+	letter-spacing: .04em;
+	line-height: 1;
+	color: var(--mint);
+	text-shadow: 0 0 26px rgba(61, 220, 151, 0.35);
+}
+
+.stamp .l
+{
+	margin-top: 6px;
+	font-family: var(--mono);
+	font-size: 10px;
+	letter-spacing: .24em;
+	color: var(--muted);
+}
+</style>
+</head>
+<body>
+
+<div class="plate" id="header">
+	<div class="ink">
+		<div class="eyebrow">artigo <span class="on">//</span> symfony cache</div>
+		<div class="word"><span class="a">VERSIONED</span> <span class="b">CACHE</span></div>
+		<div class="claim">Tag invalidation that <span class="g">never gets slower</span>.</div>
+		<div class="rule"></div>
+		<div class="sub">tags · invalidation · redis streams · cluster · relay · psr-6</div>
+	</div>
+	<div class="stamp">
+		<div class="v">O(1)</div>
+		<div class="l">TAG INVALIDATION</div>
+	</div>
+</div>
+
+</body>
+</html>

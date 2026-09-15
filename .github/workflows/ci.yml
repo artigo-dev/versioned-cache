@@ -1,0 +1,170 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+permissions:
+    contents: read
+
+jobs:
+    tests:
+        name: "PHP ${{ matrix.php }} · Symfony ${{ matrix.symfony }} · Redis ${{ matrix.redis }}"
+        runs-on: ubuntu-latest
+
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    # the oldest of everything the README claims, together
+                    - php: '8.2'
+                      symfony: '6.4.*'
+                      redis: '8.0'
+                    # the LTS in the middle
+                    - php: '8.3'
+                      symfony: '7.4.*'
+                      redis: '8'
+                    # the newest of everything
+                    - php: '8.4'
+                      symfony: '8.1.*'
+                      redis: '8'
+                    - php: '8.5'
+                      symfony: '8.1.*'
+                      redis: '8'
+                    # the oldest Redis on the newest stack: HSETEX is 8.0
+                    - php: '8.4'
+                      symfony: '8.1.*'
+                      redis: '8.0'
+
+        services:
+            redis:
+                image: "redis:${{ matrix.redis }}-alpine"
+                ports:
+                    - 6379:6379
+                options: >-
+                    --health-cmd "redis-cli ping"
+                    --health-interval 5s
+                    --health-timeout 3s
+                    --health-retries 10
+
+        steps:
+            - uses: actions/checkout@v5
+
+            - uses: shivammathur/setup-php@v2
+              with:
+                  php-version: "${{ matrix.php }}"
+                  extensions: redis
+                  coverage: none
+                  # Symfony validates cache keys inside \assert(), so with
+                  # assertions compiled out a quarter of its own conformance
+                  # suite silently stops testing anything. This is how Symfony
+                  # runs that suite itself.
+                  ini-values: zend.assertions=1
+
+            # artigo/cache-stampede is a dev requirement powering one test,
+            # which checks that the two packages compose and skips itself when
+            # the class is absent. Every release of it published so far asks
+            # for PHP 8.4, so the older legs install without it rather than
+            # wait on somebody else's release: this adapter does not depend on
+            # that package, and its CI should not either.
+            - if: matrix.php == '8.2' || matrix.php == '8.3'
+              run: composer remove --dev artigo/cache-stampede --no-update
+
+            # resolve against the Symfony line of this leg rather than the
+            # lock file, which pins the newest
+            - uses: ramsey/composer-install@v4
+              with:
+                  dependency-versions: highest
+                  composer-options: "--with=symfony/cache:${{ matrix.symfony }}"
+
+            - run: vendor/bin/phpunit -c phpunit.dist.xml
+              env:
+                  REDIS_DSN: redis://127.0.0.1:6379
+
+    relay:
+        name: Relay client
+        runs-on: ubuntu-latest
+
+        services:
+            redis:
+                image: redis:8-alpine
+                ports:
+                    - 6379:6379
+                options: >-
+                    --health-cmd "redis-cli ping"
+                    --health-interval 5s
+                    --health-timeout 3s
+                    --health-retries 10
+
+        steps:
+            - uses: actions/checkout@v5
+
+            - uses: shivammathur/setup-php@v2
+              with:
+                  php-version: '8.4'
+                  extensions: redis, relay
+                  coverage: none
+                  ini-values: zend.assertions=1
+
+            - uses: ramsey/composer-install@v4
+
+            # the same suite, driven through Relay instead of ext-redis: the
+            # adapter should not be able to tell which one it is holding
+            - run: vendor/bin/phpunit -c phpunit.dist.xml
+              env:
+                  REDIS_DSN: redis://127.0.0.1:6379
+                  REDIS_CLIENT: relay
+
+    cluster:
+        name: Redis Cluster
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v5
+
+            - name: Start a three master cluster
+              run: |
+                  for port in 7000 7001 7002; do
+                    docker run -d --name "redis-$port" --net host redis:8-alpine redis-server --port "$port" --cluster-enabled yes --cluster-config-file "nodes-$port.conf" --save ''
+                  done
+                  for i in $(seq 1 30); do
+                    docker run --rm --net host redis:8-alpine redis-cli -p 7000 ping && break
+                    sleep 1
+                  done
+                  docker run --rm --net host redis:8-alpine redis-cli --cluster create 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 --cluster-yes
+                  docker run --rm --net host redis:8-alpine redis-cli -p 7000 cluster info | head -1
+
+            - uses: shivammathur/setup-php@v2
+              with:
+                  php-version: '8.4'
+                  extensions: redis
+                  coverage: none
+                  ini-values: zend.assertions=1
+
+            - uses: ramsey/composer-install@v4
+
+            # the MemoLock tests want a single node and skip themselves here;
+            # what this job is for is the adapter against three masters
+            - run: vendor/bin/phpunit -c phpunit.dist.xml --filter VersionedRedisTagAwareAdapterTest
+              env:
+                  REDIS_DSN: "redis:?host[127.0.0.1:7000]&host[127.0.0.1:7001]&host[127.0.0.1:7002]&redis_cluster=1"
+
+    static:
+        name: Coding standards and static analysis
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v5
+
+            - uses: shivammathur/setup-php@v2
+              with:
+                  php-version: '8.4'
+                  extensions: redis
+                  coverage: none
+
+            - uses: ramsey/composer-install@v4
+
+            - run: vendor/bin/php-cs-fixer check --diff
+
+            - run: vendor/bin/phpstan analyse -c phpstan.dist.neon --no-progress

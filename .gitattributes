@@ -1,0 +1,12 @@
+* text=auto
+
+# Dev-only configuration is not worth shipping in a release archive.
+/.gitattributes    export-ignore
+/.github           export-ignore
+/.php-cs-fixer.dist.php export-ignore
+/phpstan.dist.neon export-ignore
+
+# tests/ and benchmarks/ deliberately stay: the numbers in the README are
+# meant to be re-run by whoever installed the package, and symfony/cache
+# export-ignoring its own Tests/ is precisely what made its conformance suite
+# awkward to reach from here.

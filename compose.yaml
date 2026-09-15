@@ -1,0 +1,15 @@
+# Redis for the test suite and the benchmarks. Nothing else is needed:
+#   docker compose up -d && vendor/bin/phpunit
+#
+# volatile-ttl matches how these caches are actually run in production, and it
+# is one of the policies RedisTagAwareAdapter tolerates - it accepts noeviction
+# and volatile-*, and throws on every write under allkeys-*. This adapter wants
+# the same: its rules stream carries no TTL so that volatile-* never evicts it.
+# Under allkeys-* it still runs, and a lost stream degrades to misses rather
+# than stale hits - a recompute of the pool, not a policy to pick.
+services:
+    redis:
+        image: redis:8-alpine
+        command: redis-server --maxmemory-policy volatile-ttl --save ""
+        ports:
+            - "6379:6379"
