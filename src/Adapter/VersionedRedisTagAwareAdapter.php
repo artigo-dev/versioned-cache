@@ -103,11 +103,11 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter
      *
      * The stream is the only record that an invalidation ever happened, so it
      * carries no TTL: under a volatile-* policy that keeps it out of the
-     * eviction pool altogether, where a TTL would have made it a candidate
-     * like any item. PERSIST also strips the TTL from a stream written by an
-     * earlier version of this adapter. Items cannot outlive the rules anyway:
-     * their TTL is capped to the retention, and the trim above drops only
-     * what nothing alive can match.
+     * eviction pool altogether, where a TTL would make it a candidate like any
+     * item. The PERSIST is unconditional, so the stream carries no expiry
+     * however it came to exist. Items cannot outlive the rules anyway: their
+     * TTL is capped to the retention, and the trim above drops only what
+     * nothing alive can match.
      *
      * The one script in this adapter, because the trim needs the id XADD just
      * generated. Sent as a body: an invalidation is rare, and a body needs no
