@@ -38,10 +38,10 @@ declare(strict_types=1);
  * so nothing else may be talking to that Redis while it runs.
  */
 
+use Artigo\Cache\Adapter\SharedRules;
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
 use Artigo\Cache\Benchmarks\Meter;
 use Artigo\Cache\Benchmarks\Result;
-use Symfony\Component\Cache\Adapter\ApcuAdapter;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
 use Symfony\Component\Cache\Adapter\RedisTagAwareAdapter;
 use Symfony\Component\Cache\Adapter\TagAwareAdapter;
@@ -113,7 +113,7 @@ if (str_starts_with($eviction, 'allkeys') && in_array('symfony', array_map(trim(
     fwrite(\STDERR, '! RedisTagAwareAdapter refuses to write under an allkeys-* eviction policy,'.\PHP_EOL.'! so it cannot be measured here. This adapter is happy either way - which is'.\PHP_EOL.'! one of the differences, not a flaw in the setup.'.\PHP_EOL);
 }
 
-if (!ApcuAdapter::isSupported() && in_array('versioned', array_map(trim(...), $stores), true)) {
+if (!SharedRules::apcuEnabled() && in_array('versioned', array_map(trim(...), $stores), true)) {
     fwrite(\STDERR, '! APCu is not enabled for this SAPI (apc.enable_cli), so the versioned pools share'.\PHP_EOL.'! no rule set here: a fresh pool loads the stream, and the two FPM rows will read alike.'.\PHP_EOL);
 }
 

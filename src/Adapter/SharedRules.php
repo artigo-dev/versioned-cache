@@ -86,13 +86,30 @@ final class SharedRules
             return null;
         }
 
-        if (null === $pool && !ApcuAdapter::isSupported()) {
+        if (null === $pool && !self::apcuEnabled()) {
             return null;
         }
 
         $key = self::keyFor($rulesKey, self::identityOf($redis));
 
         return new self($pool, $key, sys_get_temp_dir().\DIRECTORY_SEPARATOR.'artigo-versioned-'.$key.'.lock');
+    }
+
+    /**
+     * Whether APCu can be spoken to from this process: the extension is
+     * loaded and enabled, and - under the CLI, where it is off unless
+     * apc.enable_cli says otherwise - enabled for the CLI too. That last
+     * question ApcuAdapter::isSupported() does not ask, and a medium that
+     * answers false to every write would leave the other processes waiting
+     * for a set that never comes.
+     */
+    public static function apcuEnabled(): bool
+    {
+        if (!ApcuAdapter::isSupported()) {
+            return false;
+        }
+
+        return !\in_array(\PHP_SAPI, ['cli', 'phpdbg'], true) || filter_var(\ini_get('apc.enable_cli'), \FILTER_VALIDATE_BOOL);
     }
 
     /**
