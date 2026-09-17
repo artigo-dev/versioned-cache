@@ -17,7 +17,6 @@ use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
 use Artigo\Cache\Tests\Connection;
 use PHPUnit\Framework\TestCase;
 use Psr\Cache\CacheItemPoolInterface;
-use Symfony\Component\Cache\Adapter\ApcuAdapter;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
 
 /**
@@ -236,7 +235,7 @@ final class SharedRulesTest extends TestCase
 
         $default = SharedRules::of(null, self::RULES_KEY, $this->plain);
 
-        if (!ApcuAdapter::isSupported()) {
+        if (!SharedRules::apcuEnabled()) {
             self::assertNull($default, 'nothing to share through without APCu');
 
             return;
