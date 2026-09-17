@@ -16,7 +16,17 @@ unlinks every member, in a single blocking Lua loop — instant for a handful of
 items, and a stall when a tag fans out to thousands, during which the
 single-threaded server is doing nothing else for anybody.
 
-This adapter keeps no such index. An invalidation appends **one rule** to a
+Symfony's other tag adapter, `TagAwareAdapter`, already invalidates in one
+command: a version key per tag, deleted by `invalidateTags()`, compared on
+read. It pays on the read side instead — the tag versions have to be fetched
+whenever they were not seen within 150 ms, and on every miss — and it keeps
+one version key per tag ever written, without a TTL. So Symfony holds two
+corners of the design space: cheap invalidation with expensive reads, and
+cheap reads with invalidation that grows with the match count.
+
+This adapter is the third corner — `TagAwareAdapter`'s invalidation cost with
+`RedisTagAwareAdapter`'s read cost, and storage bounded by one trimmed stream.
+It keeps no index at all. An invalidation appends **one rule** to a
 Redis stream and returns; the work of noticing is left to whoever reads next.
 Every item is written carrying the stream's last entry id — its watermark — and
 a read evaluates only the rules newer than that against the item's own tags. A
@@ -58,7 +68,7 @@ $pool->save($item);
 $pool->invalidateTags(['articles']);   // four commands, whatever matched
 ```
 
-Two settings beyond Symfony's:
+Three settings beyond Symfony's:
 
 ```php
 new VersionedRedisTagAwareAdapter(
@@ -68,6 +78,7 @@ new VersionedRedisTagAwareAdapter(
     marshaller: null,
     rulesRetentionSeconds: 2_592_000,  // 30 days; also the maximum item lifetime
     rulesCacheMs: 1_000,               // 0 for exact reads, at a round trip each
+    rulesCache: null,                  // APCu where enabled; any PSR-6 pool; false for none
 );
 ```
 
@@ -76,11 +87,21 @@ the longest an item may live: an item must never outlive the rule that made it
 stale, or it would come back from the dead once that rule is trimmed away. A
 longer TTL is capped to it, and logged once.
 
-`rulesCacheMs` is how long a process may reuse a rule set it has already loaded.
-It is the window within which an invalidation becomes visible. A refresh fetches
+`rulesCacheMs` is how long a rule set may be reused before it is refreshed. It
+is the window within which an invalidation becomes visible. A refresh fetches
 only what was appended since the last one, and a read is judged against the
 newest rule per tag it carries, so neither the refresh nor the read grows with
 the length of the log.
+
+`rulesCache` is where the workers of a server share that rule set, so that a
+fresh process — every request, under PHP-FPM — adopts it instead of loading the
+whole stream before its first hit. It is an `ApcuAdapter` by default where APCu
+is enabled, any PSR-6 pool you pass otherwise, or `false` to keep the set per
+instance. When the set turns stale, one worker is elected to refresh it (a
+non-blocking `flock()` on a file, per host, the primitive `LockRegistry` uses)
+and the others keep it for that read; on a server whose pool was just emptied,
+one worker loads the stream and the others wait for it, briefly, instead of
+loading it too.
 
 ## Symfony framework
 
@@ -114,42 +135,60 @@ framework:
                 provider: 'redis://127.0.0.1'
 ```
 
-The two settings beyond Symfony's are the fifth and sixth constructor
-arguments; add them to `arguments` to change them.
+The three settings beyond Symfony's are the fifth to seventh constructor
+arguments; add them to `arguments` to change them. The seventh takes a pool
+service for the shared rule set, `false` for none, or nothing for APCu.
 
 ## Measured, not asserted
 
-`benchmarks/bench.php` runs both adapters through the same scenarios. Wall clock
-is worth only as much as the link it was measured over, so every row also
-carries the commands Redis executed and the socket reads it took to receive
-them — neither of which moves when the network does.
+`benchmarks/bench.php` runs this adapter, Symfony's `RedisTagAwareAdapter` and
+Symfony's generic `TagAwareAdapter` (over a `RedisAdapter`) through the same
+scenarios. Wall clock is worth only as much as the link it was measured over,
+so every row carries the commands Redis executed and, where it differs, the
+socket reads it took to receive them — round trips, in all but name — neither
+of which moves when the network does.
 
 20 000 items, 18 tags each, Redis 8.8, PHP 8.5, one run on one machine:
 
-| Scenario | **`versioned`** | `RedisTagAwareAdapter` |
-|---|---|---|
-| fill | **60 061 cmds** | 102 977 cmds |
-| overwrite | 60 011 cmds | **40 000 cmds** |
-| read hit | 20 010 cmds | 20 000 cmds |
-| invalidate 1 000 matches | **4 cmds** · 0.001 s | 1 006 cmds · 0.003 s |
-| invalidate 2 000 matches | **4 cmds** · 0.000 s | 2 006 cmds · 0.003 s |
-| invalidate 20 000 matches | **4 cmds** · 0.000 s | 20 012 cmds · 0.027 s |
-| read after invalidating everything | 40 020 cmds · 19.4 s | **20 000 cmds · 9.9 s** |
-| memory reclaimed | 18.3 MB | 16.5 MB |
-| 10 000 invalidations matching nothing | **40 000 cmds** · 4.9 s | 50 000 cmds · 5.0 s |
-| read hit, 10 000 rules behind | 20 011 cmds · 10.3 s | **20 000 cmds** · 9.8 s |
+| Scenario | **`versioned`** | `RedisTagAwareAdapter` | `TagAwareAdapter` |
+|---|---|---|---|
+| fill (commands · round trips) | 60 060 · 20 798 | 102 978 · 21 349 | 61 595 · **41 059** |
+| overwrite (commands · round trips) | 60 010 · 20 748 | **40 000** · 20 852 | 46 615 · 27 679 |
+| read hit (commands) | 20 010 | 20 000 | 27 710 |
+| invalidate 1 000 matches | **4** · 0.001 s | 1 006 · 0.003 s | **1** · 0.001 s |
+| invalidate 2 000 matches | **4** · 0.000 s | 2 006 · 0.003 s | **1** · 0.000 s |
+| invalidate 20 000 matches | **4** · 0.000 s | 20 012 · 0.030 s | **1** · 0.000 s |
+| read after invalidating everything | 40 019 · 18.5 s | **20 000 · 9.1 s** | 40 000 · 20.3 s |
+| memory reclaimed | 18.3 MB | 16.6 MB | **0.0 MB** |
+| 10 000 invalidations matching nothing | 40 000 · 5.0 s | 50 000 · 4.8 s | **10 000** · 4.6 s |
+| read hit, 10 000 rules behind | 20 010 · 10.0 s | 20 000 · 9.4 s | 28 162 · 14.2 s |
+| read hit, fresh pool every 10 reads, 10 000 rules behind | 20 020 · 19.6 s | 20 000 · 9.2 s | 40 000 · 20.3 s |
+| the same, the rule set not shared | 22 000 · 68.0 s | &mdash; | &mdash; |
 
-The last two rows are the question a rule log invites: what does a long one
-cost the readers? Ten thousand invalidations land behind a fresh fill, so every
-item is older than every rule. The answer is eleven commands over twenty
-thousand reads — one refresh per second, the first carrying the ten thousand
-rules and the rest carrying nothing — because a refresh fetches only what was
-appended, and a read is judged against the newest rule per tag rather than
-against the log.
+Three of those rows are the questions a rule log invites.
+
+**What does a long log cost the readers?** Ten thousand invalidations land
+behind a fresh fill, so every item is older than every rule. Ten commands over
+twenty thousand reads — one refresh per second, the first carrying the ten
+thousand rules and the rest carrying nothing — because a refresh fetches only
+what was appended, and a read is judged against the newest rule per tag rather
+than against the log. `TagAwareAdapter` pays for the same log differently: its
+versions are per tag, so a read whose tags it has not seen within 150 ms
+fetches them again.
+
+**What does a fresh process pay?** Under PHP-FPM every request is one. The last
+two rows re-create the pool every ten reads, behind those ten thousand rules.
+Sharing the rule set through APCu, a fresh pool adopts a ten-thousand-tag set
+in about 5 ms and asks Redis for nothing; without sharing it loads the stream:
+2 000 more commands, about 30 ms per pool. `TagAwareAdapter` has no set to
+lose, but a fresh pool has no known versions either, so every read costs two
+round trips; `RedisTagAwareAdapter` holds nothing between requests and pays
+nothing for a fresh one.
 
 ```bash
 docker compose up -d
 php benchmarks/bench.php items=20000
+php benchmarks/bench.php items=20000 unique=1
 ```
 
 ![Commands to invalidate one tag, by how many items it matched](docs/invalidation.png)
@@ -157,7 +196,29 @@ php benchmarks/bench.php items=20000
 **Four commands, always.** A thousand matches or twenty thousand, the
 invalidation is one `XADD` and a trim. The eager side tracks the match count
 exactly — 1 006, 2 006, 20 012 — so the distance between them belongs to
-whoever grows.
+whoever grows. `TagAwareAdapter` needs one command, and always did: the
+difference to it is on the read side.
+
+### With a tag of its own on every item
+
+The tags applications really use include one per entity — `article-42` — which
+no other item shares and no per-tag cache can have warmed. The same run with
+one of the 18 tags being the item's own (`unique=1`):
+
+| Scenario | **`versioned`** | `RedisTagAwareAdapter` | `TagAwareAdapter` |
+|---|---|---|---|
+| fill (commands · round trips) | 60 060 · 20 798 | 119 097 · 21 390 | 81 498 · **41 162** |
+| overwrite (commands · round trips) | 60 010 · 20 753 | **40 000** · 20 838 | 60 021 · **41 123** |
+| read hit (commands · round trips) | 20 010 · 20 010 | 20 000 · 20 000 | **40 000 · 40 000** |
+| read hit, 10 000 rules behind | 20 010 · 9.8 s | 20 000 · 9.4 s | 40 000 · 19.9 s |
+| read hit, fresh pool every 10 reads | 20 018 · 17.5 s | 20 000 · 9.3 s | 40 000 · 19.4 s |
+| the same, the rule set not shared | 22 000 · 66.7 s | &mdash; | &mdash; |
+
+![Round trips for 20 000 read hits, by what an item is tagged with](docs/reads.png)
+
+Two round trips per read, hit or miss, is the cost of keeping the versions
+next to the tags rather than the rules next to the pool. The rule log's read
+side does not move between the two runs.
 
 ## What it is worse at
 
@@ -165,19 +226,23 @@ Every cache trades something, and two rows of that table are the price.
 
 - **Memory comes back lazily.** An invalidated item holds its RAM until a reader
   unlinks it or its TTL runs out, so reading a *fully* invalidated set costs
-  **2.1×** — 40 020 commands against 20 000.
+  **2×** — 40 019 commands against 20 000.
 - **The rules stream must not be evicted.** Like Symfony's tag Sets it carries
   no TTL, so that `volatile-*` and `noeviction` never touch it — run one of
   those. Under `allkeys-*` it can go; the read path then fails safe, and an item
   stamped with a rule the stream no longer remembers reads as a miss rather than
   a stale hit, at the price of recomputing the pool once.
-- **Overwriting an existing item costs half again the commands** — 60 011
+- **Overwriting an existing item costs half again the commands** — 60 010
   against 40 000 — in the same single round trip: the write is an `HSETEX` and
   a `PEXPIRE` where Symfony's is one `SETEX`, because the item's watermark has
   to be rewritten whether its tags changed or not. On a *first* fill the
   position reverses, there being no tag index to build.
 - **An invalidation becomes visible within `rulesCacheMs`**, one second by
   default. Pass `0` for exact reads, at a round trip each.
+- **The rule set has to live somewhere between requests.** Without APCu and
+  without a pool passed as `rulesCache`, every request loads the rules of the
+  whole retention window before its first hit — about a hundred bytes per rule
+  on the wire, so a month of invalidations, per request.
 - **No tag enumeration.** `getTags()` and `getIdsMatchingTags()` have no
   counterpart here; there is no index to enumerate.
 - **`rulesRetentionSeconds` is a ceiling on item lifetime**, not only a default.
@@ -192,7 +257,7 @@ Not our tests: `AdapterTestCase` and `TagAwareTestTrait`, the suite
 |---|---|
 | PSR-6 conformance, with `TagAwareTestTrait` | **154 tests**, one skip |
 | PSR-16 conformance | **212 tests**, one skip |
-| whole suite | **391 tests**, two skips |
+| whole suite | **411 tests**, two skips |
 
 Both skips are `testPrune`: Redis expires items by itself, so this pool is not
 `Pruneable` — and neither is the adapter it replaces. The rule stream trims
@@ -253,7 +318,8 @@ twelve real ones at the same cold key for that.
 
 ## Requirements
 
-PHP 8.2+ · `symfony/cache` 6.4, 7.x or 8.x · **Redis 8.0+**
+PHP 8.2+ · `symfony/cache` 6.4, 7.x or 8.x · **Redis 8.0+** · `ext-apcu`
+recommended under PHP-FPM, for the shared rule set (see `rulesCache`)
 
 Redis 8 is what makes the write path a single command: `HSETEX` sets an item's
 fields and their expiry together, so there is no script on the write path and
@@ -276,8 +342,13 @@ can re-run rather than take on trust:
 
 | script | question it answers |
 |---|---|
-| `benchmarks/bench.php` | what does invalidating a tag cost as the match count grows? |
-| `benchmarks/charts.php` | redraws the picture above from those measurements |
+| `benchmarks/bench.php` | what does invalidating a tag cost as the match count grows, what does a read cost after it, and what does a fresh process pay — against both of Symfony's tag adapters? |
+| `benchmarks/charts.php` | redraws the pictures above from those measurements |
+
+`unique=1` gives every item one tag of its own, the entity tag applications
+really use; `fresh=N` re-creates the pool every N reads in the FPM rows, the
+way a request is a fresh process; `stores=` picks from `versioned`, `symfony`
+(`RedisTagAwareAdapter`) and `tagaware` (`TagAwareAdapter` over a `RedisAdapter`).
 
 The stampede benchmark moved to
 [`artigo/cache-stampede`](https://github.com/artigo-dev/cache-stampede) with the

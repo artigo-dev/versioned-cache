@@ -10,12 +10,14 @@ declare(strict_types=1);
  */
 
 /*
- * What does a tag cost when it falls?
+ * What does a tag cost when it falls - and what does a read cost after it?
  *
- * Runs this adapter and Symfony's RedisTagAwareAdapter through the same
- * scenarios - filling, overwriting, reading, invalidating at three fan-out
- * sizes, reading again, and giving the memory back - and prints a markdown
- * table.
+ * Runs this adapter, Symfony's RedisTagAwareAdapter and Symfony's generic
+ * TagAwareAdapter (over a RedisAdapter) through the same scenarios - filling,
+ * overwriting, reading, invalidating at three fan-out sizes, reading again,
+ * giving the memory back, reading behind a long rule log, and reading from a
+ * pool re-created every few reads, the way PHP-FPM does - and prints a
+ * markdown table.
  *
  * Every row carries the command count and the number of socket reads Redis
  * did, because those do not move when the network does. The wall clock beside
@@ -25,8 +27,11 @@ declare(strict_types=1);
  *   php benchmarks/bench.php
  *   php benchmarks/bench.php items=50000 tags=20
  *   php benchmarks/bench.php stores=versioned
+ *   php benchmarks/bench.php unique=1
  *
- * Options: dsn=, items=, tags=, db=, stores=, client=relay, force=1
+ * Options: dsn=, items=, tags=, db=, stores=, client=relay, force=1,
+ *          unique=1 (one tag of its own per item, the way an entity tag is),
+ *          fresh=N (re-create the pool every N reads in the FPM rows; 10)
  *
  * Each store gets its own Redis database and must find it empty; pass force=1
  * to flush whatever is there instead. The counters this reads are server-wide,
@@ -36,8 +41,10 @@ declare(strict_types=1);
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
 use Artigo\Cache\Benchmarks\Meter;
 use Artigo\Cache\Benchmarks\Result;
+use Symfony\Component\Cache\Adapter\ApcuAdapter;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
 use Symfony\Component\Cache\Adapter\RedisTagAwareAdapter;
+use Symfony\Component\Cache\Adapter\TagAwareAdapter;
 use Symfony\Component\Cache\Adapter\TagAwareAdapterInterface;
 
 require __DIR__.'/../vendor/autoload.php';
@@ -57,7 +64,11 @@ $items = (int) ($options['items'] ?? 20000);
 $tagCount = (int) ($options['tags'] ?? 18);
 $firstDb = (int) ($options['db'] ?? 10);
 $force = (bool) ($options['force'] ?? false);
-$stores = explode(',', (string) ($options['stores'] ?? 'versioned,symfony'));
+$stores = explode(',', (string) ($options['stores'] ?? 'versioned,symfony,tagaware'));
+// unique=1 gives every item one tag of its own on top, the way an entity tag does
+$unique = (bool) ($options['unique'] ?? false);
+// fresh=N re-creates the pool every N reads in the FPM rows: a request is a fresh process
+$fresh = max(1, (int) ($options['fresh'] ?? 10));
 
 // client=relay runs both adapters through Relay instead of ext-redis, which
 // answers reads from a replica in this process rather than over the socket
@@ -102,6 +113,10 @@ if (str_starts_with($eviction, 'allkeys') && in_array('symfony', array_map(trim(
     fwrite(\STDERR, '! RedisTagAwareAdapter refuses to write under an allkeys-* eviction policy,'.\PHP_EOL.'! so it cannot be measured here. This adapter is happy either way - which is'.\PHP_EOL.'! one of the differences, not a flaw in the setup.'.\PHP_EOL);
 }
 
+if (!ApcuAdapter::isSupported() && in_array('versioned', array_map(trim(...), $stores), true)) {
+    fwrite(\STDERR, '! APCu is not enabled for this SAPI (apc.enable_cli), so the versioned pools share'.\PHP_EOL.'! no rule set here: a fresh pool loads the stream, and the two FPM rows will read alike.'.\PHP_EOL);
+}
+
 echo \PHP_EOL;
 
 $meter = new Meter($probe);
@@ -132,14 +147,19 @@ foreach ($stores as $name) {
 
     $connection->flushDb();
 
-    $pool = 'versioned' === $name
-        ? new VersionedRedisTagAwareAdapter($connection, 'bench')
-        : new RedisTagAwareAdapter($connection, 'bench');
+    // a pool as a request would build it; $shared = false keeps the versioned
+    // pool's rule set to itself, for the row that shows what sharing saves
+    $make = static fn (bool $shared = true): TagAwareAdapterInterface => match ($name) {
+        'versioned' => new VersionedRedisTagAwareAdapter($connection, 'bench', rulesCache: $shared ? null : false),
+        'symfony' => new RedisTagAwareAdapter($connection, 'bench'),
+        'tagaware' => new TagAwareAdapter(new RedisAdapter($connection, 'bench')),
+        default => throw new RuntimeException(sprintf('Unknown store "%s"; pick from versioned, symfony, tagaware.', $name)),
+    };
 
     echo sprintf('%s%s', $name, \PHP_EOL);
 
     try {
-        run($meter, $pool, $name, $items, $tagCount, $fanouts);
+        run($meter, $make, $name, $items, $tagCount, $fanouts, $unique, $fresh);
     } catch (Throwable $e) {
         fwrite(\STDERR, sprintf('  ! %s: %s'.\PHP_EOL, $name, $e->getMessage()));
         $meter->note($name, 'failed', $e->getMessage());
@@ -157,15 +177,20 @@ table($meter->results());
  */
 function run(
     Meter $meter,
-    TagAwareAdapterInterface $pool,
+    Closure $make,
     string $name,
     int $items,
     int $tagCount,
     array $fanouts,
+    bool $unique,
+    int $fresh,
 ): void {
+    /** @var TagAwareAdapterInterface $pool */
+    $pool = $make();
+
     // an untimed pass first, so class loading and script caching do not land
     // on whichever scenario happens to run first
-    fill($pool, 50, $tagCount);
+    fill($pool, 50, $tagCount, $unique);
     $pool->clear();
 
     $report = static function (Result $result): void {
@@ -178,8 +203,8 @@ function run(
         );
     };
 
-    $report($meter->measure($name, 'fill', static fn () => fill($pool, $items, $tagCount)));
-    $report($meter->measure($name, 'overwrite', static fn () => fill($pool, $items, $tagCount)));
+    $report($meter->measure($name, 'fill', static fn () => fill($pool, $items, $tagCount, $unique)));
+    $report($meter->measure($name, 'overwrite', static fn () => fill($pool, $items, $tagCount, $unique)));
     $report($meter->measure($name, 'read hit', static fn () => read($pool, $items)));
 
     $filled = $meter->usedMemory();
@@ -210,7 +235,7 @@ function run(
     // against the rules it has not seen. The eager adapter has no log and
     // pays at invalidation time instead.
     $pool->clear();
-    fill($pool, $items, $tagCount);
+    fill($pool, $items, $tagCount, $unique);
 
     $report($meter->measure($name, 'invalidate 10 000 unrelated tags', static function () use ($pool): void {
         for ($i = 0; $i < 10_000; ++$i) {
@@ -218,9 +243,38 @@ function run(
         }
     }));
     $report($meter->measure($name, 'read hit, 10 000 rules behind', static fn () => read($pool, $items)));
+
+    // the FPM model: a request is a fresh process, and a fresh pool holds no
+    // rules. Behind the same 10 000 rules the pool is re-created every $fresh
+    // reads, so each "request" pays whatever a cold pool pays before its first
+    // hit. The versioned pool shares its rule set through APCu where it can;
+    // its second row keeps the set to itself, and shows what that costs
+    $report($meter->measure($name, sprintf('read hit, fresh pool every %d reads', $fresh), static fn () => readFresh($make, $items, $fresh)));
+
+    if ('versioned' === $name) {
+        $report($meter->measure($name, sprintf('read hit, fresh pool every %d reads, no shared rules', $fresh), static fn () => readFresh(static fn () => $make(false), $items, $fresh)));
+    }
 }
 
-function fill(TagAwareAdapterInterface $pool, int $items, int $tagCount): void
+/**
+ * Reads every item once, from a pool re-created every $every reads - a
+ * request being a fresh process, and a fresh pool holding no rules.
+ */
+function readFresh(Closure $make, int $items, int $every): void
+{
+    $pool = null;
+
+    for ($i = 0; $i < $items; ++$i) {
+        if (null === $pool || 0 === $i % $every) {
+            /** @var TagAwareAdapterInterface $pool */
+            $pool = $make();
+        }
+
+        $pool->getItem('item-'.$i)->get();
+    }
+}
+
+function fill(TagAwareAdapterInterface $pool, int $items, int $tagCount, bool $unique = false): void
 {
     $payload = str_repeat('x', 256);
 
@@ -228,7 +282,7 @@ function fill(TagAwareAdapterInterface $pool, int $items, int $tagCount): void
         $item = $pool->getItem('item-'.$i);
         $item->set($payload);
         $item->expiresAfter(3600);
-        $item->tag(tagsFor($i, $tagCount, $items));
+        $item->tag(tagsFor($i, $tagCount, $items, $unique));
         $pool->saveDeferred($item);
 
         if (0 === $i % 1000) {
@@ -248,13 +302,19 @@ function read(TagAwareAdapterInterface $pool, int $items): void
 
 /**
  * Every item carries "everything"; a twentieth carries "bucket-0" and a tenth
- * carries "tenth", which is what makes the three fan-outs.
+ * carries "tenth", which is what makes the three fan-outs. With $unique, one
+ * of the tags is the item's own - the entity tag applications really use,
+ * which no other item shares and no tag-version cache can have seen.
  *
  * @return list<string>
  */
-function tagsFor(int $index, int $tagCount, int $items): array
+function tagsFor(int $index, int $tagCount, int $items, bool $unique = false): array
 {
     $tags = ['everything', 'bucket-'.($index % 20)];
+
+    if ($unique) {
+        $tags[] = 'entity-'.$index;
+    }
 
     if (0 === $index % 10) {
         $tags[] = 'tenth';

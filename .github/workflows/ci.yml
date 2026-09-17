@@ -36,10 +36,15 @@ jobs:
                     - php: '8.4'
                       symfony: '8.1.*'
                       redis: '8.0'
+                    # Valkey has HSETEX since 9.0
+                    - php: '8.4'
+                      symfony: '8.1.*'
+                      redis: 'valkey-9'
+                      image: 'valkey/valkey:9-alpine'
 
         services:
             redis:
-                image: "redis:${{ matrix.redis }}-alpine"
+                image: "${{ matrix.image || format('redis:{0}-alpine', matrix.redis) }}"
                 ports:
                     - 6379:6379
                 options: >-
@@ -61,15 +66,6 @@ jobs:
                   # suite silently stops testing anything. This is how Symfony
                   # runs that suite itself.
                   ini-values: zend.assertions=1
-
-            # artigo/cache-stampede is a dev requirement powering one test,
-            # which checks that the two packages compose and skips itself when
-            # the class is absent. Every release of it published so far asks
-            # for PHP 8.4, so the older legs install without it rather than
-            # wait on somebody else's release: this adapter does not depend on
-            # that package, and its CI should not either.
-            - if: matrix.php == '8.2' || matrix.php == '8.3'
-              run: composer remove --dev artigo/cache-stampede --no-update
 
             # resolve against the Symfony line of this leg rather than the
             # lock file, which pins the newest

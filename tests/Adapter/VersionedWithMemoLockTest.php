@@ -119,7 +119,7 @@ final class VersionedWithMemoLockTest extends TestCase
 
     private function pool(): VersionedRedisTagAwareAdapter
     {
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'combined-test');
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'combined-test', rulesCache: false);
         $pool->setCallbackWrapper(new MemoLock($this->redis, lockTtlMs: 5_000, waitTimeoutMs: 200, pollIntervalMs: 10));
 
         return $pool;

@@ -47,7 +47,7 @@ final class VersionedRedisTagAwareAdapterTest extends AdapterTestCase
 
     public function createCachePool(int $defaultLifetime = 0, ?string $testMethod = null): CacheItemPoolInterface
     {
-        return new VersionedRedisTagAwareAdapter(self::$redis, 'conformance', $defaultLifetime);
+        return new VersionedRedisTagAwareAdapter(self::$redis, 'conformance', $defaultLifetime, rulesCache: false);
     }
 
     protected function tearDown(): void

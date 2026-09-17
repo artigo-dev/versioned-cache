@@ -31,6 +31,23 @@ const INVALIDATION = [
     'series' => [
         ['name' => 'versioned', 'colour' => '#3ddc97', 'values' => [4, 4, 4]],
         ['name' => 'RedisTagAwareAdapter', 'colour' => '#ff6b6b', 'values' => [1006, 2006, 20012]],
+        ['name' => 'TagAwareAdapter', 'colour' => '#ffd166', 'values' => [1, 1, 1]],
+    ],
+];
+
+/*
+ * php benchmarks/bench.php items=20000 · php benchmarks/bench.php items=20000 unique=1
+ * The same 20 000 items read once each as hits, on Redis 8.8, PHP 8.5, over
+ * loopback. Socket reads Redis did - round trips - by whether every item
+ * carries a tag of its own (the entity tag applications really use) or only
+ * tags it shares with others.
+ */
+const READS = [
+    'labels' => ['shared tags only', 'one tag of its own'],
+    'series' => [
+        ['name' => 'versioned', 'colour' => '#3ddc97', 'values' => [20010, 20010]],
+        ['name' => 'RedisTagAwareAdapter', 'colour' => '#ff6b6b', 'values' => [20000, 20000]],
+        ['name' => 'TagAwareAdapter', 'colour' => '#ffd166', 'values' => [27710, 40000]],
     ],
 ];
 
@@ -51,6 +68,16 @@ file_put_contents($out.'/invalidation.svg', chart(
 ));
 
 echo 'wrote docs/invalidation.svg'.\PHP_EOL;
+
+file_put_contents($out.'/reads.svg', chart(
+    'Round trips for 20 000 read hits',
+    'what an item is tagged with',
+    READS,
+    logarithmic: false,
+    format: static fn (float $v): string => number_format($v),
+));
+
+echo 'wrote docs/reads.svg'.\PHP_EOL;
 
 /**
  * @param array{labels: list<string>, series: list<array{name: string, colour: string, values: list<int>}>} $data
@@ -76,7 +103,9 @@ function chart(string $title, string $axis, array $data, bool $logarithmic, \Clo
     }
 
     $max = max($values);
-    $min = $logarithmic ? 1.0 : 0.0;
+    // the logarithmic floor sits below 1, so a series worth one command has a
+    // line of its own above the axis rather than lying on it
+    $min = $logarithmic ? 0.5 : 0.0;
 
     $scale = static function (float $value) use ($logarithmic, $min, $max, $top, $plotHeight): float {
         $position = $logarithmic
@@ -114,8 +143,12 @@ function chart(string $title, string $axis, array $data, bool $logarithmic, \Clo
     }
 
     // where two series share a point their labels would sit on each other:
-    // rank them at every x and send the lower one underneath
-    $rank = [];
+    // rank them at every x, put the highest one's label above its point and
+    // stack the others underneath theirs, each pushed down until it clears
+    // the label before it. A label that would land on the axis goes to the
+    // lower right of its point instead, where nothing else is
+    $floor = $top + $plotHeight;
+    $labels = [];
 
     foreach ($data['labels'] as $index => $ignored) {
         $column = [];
@@ -125,11 +158,49 @@ function chart(string $title, string $axis, array $data, bool $logarithmic, \Clo
         }
 
         arsort($column);
-        $rank[$index] = array_flip(array_keys($column));
+        $baseline = null;
+
+        foreach (array_keys($column) as $rank => $position) {
+            $y = $scale((float) $column[$position]);
+
+            if (0 === $rank) {
+                $labels[$index][$position] = [$x($index), $y - 12.0, 'middle'];
+
+                continue;
+            }
+
+            $baseline = null === $baseline ? $y + 19.0 : max($y + 19.0, $baseline + 13.0);
+
+            $labels[$index][$position] = $baseline > $floor - 4.0
+                ? [$x($index) + 9.0, min($y + 14.0, $floor - 3.0), 'start']
+                : [$x($index), $baseline, 'middle'];
+        }
     }
 
-    // the series
+    // the same for the names at the line ends: sorted by where the lines end,
+    // each name pushed down until it clears the one above
+    $last = \count($data['labels']) - 1;
+    $ends = [];
+
     foreach ($data['series'] as $position => $series) {
+        $ends[$position] = $series['values'][$last];
+    }
+
+    arsort($ends);
+    $names = [];
+    $baseline = null;
+
+    foreach (array_keys($ends) as $position) {
+        $y = $scale((float) $ends[$position]) + 4.0;
+        $baseline = null === $baseline ? $y : max($y, $baseline + 15.0);
+        // a name pushed off its own line also moves right, clear of the value
+        // labels stacked under the last points
+        $names[$position] = [$baseline > $y ? 30.0 : 14.0, $baseline];
+    }
+
+    // the series, last first, so the first one named is drawn on top where
+    // two of them run together
+    foreach (array_reverse($data['series'], true) as $position => $series) {
         $points = [];
 
         foreach ($series['values'] as $index => $value) {
@@ -140,15 +211,15 @@ function chart(string $title, string $axis, array $data, bool $logarithmic, \Clo
 
         foreach ($series['values'] as $index => $value) {
             $svg[] = \sprintf('<circle cx="%.1f" cy="%.1f" r="4.5" fill="%s"/>', $x($index), $scale((float) $value), $series['colour']);
-            $offset = 0 === $rank[$index][$position] ? -12.0 : 19.0;
-            $svg[] = \sprintf('<text x="%.1f" y="%.1f" font-size="11.5" font-weight="600" fill="%s" text-anchor="middle">%s</text>',
-                $x($index), $scale((float) $value) + $offset, $series['colour'], e($format((float) $value)));
+            [$labelX, $labelY, $anchor] = $labels[$index][$position];
+            $svg[] = \sprintf('<text x="%.1f" y="%.1f" font-size="11.5" font-weight="600" fill="%s" text-anchor="%s">%s</text>',
+                $labelX, $labelY, $series['colour'], $anchor, e($format((float) $value)));
         }
 
         // the line names itself at its own end, so no legend is needed
-        $last = \count($series['values']) - 1;
+        [$shift, $nameY] = $names[$position];
         $svg[] = \sprintf('<text x="%.1f" y="%.1f" font-size="13" font-weight="600" fill="%s">%s</text>',
-            $x($last) + 14, $scale((float) $series['values'][$last]) + 4, $series['colour'], e($series['name']));
+            $x($last) + $shift, $nameY, $series['colour'], e($series['name']));
     }
 
     // the x axis
