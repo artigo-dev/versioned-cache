@@ -2,32 +2,40 @@
 <style>@font-face { font-family: "Rajdhani"; font-weight: 600; src: url("src/fonts/rajdhani-600.woff2") format("woff2"); }@font-face { font-family: "Rajdhani"; font-weight: 700; src: url("src/fonts/rajdhani-700.woff2") format("woff2"); }</style>
 <rect width="760" height="380" fill="#0a0a12"/>
 <text x="38" y="32" font-size="17" font-weight="600" fill="#e8e8f0">Commands to invalidate one tag</text>
-<line x1="78" y1="316.0" x2="510.0" y2="316.0" stroke="#1c1c2a" stroke-width="1"/>
-<text x="68" y="320.0" font-size="11" fill="#8b8ba7" text-anchor="end">1</text>
-<line x1="78" y1="256.9" x2="510.0" y2="256.9" stroke="#1c1c2a" stroke-width="1"/>
-<text x="68" y="260.9" font-size="11" fill="#8b8ba7" text-anchor="end">10</text>
-<line x1="78" y1="197.9" x2="510.0" y2="197.9" stroke="#1c1c2a" stroke-width="1"/>
-<text x="68" y="201.9" font-size="11" fill="#8b8ba7" text-anchor="end">100</text>
-<line x1="78" y1="138.8" x2="510.0" y2="138.8" stroke="#1c1c2a" stroke-width="1"/>
-<text x="68" y="142.8" font-size="11" fill="#8b8ba7" text-anchor="end">1,000</text>
-<line x1="78" y1="79.8" x2="510.0" y2="79.8" stroke="#1c1c2a" stroke-width="1"/>
-<text x="68" y="83.8" font-size="11" fill="#8b8ba7" text-anchor="end">10,000</text>
-<polyline points="108.0,280.4 294.0,280.4 480.0,280.4" fill="none" stroke="#3ddc97" stroke-width="2.5" stroke-linejoin="round"/>
-<circle cx="108.0" cy="280.4" r="4.5" fill="#3ddc97"/>
-<text x="108.0" y="299.4" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">4</text>
-<circle cx="294.0" cy="280.4" r="4.5" fill="#3ddc97"/>
-<text x="294.0" y="299.4" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">4</text>
-<circle cx="480.0" cy="280.4" r="4.5" fill="#3ddc97"/>
-<text x="480.0" y="299.4" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">4</text>
-<text x="494.0" y="284.4" font-size="13" font-weight="600" fill="#3ddc97">versioned</text>
-<polyline points="108.0,138.7 294.0,121.0 480.0,62.0" fill="none" stroke="#ff6b6b" stroke-width="2.5" stroke-linejoin="round"/>
-<circle cx="108.0" cy="138.7" r="4.5" fill="#ff6b6b"/>
-<text x="108.0" y="126.7" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">1,006</text>
-<circle cx="294.0" cy="121.0" r="4.5" fill="#ff6b6b"/>
-<text x="294.0" y="109.0" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">2,006</text>
+<line x1="78" y1="299.4" x2="510.0" y2="299.4" stroke="#1c1c2a" stroke-width="1"/>
+<text x="68" y="303.4" font-size="11" fill="#8b8ba7" text-anchor="end">1</text>
+<line x1="78" y1="244.2" x2="510.0" y2="244.2" stroke="#1c1c2a" stroke-width="1"/>
+<text x="68" y="248.2" font-size="11" fill="#8b8ba7" text-anchor="end">10</text>
+<line x1="78" y1="189.0" x2="510.0" y2="189.0" stroke="#1c1c2a" stroke-width="1"/>
+<text x="68" y="193.0" font-size="11" fill="#8b8ba7" text-anchor="end">100</text>
+<line x1="78" y1="133.8" x2="510.0" y2="133.8" stroke="#1c1c2a" stroke-width="1"/>
+<text x="68" y="137.8" font-size="11" fill="#8b8ba7" text-anchor="end">1,000</text>
+<line x1="78" y1="78.6" x2="510.0" y2="78.6" stroke="#1c1c2a" stroke-width="1"/>
+<text x="68" y="82.6" font-size="11" fill="#8b8ba7" text-anchor="end">10,000</text>
+<polyline points="108.0,299.4 294.0,299.4 480.0,299.4" fill="none" stroke="#ffd166" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="108.0" cy="299.4" r="4.5" fill="#ffd166"/>
+<text x="117.0" y="313.0" font-size="11.5" font-weight="600" fill="#ffd166" text-anchor="start">1</text>
+<circle cx="294.0" cy="299.4" r="4.5" fill="#ffd166"/>
+<text x="303.0" y="313.0" font-size="11.5" font-weight="600" fill="#ffd166" text-anchor="start">1</text>
+<circle cx="480.0" cy="299.4" r="4.5" fill="#ffd166"/>
+<text x="489.0" y="313.0" font-size="11.5" font-weight="600" fill="#ffd166" text-anchor="start">1</text>
+<text x="494.0" y="303.4" font-size="13" font-weight="600" fill="#ffd166">TagAwareAdapter</text>
+<polyline points="108.0,133.7 294.0,117.1 480.0,62.0" fill="none" stroke="#ff6b6b" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="108.0" cy="133.7" r="4.5" fill="#ff6b6b"/>
+<text x="108.0" y="121.7" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">1,006</text>
+<circle cx="294.0" cy="117.1" r="4.5" fill="#ff6b6b"/>
+<text x="294.0" y="105.1" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">2,006</text>
 <circle cx="480.0" cy="62.0" r="4.5" fill="#ff6b6b"/>
 <text x="480.0" y="50.0" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">20,012</text>
 <text x="494.0" y="66.0" font-size="13" font-weight="600" fill="#ff6b6b">RedisTagAwareAdapter</text>
+<polyline points="108.0,266.2 294.0,266.2 480.0,266.2" fill="none" stroke="#3ddc97" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="108.0" cy="266.2" r="4.5" fill="#3ddc97"/>
+<text x="108.0" y="285.2" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">4</text>
+<circle cx="294.0" cy="266.2" r="4.5" fill="#3ddc97"/>
+<text x="294.0" y="285.2" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">4</text>
+<circle cx="480.0" cy="266.2" r="4.5" fill="#3ddc97"/>
+<text x="480.0" y="285.2" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">4</text>
+<text x="494.0" y="270.2" font-size="13" font-weight="600" fill="#3ddc97">versioned</text>
 <line x1="78" y1="316.0" x2="510.0" y2="316.0" stroke="#26263a" stroke-width="1"/>
 <text x="108.0" y="338.0" font-size="12" fill="#b8b8c8" text-anchor="middle">1 000</text>
 <text x="294.0" y="338.0" font-size="12" fill="#b8b8c8" text-anchor="middle">2 000</text>

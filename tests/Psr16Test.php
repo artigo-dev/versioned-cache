@@ -43,7 +43,7 @@ final class Psr16Test extends SimpleCacheTest
 
     public function createSimpleCache(): CacheInterface
     {
-        return new Psr16Cache(new VersionedRedisTagAwareAdapter(self::$redis, 'psr16'));
+        return new Psr16Cache(new VersionedRedisTagAwareAdapter(self::$redis, 'psr16', rulesCache: false));
     }
 
     protected function tearDown(): void

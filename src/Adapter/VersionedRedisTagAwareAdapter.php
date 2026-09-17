@@ -12,6 +12,7 @@ declare(strict_types=1);
 namespace Artigo\Cache\Adapter;
 
 use Artigo\Cache\Exception\InvalidArgumentException;
+use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Component\Cache\Adapter\AbstractTagAwareAdapter;
 use Symfony\Component\Cache\CacheItem;
 use Symfony\Component\Cache\Exception\CacheException;
@@ -62,6 +63,12 @@ use Symfony\Component\Cache\Marshaller\MarshallerInterface;
  * window between computing a value and writing it is therefore open here as
  * it is in every write-back cache.
  *
+ * The rule set is compacted - the newest rule per tag - and, given a cache
+ * pool, shared by the workers of a server, so a fresh process (every request,
+ * under PHP-FPM) adopts it instead of loading the whole stream before its
+ * first hit (see SharedRules). APCu is the default pool where it is enabled;
+ * pass false as $rulesCache to keep the set per instance.
+ *
  * What it is worse at, and there is no getting around any of it:
  *
  * - **Memory comes back lazily.** An invalidated item holds its RAM until a
@@ -88,6 +95,19 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter
     private const FIELD_VALUE = 'v';
     private const FIELD_TAGS = 't';
     private const FIELD_MARK = 'm';
+
+    /**
+     * How long a worker holding no rules waits for the one elected to load
+     * the stream before loading it on its own: the cold start of a server
+     * whose shared pool was just emptied, where every request would otherwise
+     * load the whole stream at once. In milliseconds.
+     */
+    private const COLD_WAIT_MS = 250;
+
+    /**
+     * How often that worker looks whether the load has landed, in milliseconds.
+     */
+    private const COLD_POLL_MS = 2;
 
     /**
      * Appends one rule and keeps the stream from growing without bound. A
@@ -138,11 +158,26 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter
     private string $poolNamespace;
     private ?InvalidationRules $rules = null;
     private ?float $rulesReadAt = null;
+
+    /**
+     * This adapter appended a rule the held set has not seen yet: the next
+     * read fetches the delta whatever the window or the shared set say, so a
+     * process always sees its own invalidations at once.
+     */
+    private bool $rulesDirty = false;
+
+    /**
+     * The set shared with the other workers of this server; null when the
+     * caller opted out, or gave no pool and APCu is not there.
+     */
+    private ?SharedRules $sharedRules;
+
     private bool $ttlWarned = false;
 
     /**
-     * @param int $rulesRetentionSeconds how long rules - and therefore items - may live
-     * @param int $rulesCacheMs          how long a loaded rule set may be reused within one process
+     * @param int                               $rulesRetentionSeconds how long rules - and therefore items - may live
+     * @param int                               $rulesCacheMs          how long a loaded rule set may be reused before it is refreshed
+     * @param CacheItemPoolInterface|false|null $rulesCache            where the workers of a server share the rule set (see SharedRules): a pool, false for none, null for APCu where it is enabled
      */
     public function __construct(
         private readonly \Redis|\RedisArray|\RedisCluster|\Relay\Relay|\Relay\Cluster $redis,
@@ -151,6 +186,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter
         ?MarshallerInterface $marshaller = null,
         private readonly int $rulesRetentionSeconds = 2_592_000,
         private readonly int $rulesCacheMs = 1_000,
+        CacheItemPoolInterface|false|null $rulesCache = null,
     ) {
         if ($rulesRetentionSeconds < 1) {
             throw new InvalidArgumentException(\sprintf('Argument "$rulesRetentionSeconds" must be a positive number of seconds, %d given.', $rulesRetentionSeconds));
@@ -167,6 +203,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter
         $this->marshaller = $marshaller ?? new DefaultMarshaller();
         $this->poolNamespace = '' === $namespace ? '' : $namespace.self::NAMESPACE_SEPARATOR;
         $this->rulesKey = $this->poolNamespace.'@rules';
+        $this->sharedRules = SharedRules::of($rulesCache, $this->rulesKey, $redis);
     }
 
     /**
@@ -470,8 +507,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter
         }
 
         // what we hold is behind the rule we just wrote; the next read fetches
-        // it, and whatever anyone else appended meanwhile, in one range
-        $this->rulesReadAt = null;
+        // it, and whatever anyone else appended meanwhile, in one range -
+        // whatever the window or the shared set say
+        $this->rulesDirty = true;
 
         return true;
     }
@@ -510,7 +548,19 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter
 
     /**
      * The rule set, refreshed at most every $rulesCacheMs - incrementally,
-     * from the last id it holds.
+     * from the last id it holds, and shared with the other workers of this
+     * server where a pool allows (see SharedRules).
+     *
+     * In order: the held set while it is fresh; the shared set, adopted
+     * unless what is held is newer, and final when it is fresh - no round
+     * trip; otherwise a refresh: one XRANGE from the last id held, absorbed,
+     * stamped and stored for the next worker. Where several workers cross the
+     * window together, one is elected to refresh and the others keep the set
+     * they hold for this read - one refresh away from exact, never blocked. A
+     * worker that holds nothing, on a server whose pool was just emptied,
+     * waits for the leader's load for a bounded time (COLD_WAIT_MS) rather
+     * than join a herd of full loads, then loads on its own. Exact reads
+     * ($rulesCacheMs = 0) elect nobody: every read refreshes.
      *
      * When it cannot be refreshed the last known set is reused: reporting "no
      * rules" would let an invalidated item read as fresh, which is the one
@@ -520,33 +570,113 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter
      */
     private function rules(): ?InvalidationRules
     {
-        if (null !== $this->rules && $this->rulesAreFresh()) {
+        if (null !== $this->rules && !$this->rulesDirty && $this->rulesAreFresh()) {
             return $this->rules;
         }
 
-        $rules = $this->rules ?? new InvalidationRules($this->poolNamespace, $this->rulesRetentionSeconds * 1000);
-        $from = $rules->last();
+        // not after our own invalidation: the shared set cannot have it yet,
+        // and a process must see what it just invalidated
+        $shared = $this->rulesDirty ? null : $this->sharedRules;
+        $leader = null;
+
+        if (null !== $shared) {
+            if ($this->adoptSharedRules($shared) && $this->rulesAreFresh()) {
+                return $this->rules;
+            }
+
+            if ($this->rulesCacheMs > 0) {
+                $leader = $shared->lead() ? $shared : null;
+
+                if (null === $leader) {
+                    // another worker is refreshing right now: what we hold is
+                    // one refresh away from exact, good enough for this read
+                    if (null !== $this->rules) {
+                        return $this->rules;
+                    }
+
+                    // holding nothing, wait for the leader's load instead
+                    if ($this->awaitSharedRules($shared)) {
+                        return $this->rules;
+                    }
+                }
+            }
+        }
 
         try {
-            $entries = $this->redis->xRange($this->rulesKey, InvalidationRules::NONE === $from ? '-' : $from, '+');
-        } catch (\Exception $e) {
-            CacheItem::log($this->logger, 'Failed to load the invalidation rules: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+            $rules = $this->rules ?? new InvalidationRules($this->poolNamespace, $this->rulesRetentionSeconds * 1000);
+            $from = $rules->last();
 
-            return $this->rules;
+            try {
+                $entries = $this->redis->xRange($this->rulesKey, InvalidationRules::NONE === $from ? '-' : $from, '+');
+            } catch (\Exception $e) {
+                CacheItem::log($this->logger, 'Failed to load the invalidation rules: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+
+                return $this->rules;
+            }
+
+            if (!\is_array($entries)) {
+                CacheItem::log($this->logger, 'Failed to load the invalidation rules.', ['cache-adapter' => get_debug_type($this)]);
+
+                return $this->rules;
+            }
+
+            $rules->absorb($entries);
+            $readAtMs = microtime(true) * 1000;
+
+            $this->rules = $rules;
+            $this->rulesReadAt = $readAtMs;
+            $this->rulesDirty = false;
+
+            $this->sharedRules?->store($rules, $readAtMs);
+
+            return $rules;
+        } finally {
+            $leader?->release();
+        }
+    }
+
+    /**
+     * Takes over the set another worker shared, unless what is held is newer.
+     * True when a set was adopted - fresh or not - false when there was
+     * nothing to adopt.
+     */
+    private function adoptSharedRules(SharedRules $shared): bool
+    {
+        if (null === $loaded = $shared->load($this->poolNamespace, $this->rulesRetentionSeconds * 1000)) {
+            return false;
         }
 
-        if (!\is_array($entries)) {
-            CacheItem::log($this->logger, 'Failed to load the invalidation rules.', ['cache-adapter' => get_debug_type($this)]);
+        [$rules, $readAtMs] = $loaded;
 
-            return $this->rules;
+        if (null !== $this->rules && InvalidationRules::isNewerId($this->rules->last(), $rules->last())) {
+            return false;
         }
-
-        $rules->absorb($entries);
 
         $this->rules = $rules;
-        $this->rulesReadAt = microtime(true) * 1000;
+        $this->rulesReadAt = $readAtMs;
 
-        return $rules;
+        return true;
+    }
+
+    /**
+     * Waits, briefly, for the worker elected to load the stream to share it:
+     * looks every COLD_POLL_MS for at most COLD_WAIT_MS, and gives up early
+     * when the leader has gone without leaving a set. True when a set was
+     * adopted.
+     */
+    private function awaitSharedRules(SharedRules $shared): bool
+    {
+        $deadline = microtime(true) + self::COLD_WAIT_MS / 1000;
+
+        do {
+            usleep(self::COLD_POLL_MS * 1000);
+
+            if ($this->adoptSharedRules($shared)) {
+                return true;
+            }
+        } while ($shared->isRefreshing() && microtime(true) < $deadline);
+
+        return false;
     }
 
     private function rulesAreFresh(): bool

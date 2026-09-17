@@ -40,7 +40,7 @@ final class ScriptCacheTest extends TestCase
 
     public function testAFlushedScriptCacheChangesNothing(): void
     {
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'scripts-test', rulesCacheMs: 0);
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'scripts-test', rulesCacheMs: 0, rulesCache: false);
 
         $first = $pool->getItem('before');
         $first->set('written before the flush');

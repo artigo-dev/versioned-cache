@@ -44,8 +44,8 @@ final class RulesStreamTest extends TestCase
 
     public function testARuleAppendedElsewhereIsFetchedFromTheLastIdHeld(): void
     {
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0);
-        $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream');
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
+        $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream', rulesCache: false);
 
         $item = $pool->getItem('k');
         $item->set('v');
@@ -67,7 +67,7 @@ final class RulesStreamTest extends TestCase
 
     public function testAWriteAfterAFreshReadCostsNoWatermarkRoundTrip(): void
     {
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 1_000);
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 1_000, rulesCache: false);
 
         $item = $pool->getItem('k');
         $this->redis->watermarks = 0;
@@ -77,7 +77,7 @@ final class RulesStreamTest extends TestCase
 
         self::assertSame(0, $this->redis->watermarks, 'the rule set read for the miss already knows the stream\'s head');
 
-        $exact = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0);
+        $exact = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
         $item = $exact->getItem('k2');
         $this->redis->watermarks = 0;
 
@@ -92,8 +92,8 @@ final class RulesStreamTest extends TestCase
         // Symfony's TagAwareTestTrait::testInvalidateCommits pins this: the
         // watermark is the stream's head at write time, whatever happened
         // between computing the value and writing it
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0);
-        $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream');
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
+        $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream', rulesCache: false);
 
         $item = $pool->getItem('slow');
         self::assertFalse($item->isHit());
@@ -109,8 +109,8 @@ final class RulesStreamTest extends TestCase
 
     public function testAStreamDeletedUnderARunningProcessIsForgotten(): void
     {
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0);
-        $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream');
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
+        $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream', rulesCache: false);
 
         $item = $pool->getItem('x');
         $item->set('v');
@@ -133,8 +133,8 @@ final class RulesStreamTest extends TestCase
 
     public function testAnInvalidatedItemDoesNotComeBackWhenTheStreamIsLost(): void
     {
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0);
-        $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream');
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
+        $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream', rulesCache: false);
 
         // a rule before the item, so the item carries a real watermark
         $elsewhere->invalidateTags(['earlier']);
@@ -154,8 +154,8 @@ final class RulesStreamTest extends TestCase
 
     public function testAnInvalidatedItemDoesNotComeBackWhenTheStreamIsRebuiltByAnotherRule(): void
     {
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0);
-        $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream');
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
+        $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream', rulesCache: false);
 
         // The stream is opened by hand, on an id from 1970, so the item stamps
         // on THAT rather than on the clock. Ids are milliseconds: a host quick
@@ -186,8 +186,8 @@ final class RulesStreamTest extends TestCase
 
     public function testAnItemWrittenAfterTheLossIsServedThroughTheNextRule(): void
     {
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0);
-        $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream');
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
+        $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream', rulesCache: false);
 
         $elsewhere->invalidateTags(['earlier']);
         $this->other->del('stream:@rules');
@@ -208,7 +208,7 @@ final class RulesStreamTest extends TestCase
     {
         // no stream exists yet: the first rule opens it, and an opening rule
         // must not read as a rebuild
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0);
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
 
         foreach (['a', 'b'] as $tag) {
             $item = $pool->getItem($tag);
@@ -225,7 +225,7 @@ final class RulesStreamTest extends TestCase
 
     public function testTheRulesStreamCarriesNoTtl(): void
     {
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0);
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
 
         $pool->invalidateTags(['t']);
         self::assertSame(-1, $this->other->pttl('stream:@rules'), 'a key with a TTL is an eviction candidate under volatile-*');
@@ -239,7 +239,7 @@ final class RulesStreamTest extends TestCase
 
     public function testASubNamespaceClearLeavesTheRestOfThePoolAlone(): void
     {
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0);
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
 
         foreach (['foo.1', 'foo.2', 'bar.1'] as $key) {
             $item = $pool->getItem($key);
@@ -252,37 +252,5 @@ final class RulesStreamTest extends TestCase
         self::assertFalse($pool->getItem('foo.1')->isHit());
         self::assertFalse($pool->getItem('foo.2')->isHit());
         self::assertTrue($pool->getItem('bar.1')->isHit());
-    }
-}
-
-/**
- * A connection that remembers where each XRANGE started and how often the
- * watermark was asked for.
- */
-final class SpyRedis extends \Redis
-{
-    /** @var list<string> */
-    public array $starts = [];
-
-    public int $watermarks = 0;
-
-    /**
-     * @return \Redis|array<mixed>|bool
-     */
-    public function xRange(string $key, string $start, string $end, int $count = -1): \Redis|array|bool
-    {
-        $this->starts[] = $start;
-
-        return parent::xRange($key, $start, $end, $count);
-    }
-
-    /**
-     * @return \Redis|array<mixed>|bool
-     */
-    public function xRevRange(string $key, string $end, string $start, int $count = -1): \Redis|array|bool
-    {
-        ++$this->watermarks;
-
-        return parent::xRevRange($key, $end, $start, $count);
     }
 }

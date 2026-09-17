@@ -37,7 +37,7 @@ final class DegradedRedisTest extends TestCase
     public function testRulesThatCannotBeLoadedMakeEveryReadAMissAndUnlinkNothing(): void
     {
         $redis = $this->open(BrokenRulesRedis::class);
-        $writer = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0);
+        $writer = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false);
 
         $item = $writer->getItem('k');
         $item->set('v');
@@ -48,7 +48,7 @@ final class DegradedRedisTest extends TestCase
 
         // a process that has never loaded the rules, and now cannot
         $redis->broken = true;
-        $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0);
+        $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false);
 
         self::assertFalse($pool->getItem('k')->isHit(), 'without the rules, fresh cannot be told from stale: a miss, never a hit');
         self::assertFalse($pool->hasItem('k'));
@@ -62,7 +62,7 @@ final class DegradedRedisTest extends TestCase
     public function testAProcessHoldingRulesKeepsServingWhileTheyCannotBeRefreshed(): void
     {
         $redis = $this->open(BrokenRulesRedis::class);
-        $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0);
+        $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false);
 
         $item = $pool->getItem('k');
         $item->set('v');
@@ -80,20 +80,20 @@ final class DegradedRedisTest extends TestCase
     public function testDeferredItemsSurviveAReset(): void
     {
         $redis = $this->open(\Redis::class);
-        $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded');
+        $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCache: false);
 
         $item = $pool->getItem('deferred');
         $item->set('v');
         $pool->saveDeferred($item);
         $pool->reset();
 
-        self::assertTrue((new VersionedRedisTagAwareAdapter($redis, 'degraded'))->getItem('deferred')->isHit(), 'reset() commits what was deferred, as every Symfony adapter does');
+        self::assertTrue((new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCache: false))->getItem('deferred')->isHit(), 'reset() commits what was deferred, as every Symfony adapter does');
     }
 
     public function testAPipelineThatDiesAnswersMissesRatherThanThrowing(): void
     {
         $redis = $this->open(DeadPipelineRedis::class);
-        $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded');
+        $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCache: false);
 
         $item = $pool->getItem('a');
         $item->set('v');
@@ -122,7 +122,7 @@ final class DegradedRedisTest extends TestCase
 
         try {
             $this->expectException(InvalidArgumentException::class);
-            new VersionedRedisTagAwareAdapter($redis, 'degraded');
+            new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCache: false);
         } finally {
             $redis->setOption(\Redis::OPT_SERIALIZER, \Redis::SERIALIZER_NONE);
         }
@@ -148,7 +148,7 @@ final class DegradedRedisTest extends TestCase
 
         try {
             $this->expectException(InvalidArgumentException::class);
-            new VersionedRedisTagAwareAdapter($redis, 'degraded');
+            new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCache: false);
         } finally {
             $redis->setOption(\Redis::OPT_COMPRESSION, \Redis::COMPRESSION_NONE);
         }

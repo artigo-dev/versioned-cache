@@ -94,6 +94,81 @@ final class InvalidationRules
     }
 
     /**
+     * The shape that crosses requests (see SharedRules): plain arrays,
+     * nothing else, so any cache pool stores it as it is.
+     *
+     * @return array{tags: array<string, array{int, int}>, prefixes: list<array{int, int, string}>, last: string, first: string, first_opened: bool|null}
+     */
+    public function toArray(): array
+    {
+        return [
+            'tags' => $this->tags,
+            'prefixes' => $this->prefixes,
+            'last' => $this->last,
+            'first' => $this->first,
+            'first_opened' => $this->firstOpened,
+        ];
+    }
+
+    /**
+     * Rebuilds a set from toArray(); null when the shape is not one we wrote.
+     */
+    public static function fromArray(mixed $state, string $poolNamespace, int $retentionMs): ?self
+    {
+        if (!\is_array($state)
+            || !\is_array($state['tags'] ?? null)
+            || !\is_array($state['prefixes'] ?? null)
+            || !\is_string($state['last'] ?? null)
+            || !\is_string($state['first'] ?? null)
+        ) {
+            return null;
+        }
+
+        $tags = [];
+
+        foreach ($state['tags'] as $tag => $rule) {
+            if (!\is_array($rule) || !\is_int($rule[0] ?? null) || !\is_int($rule[1] ?? null)) {
+                return null;
+            }
+
+            // a numeric tag came back as an int key, as PHP has it
+            $tags[(string) $tag] = [$rule[0], $rule[1]];
+        }
+
+        $prefixes = [];
+
+        foreach ($state['prefixes'] as $rule) {
+            if (!\is_array($rule) || !\is_int($rule[0] ?? null) || !\is_int($rule[1] ?? null) || !\is_string($rule[2] ?? null)) {
+                return null;
+            }
+
+            $prefixes[] = [$rule[0], $rule[1], $rule[2]];
+        }
+
+        $firstOpened = $state['first_opened'] ?? null;
+
+        $rules = new self($poolNamespace, $retentionMs);
+        $rules->tags = $tags;
+        $rules->prefixes = $prefixes;
+        $rules->last = $state['last'];
+        $rules->first = $state['first'];
+        $rules->firstOpened = \is_bool($firstOpened) ? $firstOpened : null;
+
+        return $rules;
+    }
+
+    /**
+     * Is the first id newer than the second?
+     */
+    public static function isNewerId(string $id, string $than): bool
+    {
+        [$ms, $sequence] = self::split($id);
+        [$thanMs, $thanSequence] = self::split($than);
+
+        return $ms > $thanMs || ($ms === $thanMs && $sequence > $thanSequence);
+    }
+
+    /**
      * Merges the entries of an XRANGE that started at last(), inclusively -
      * or at the beginning, when nothing was held yet.
      *
