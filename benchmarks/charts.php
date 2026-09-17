@@ -47,7 +47,7 @@ const READS = [
     'series' => [
         ['name' => 'versioned', 'colour' => '#3ddc97', 'values' => [20010, 20010]],
         ['name' => 'RedisTagAwareAdapter', 'colour' => '#ff6b6b', 'values' => [20000, 20000]],
-        ['name' => 'TagAwareAdapter', 'colour' => '#ffd166', 'values' => [27710, 40000]],
+        ['name' => 'TagAwareAdapter', 'colour' => '#ffd166', 'values' => [29059, 40000]],
     ],
 ];
 

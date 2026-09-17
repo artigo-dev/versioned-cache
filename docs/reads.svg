@@ -12,9 +12,9 @@
 <text x="68" y="129.5" font-size="11" fill="#8b8ba7" text-anchor="end">30,000</text>
 <line x1="78" y1="62.0" x2="510.0" y2="62.0" stroke="#1c1c2a" stroke-width="1"/>
 <text x="68" y="66.0" font-size="11" fill="#8b8ba7" text-anchor="end">40,000</text>
-<polyline points="108.0,140.0 480.0,62.0" fill="none" stroke="#ffd166" stroke-width="2.5" stroke-linejoin="round"/>
-<circle cx="108.0" cy="140.0" r="4.5" fill="#ffd166"/>
-<text x="108.0" y="128.0" font-size="11.5" font-weight="600" fill="#ffd166" text-anchor="middle">27,710</text>
+<polyline points="108.0,131.5 480.0,62.0" fill="none" stroke="#ffd166" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="108.0" cy="131.5" r="4.5" fill="#ffd166"/>
+<text x="108.0" y="119.5" font-size="11.5" font-weight="600" fill="#ffd166" text-anchor="middle">29,059</text>
 <circle cx="480.0" cy="62.0" r="4.5" fill="#ffd166"/>
 <text x="480.0" y="50.0" font-size="11.5" font-weight="600" fill="#ffd166" text-anchor="middle">40,000</text>
 <text x="494.0" y="66.0" font-size="13" font-weight="600" fill="#ffd166">TagAwareAdapter</text>

@@ -46,6 +46,7 @@ use Symfony\Component\Cache\Adapter\RedisAdapter;
 use Symfony\Component\Cache\Adapter\RedisTagAwareAdapter;
 use Symfony\Component\Cache\Adapter\TagAwareAdapter;
 use Symfony\Component\Cache\Adapter\TagAwareAdapterInterface;
+use Symfony\Component\Cache\PruneableInterface;
 
 require __DIR__.'/../vendor/autoload.php';
 require __DIR__.'/src/meter.php';
@@ -159,7 +160,7 @@ foreach ($stores as $name) {
     echo sprintf('%s%s', $name, \PHP_EOL);
 
     try {
-        run($meter, $make, $name, $items, $tagCount, $fanouts, $unique, $fresh);
+        run($meter, $make, $name, $items, $tagCount, $fanouts, $unique, $fresh, $connection);
     } catch (Throwable $e) {
         fwrite(\STDERR, sprintf('  ! %s: %s'.\PHP_EOL, $name, $e->getMessage()));
         $meter->note($name, 'failed', $e->getMessage());
@@ -184,6 +185,7 @@ function run(
     array $fanouts,
     bool $unique,
     int $fresh,
+    Redis|Relay\Relay $connection,
 ): void {
     /** @var TagAwareAdapterInterface $pool */
     $pool = $make();
@@ -254,6 +256,111 @@ function run(
     if ('versioned' === $name) {
         $report($meter->measure($name, sprintf('read hit, fresh pool every %d reads, no shared rules', $fresh), static fn () => readFresh(static fn () => $make(false), $items, $fresh)));
     }
+
+    // What the server is left holding when nobody reads these items again -
+    // the case an operator lives with, since a cache is mostly written to and
+    // only sometimes read back. Each round starts from an empty database, so
+    // what is counted afterwards was put there by the adapter and by nothing
+    // else.
+
+    $connection->flushDb();
+    $pool = $make();
+    // a short life, then a full pass so the server drops what has expired
+    fill($pool, $items, $tagCount, $unique, 2);
+    sleep(3);
+    expireNow($connection);
+    $meter->note($name, 'left after the items expired', leftovers($connection));
+    echo sprintf('  %-24s %s%s', 'left after expiry', leftovers($connection), \PHP_EOL);
+
+    $connection->flushDb();
+    $pool = $make();
+    fill($pool, $items, $tagCount, $unique);
+    $pool->invalidateTags(['everything']);
+    $meter->note($name, 'left after invalidating everything', leftovers($connection));
+    echo sprintf('  %-24s %s%s', 'left after invalidation', leftovers($connection), \PHP_EOL);
+
+    // and what an operator can get back on purpose. Symfony's generic adapter
+    // is Pruneable and forwards to its pool, which a Redis pool is not, so it
+    // prunes nothing; RedisTagAwareAdapter gains a prune in 8.2 that collects
+    // the tag Sets' dangling members rather than items, which it deleted when
+    // the tag fell.
+    if ($pool instanceof PruneableInterface) {
+        $report($meter->measure($name, 'prune', static fn () => $pool->prune()));
+        $meter->note($name, 'left after prune', leftovers($connection));
+        echo sprintf('  %-24s %s%s', 'left after prune', leftovers($connection), \PHP_EOL);
+    } else {
+        $meter->note($name, 'left after prune', 'not pruneable');
+    }
+}
+
+/**
+ * A full pass over the keyspace, which also makes the server drop every
+ * expired key it meets: what has expired is gone logically at once, but is
+ * still held until something looks at it or the expiry cycle gets there.
+ */
+function expireNow(Redis|Relay\Relay $connection): void
+{
+    foreach ([1, 2] as $ignored) {
+        $cursor = null;
+
+        do {
+            $connection->scan($cursor, null, 5_000);
+        } while ($cursor);
+    }
+}
+
+/**
+ * What the server still holds, by kind. The shape of what an adapter leaves
+ * behind says as much as its size: an item is one thing, a tag Set that
+ * outlives every item it named is another, and a tag version key that nothing
+ * will ever delete is a third.
+ */
+function leftovers(Redis|Relay\Relay $connection): string
+{
+    $parts = [];
+
+    foreach (['string', 'hash', 'set', 'stream'] as $type) {
+        $cursor = '0';
+        $keys = 0;
+        $members = 0;
+        $versions = 0;
+
+        do {
+            $answer = $connection->rawCommand('SCAN', $cursor, 'COUNT', '5000', 'TYPE', $type);
+
+            if (!is_array($answer) || !isset($answer[0], $answer[1]) || !is_array($answer[1])) {
+                break;
+            }
+
+            $cursor = (string) $answer[0];
+            $batch = $answer[1];
+            $keys += count($batch);
+
+            foreach ($batch as $key) {
+                if ('set' === $type) {
+                    $members += (int) $connection->sCard((string) $key);
+                } elseif ('string' === $type && str_contains((string) $key, "\1tags\1")) {
+                    // TagAwareAdapter's per-tag version, written without a TTL
+                    ++$versions;
+                }
+            }
+        } while ('0' !== $cursor);
+
+        if (0 === $keys) {
+            continue;
+        }
+
+        $many = 1 === $keys ? '' : 's';
+
+        $parts[] = match (true) {
+            'set' === $type => sprintf('%s set%s holding %s member%s', number_format($keys), $many, number_format($members), 1 === $members ? '' : 's'),
+            'string' === $type && $versions > 0 => sprintf('%s string%s (%s of them tag versions)', number_format($keys), $many, number_format($versions)),
+            'hash' === $type => sprintf('%s hash%s', number_format($keys), 1 === $keys ? '' : 'es'),
+            default => sprintf('%s %s%s', number_format($keys), $type, $many),
+        };
+    }
+
+    return [] === $parts ? 'nothing' : implode(', ', $parts);
 }
 
 /**
@@ -274,14 +381,14 @@ function readFresh(Closure $make, int $items, int $every): void
     }
 }
 
-function fill(TagAwareAdapterInterface $pool, int $items, int $tagCount, bool $unique = false): void
+function fill(TagAwareAdapterInterface $pool, int $items, int $tagCount, bool $unique = false, int $lifetime = 3600): void
 {
     $payload = str_repeat('x', 256);
 
     for ($i = 0; $i < $items; ++$i) {
         $item = $pool->getItem('item-'.$i);
         $item->set($payload);
-        $item->expiresAfter(3600);
+        $item->expiresAfter($lifetime);
         $item->tag(tagsFor($i, $tagCount, $items, $unique));
         $pool->saveDeferred($item);
 
