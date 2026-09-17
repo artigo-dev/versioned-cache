@@ -27,7 +27,7 @@
         "symfony/cache-contracts": "^3.1"
     },
     "require-dev": {
-        "artigo/cache-stampede": "^1.0",
+        "artigo/cache-stampede": "^1.1",
         "cache/integration-tests": "^1.0.3",
         "friendsofphp/php-cs-fixer": "^3.64",
         "phpstan/phpstan": "^2.0",
