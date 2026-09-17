@@ -18,6 +18,7 @@ use Symfony\Component\Cache\CacheItem;
 use Symfony\Component\Cache\Exception\CacheException;
 use Symfony\Component\Cache\Marshaller\DefaultMarshaller;
 use Symfony\Component\Cache\Marshaller\MarshallerInterface;
+use Symfony\Component\Cache\PruneableInterface;
 
 /**
  * Tag invalidation that costs the same whether three items match or three
@@ -73,7 +74,8 @@ use Symfony\Component\Cache\Marshaller\MarshallerInterface;
  *
  * - **Memory comes back lazily.** An invalidated item holds its RAM until a
  *   read unlinks it or its TTL runs out. Reading a fully invalidated set is
- *   roughly twice the cost of reading a live one.
+ *   roughly twice the cost of reading a live one, and prune() is what takes
+ *   back the items nobody reads again.
  * - **Invalidation becomes visible within `rulesCacheMs`**, because the rule
  *   set is cached in the process for that long. Pass 0 for exact reads, at
  *   the price of loading the rules on every one.
@@ -83,7 +85,7 @@ use Symfony\Component\Cache\Marshaller\MarshallerInterface;
  *   TTL is capped and a warning is logged.
  * - **No tag enumeration.** There is no index to enumerate.
  */
-final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter
+final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implements PruneableInterface
 {
     /**
      * What Symfony puts between a namespace and a key. AbstractTagAwareAdapter
@@ -108,6 +110,11 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter
      * How often that worker looks whether the load has landed, in milliseconds.
      */
     private const COLD_POLL_MS = 2;
+
+    /**
+     * How many keys a prune names, reads and judges at a time.
+     */
+    private const PRUNE_BATCH = 1_000;
 
     /**
      * Appends one rule and keeps the stream from growing without bound. A
@@ -228,6 +235,73 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter
         // the rule set is shared truth with a bounded staleness, not request
         // state: keep it and let the next read fetch what is new
         $this->rulesReadAt = null;
+    }
+
+    /**
+     * Unlinks the items a rule invalidated that nobody has read since.
+     *
+     * Invalidating costs four commands here because it deletes nothing: a
+     * stale item is unlinked by the reader that finds it, and one nobody asks
+     * for again waits for its TTL. That is the bargain, and this is the way
+     * out of the single case where it is a poor one - a tag matching a great
+     * many items, none of them read afterwards.
+     *
+     * The walk asks the rule set it already holds exactly the question a read
+     * asks, item by item, and unlinks what answers yes. There is no index to
+     * consult and none to repair: this gives memory back, it does not make the
+     * pool any more correct, and a pool that is never pruned is correct all
+     * the same. Symfony's cache:pool:prune command drives it.
+     *
+     * The rules are read once, at the start. A rule appended during the walk
+     * is not applied this time, and an item written during it carries a mark
+     * newer than any rule in the snapshot, so it cannot be judged stale:
+     * either way of being out of date keeps an item that could have gone,
+     * which is the harmless direction.
+     *
+     * Between reading an item's stamp and unlinking it, a writer may put a
+     * fresh item in its place, which is then unlinked too. That is the race a
+     * read already runs when it unlinks what it has just judged, and it costs
+     * the same: one miss.
+     *
+     * A pool with no namespace has no keys of its own to name, so the walk
+     * covers the whole database and judges every hash in it - as Symfony's own
+     * prune does. Namespace a pool that shares its database.
+     *
+     * The batches are pipelined where the connection allows it, which a
+     * cluster does not: there a prune costs one round trip per item rather
+     * than one per thousand. It is a job for a cron either way.
+     */
+    public function prune(): bool
+    {
+        // no rules, no verdict: a read treats every item as a miss and unlinks
+        // nothing, and so does this
+        if (null === $rules = $this->rules()) {
+            return false;
+        }
+
+        $ok = true;
+        $batch = [];
+
+        try {
+            foreach ($this->pruneKeys() as $key) {
+                $batch[] = $key;
+
+                if (self::PRUNE_BATCH <= \count($batch)) {
+                    $ok = $this->pruneBatch($rules, $batch) && $ok;
+                    $batch = [];
+                }
+            }
+        } catch (\Exception $e) {
+            CacheItem::log($this->logger, 'Failed to walk the pool: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+
+            $ok = false;
+        }
+
+        if ([] !== $batch) {
+            $ok = $this->pruneBatch($rules, $batch) && $ok;
+        }
+
+        return $ok;
     }
 
     /**
@@ -464,6 +538,208 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter
     protected function doClear(string $namespace): bool
     {
         return $this->addRule([], $namespace);
+    }
+
+    /**
+     * Reads the tags and the watermark of a batch of keys, and unlinks those
+     * the rules invalidate. The rules key is skipped: it is a stream, and the
+     * record of the invalidations rather than a thing they can reach.
+     *
+     * @param list<string> $keys
+     */
+    private function pruneBatch(InvalidationRules $rules, array $keys): bool
+    {
+        $fields = [self::FIELD_TAGS, self::FIELD_MARK];
+        $calls = [];
+        $ids = [];
+
+        foreach ($keys as $key) {
+            if ($this->rulesKey === $key) {
+                continue;
+            }
+
+            $ids[] = $key;
+            $calls[] = ['hMGet', $key, $fields];
+        }
+
+        if ([] === $ids) {
+            return true;
+        }
+
+        $rows = $this->pipeline($calls);
+        $stale = [];
+
+        foreach ($ids as $index => $id) {
+            $row = $rows[$index] ?? null;
+
+            // not one of ours, or gone between the walk naming it and this
+            if (!\is_array($row) || !\is_string($row[self::FIELD_TAGS] ?? null)) {
+                continue;
+            }
+
+            $mark = $row[self::FIELD_MARK] ?? null;
+
+            if ($rules->invalidates($id, InvalidationRules::strings(json_decode($row[self::FIELD_TAGS], true)), \is_string($mark) ? $mark : InvalidationRules::NONE)) {
+                $stale[] = $id;
+            }
+        }
+
+        return [] === $stale || $this->doDelete($stale);
+    }
+
+    /**
+     * Every key of this pool, node by node, named the way the pool names them:
+     * a client-side prefix goes on the pattern where the client does not put
+     * it there itself, and comes off whatever the server answers with.
+     *
+     * @return iterable<string>
+     */
+    private function pruneKeys(): iterable
+    {
+        [$patternPrefix, $keyPrefix] = self::scanPrefixes($this->redis);
+        $pattern = $patternPrefix.$this->poolNamespace.'*';
+        $strip = \strlen($keyPrefix);
+
+        // a cluster is walked master by master, through the one client that
+        // also routes the reads and the unlinks afterwards
+        if ($this->redis instanceof \RedisCluster || $this->redis instanceof \Relay\Cluster) {
+            foreach ($this->redis->_masters() as $master) {
+                $address = self::address($master);
+                $cursor = null;
+
+                do {
+                    $keys = self::scanned($this->redis->scan($cursor, $address, $pattern, self::PRUNE_BATCH), $cursor);
+
+                    foreach ($keys as $key) {
+                        yield $strip > 0 ? substr($key, $strip) : $key;
+                    }
+                } while ($cursor);
+            }
+
+            return;
+        }
+
+        foreach ($this->scanNodes() as $node) {
+            $cursor = null;
+
+            do {
+                $keys = self::scanned($node->scan($cursor, $pattern, self::PRUNE_BATCH), $cursor);
+
+                foreach ($keys as $key) {
+                    yield $strip > 0 ? substr($key, $strip) : $key;
+                }
+            } while ($cursor);
+        }
+    }
+
+    /**
+     * The connections a walk visits one at a time: one on its own, or every
+     * host of an array of them. A cluster is not among them - it is walked
+     * through its own client, which is the only thing that can route to a
+     * master.
+     *
+     * @return list<\Redis|\Relay\Relay>
+     */
+    private function scanNodes(): array
+    {
+        if ($this->redis instanceof \Redis || $this->redis instanceof \Relay\Relay) {
+            return [$this->redis];
+        }
+
+        if (!$this->redis instanceof \RedisArray) {
+            return [];
+        }
+
+        $nodes = [];
+
+        foreach ($this->redis->_hosts() as $host) {
+            if (!\is_string($host)) {
+                continue;
+            }
+
+            $node = $this->redis->_instance($host);
+
+            if ($node instanceof \Redis) {
+                $nodes[] = $node;
+            }
+        }
+
+        return $nodes;
+    }
+
+    /**
+     * A SCAN answers a batch of keys and moves the cursor it was given, except
+     * on a cluster, where it answers [cursor, keys] and leaves the cursor
+     * alone.
+     *
+     * @return list<string>
+     */
+    private static function scanned(mixed $answer, mixed &$cursor): array
+    {
+        if (\is_array($answer) && isset($answer[1]) && \is_array($answer[1])) {
+            $cursor = $answer[0];
+            $answer = $answer[1];
+        }
+
+        $keys = [];
+
+        foreach (\is_array($answer) ? $answer : [] as $key) {
+            if (\is_string($key)) {
+                $keys[] = $key;
+            }
+        }
+
+        return $keys;
+    }
+
+    /**
+     * How a master names itself to the client that has to be told which one to
+     * scan: phpredis answers [host, port], Relay the same, and both take the
+     * address back as one string.
+     */
+    private static function address(mixed $master): string
+    {
+        if (!\is_array($master)) {
+            return \is_scalar($master) ? (string) $master : '';
+        }
+
+        $parts = [];
+
+        foreach ($master as $part) {
+            $parts[] = \is_scalar($part) ? (string) $part : '';
+        }
+
+        return implode(':', $parts);
+    }
+
+    /**
+     * A client-side prefix is on every key the server answers with, but only
+     * some clients put it on the pattern for us.
+     *
+     * @return array{0: string, 1: string} what to prepend to the pattern, and what to strip from the keys
+     */
+    private static function scanPrefixes(\Redis|\RedisArray|\RedisCluster|\Relay\Relay|\Relay\Cluster $redis): array
+    {
+        $isRelay = $redis instanceof \Relay\Relay || $redis instanceof \Relay\Cluster;
+        $prefix = $redis->getOption($isRelay ? \Relay\Relay::OPT_PREFIX : \Redis::OPT_PREFIX);
+
+        // an array of connections answers once per node; they share the option
+        if (\is_array($prefix)) {
+            $prefix = reset($prefix);
+        }
+
+        if (!\is_string($prefix) || '' === $prefix) {
+            return ['', ''];
+        }
+
+        $scan = $redis->getOption($isRelay ? \Relay\Relay::OPT_SCAN : \Redis::OPT_SCAN);
+        $scan = \is_int($scan) || \is_string($scan) ? (int) $scan : 0;
+
+        $prefixesItself = $isRelay
+            ? (bool) (\Relay\Relay::SCAN_PREFIX & $scan)
+            : \defined('Redis::SCAN_PREFIX') && (bool) (\Redis::SCAN_PREFIX & $scan);
+
+        return [$prefixesItself ? '' : $prefix, $prefix];
     }
 
     /**

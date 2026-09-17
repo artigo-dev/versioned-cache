@@ -66,7 +66,15 @@ $item->set($article)->tag(['articles', 'front-page']);
 $pool->save($item);
 
 $pool->invalidateTags(['articles']);   // four commands, whatever matched
+$pool->prune();                        // and the memory back, at your leisure
 ```
+
+Invalidating deletes nothing, on purpose: a stale item is unlinked by the
+reader that finds it. `prune()` is for the items nobody reads again — it walks
+the pool, asks the rules the same question a read asks, and unlinks what
+answers yes. Symfony's `cache:pool:prune` drives it, so a nightly cron is all
+it takes. Nothing depends on it: a pool that is never pruned is just as
+correct, only larger.
 
 Three settings beyond Symfony's:
 
@@ -152,23 +160,23 @@ of which moves when the network does.
 
 | Scenario | **`versioned`** | `RedisTagAwareAdapter` | `TagAwareAdapter` |
 |---|---|---|---|
-| fill (commands · round trips) | 60 060 · 20 798 | 102 978 · 21 349 | 61 595 · **41 059** |
-| overwrite (commands · round trips) | 60 010 · 20 748 | **40 000** · 20 852 | 46 615 · 27 679 |
-| read hit (commands) | 20 010 | 20 000 | 27 710 |
-| invalidate 1 000 matches | **4** · 0.001 s | 1 006 · 0.003 s | **1** · 0.001 s |
-| invalidate 2 000 matches | **4** · 0.000 s | 2 006 · 0.003 s | **1** · 0.000 s |
-| invalidate 20 000 matches | **4** · 0.000 s | 20 012 · 0.030 s | **1** · 0.000 s |
-| read after invalidating everything | 40 019 · 18.5 s | **20 000 · 9.1 s** | 40 000 · 20.3 s |
-| memory reclaimed | 18.3 MB | 16.6 MB | **0.0 MB** |
-| 10 000 invalidations matching nothing | 40 000 · 5.0 s | 50 000 · 4.8 s | **10 000** · 4.6 s |
-| read hit, 10 000 rules behind | 20 010 · 10.0 s | 20 000 · 9.4 s | 28 162 · 14.2 s |
-| read hit, fresh pool every 10 reads, 10 000 rules behind | 20 020 · 19.6 s | 20 000 · 9.2 s | 40 000 · 20.3 s |
-| the same, the rule set not shared | 22 000 · 68.0 s | &mdash; | &mdash; |
+| fill (commands · round trips) | 60 061 · 20 802 | 102 978 · 21 331 | 61 595 · **41 018** |
+| overwrite (commands · round trips) | 60 010 · 20 755 | **40 000** · 20 825 | 48 111 · 29 140 |
+| read hit (commands) | 20 010 | **20 000** | 29 059 |
+| invalidate 1 000 matches | **4** · 0.001 s | 1 006 · 0.003 s | **1** · 0.000 s |
+| invalidate 2 000 matches | **4** · 0.001 s | 2 006 · 0.004 s | **1** · 0.000 s |
+| invalidate 20 000 matches | **4** · 0.000 s | 20 012 · 0.035 s | **1** · 0.000 s |
+| read after invalidating everything | 40 019 · 18.8 s | **20 000 · 9.6 s** | 40 000 · 19.9 s |
+| memory reclaimed by reading | 18.3 MB | 16.6 MB | **0.0 MB** |
+| 10 000 invalidations matching nothing | 40 000 · 4.7 s | 50 000 · 4.9 s | **10 000** · 4.8 s |
+| read hit, 10 000 rules behind | 20 011 · 10.2 s | 20 000 · 9.9 s | 28 887 · 15.4 s |
+| read hit, fresh pool every 10 reads, 10 000 rules behind | 20 019 · 19.9 s | 20 000 · 10.3 s | 40 000 · 20.6 s |
+| the same, the rule set not shared | 22 000 · 69.8 s | &mdash; | &mdash; |
 
 Three of those rows are the questions a rule log invites.
 
 **What does a long log cost the readers?** Ten thousand invalidations land
-behind a fresh fill, so every item is older than every rule. Ten commands over
+behind a fresh fill, so every item is older than every rule. Eleven commands over
 twenty thousand reads — one refresh per second, the first carrying the ten
 thousand rules and the rest carrying nothing — because a refresh fetches only
 what was appended, and a read is judged against the newest rule per tag rather
@@ -180,7 +188,7 @@ fetches them again.
 two rows re-create the pool every ten reads, behind those ten thousand rules.
 Sharing the rule set through APCu, a fresh pool adopts a ten-thousand-tag set
 in about 5 ms and asks Redis for nothing; without sharing it loads the stream:
-2 000 more commands, about 30 ms per pool. `TagAwareAdapter` has no set to
+2 000 more commands, about 25 ms per pool. `TagAwareAdapter` has no set to
 lose, but a fresh pool has no known versions either, so every read costs two
 round trips; `RedisTagAwareAdapter` holds nothing between requests and pays
 nothing for a fresh one.
@@ -199,6 +207,36 @@ exactly — 1 006, 2 006, 20 012 — so the distance between them belongs to
 whoever grows. `TagAwareAdapter` needs one command, and always did: the
 difference to it is on the read side.
 
+### What each adapter leaves behind
+
+A cache is mostly written to and only sometimes read back, so what the server
+is still holding afterwards matters as much as what an invalidation cost. The
+same 20 000 items, with nobody reading them again:
+
+| | **`versioned`** | `RedisTagAwareAdapter` | `TagAwareAdapter` |
+|---|---|---|---|
+| after every item expired | **nothing** | 1 574 sets holding 360 000 members | 1 574 tag version keys |
+| after invalidating everything | 20 000 hashes, 1 stream | 1 573 sets holding 340 000 members | 20 000 items, 1 573 tag version keys |
+| after `prune()` | **1 stream** | &mdash; | unchanged |
+| what that prune cost | 20 042 · 123 round trips · 0.217 s | &mdash; | 0 commands |
+
+**Expiry leaves nothing here.** The tags live inside the item, so when Redis
+drops the key it drops the last thing that named the tag. A tag SET outlives
+every item in it: all 360 000 of those members point at keys that no longer
+exist, and the SETs carry no TTL, so no eviction policy reclaims them either.
+They are cleaned when the tag is next invalidated, or by the `prune()`
+`RedisTagAwareAdapter` gains in Symfony 8.2 (#65353) &mdash; not in the 8.1 the
+run above used, hence the dash. `TagAwareAdapter` writes one version key per
+tag ever used, also without a TTL, and has no way to collect them at all.
+
+**Invalidation is the other way round.** The eager walk deleted the items as it
+went, which is what its 20 012 commands bought; here they are still there,
+waiting for a reader or a prune. That is the bargain this adapter makes, and
+`prune()` is the way out of the case where it is a poor one: 20 000 items back
+in 0.217 s and 123 round trips, because the judgement happens in the process
+and only the unlinks go to the server. `TagAwareAdapter` is `Pruneable` too,
+but forwards to its inner pool, which a Redis pool is not, so nothing happens.
+
 ### With a tag of its own on every item
 
 The tags applications really use include one per entity — `article-42` — which
@@ -207,12 +245,14 @@ one of the 18 tags being the item's own (`unique=1`):
 
 | Scenario | **`versioned`** | `RedisTagAwareAdapter` | `TagAwareAdapter` |
 |---|---|---|---|
-| fill (commands · round trips) | 60 060 · 20 798 | 119 097 · 21 390 | 81 498 · **41 162** |
-| overwrite (commands · round trips) | 60 010 · 20 753 | **40 000** · 20 838 | 60 021 · **41 123** |
+| fill (commands · round trips) | 60 060 · 20 798 | 119 097 · 21 370 | 81 498 · **41 130** |
+| overwrite (commands · round trips) | 60 010 · 20 754 | **40 000** · 20 823 | 60 021 · **41 066** |
 | read hit (commands · round trips) | 20 010 · 20 010 | 20 000 · 20 000 | **40 000 · 40 000** |
-| read hit, 10 000 rules behind | 20 010 · 9.8 s | 20 000 · 9.4 s | 40 000 · 19.9 s |
-| read hit, fresh pool every 10 reads | 20 018 · 17.5 s | 20 000 · 9.3 s | 40 000 · 19.4 s |
-| the same, the rule set not shared | 22 000 · 66.7 s | &mdash; | &mdash; |
+| read hit, 10 000 rules behind | 20 012 · 11.2 s | 20 000 · 9.6 s | 40 000 · 21.2 s |
+| read hit, fresh pool every 10 reads | 20 029 · 29.8 s | 20 000 · 9.4 s | 40 000 · 21.4 s |
+| the same, the rule set not shared | 22 000 · 67.9 s | &mdash; | &mdash; |
+| after every item expired | **nothing** | 21 477 sets holding 360 000 members | 21 477 tag version keys |
+| after invalidating everything | 20 000 hashes, 1 stream | 21 476 sets holding 340 000 members | 20 000 items, 21 476 tag version keys |
 
 ![Round trips for 20 000 read hits, by what an item is tagged with](docs/reads.png)
 
@@ -226,7 +266,9 @@ Every cache trades something, and two rows of that table are the price.
 
 - **Memory comes back lazily.** An invalidated item holds its RAM until a reader
   unlinks it or its TTL runs out, so reading a *fully* invalidated set costs
-  **2×** — 40 019 commands against 20 000.
+  **2×** — 40 019 commands against 20 000. For the items nobody reads again,
+  `prune()` is the way out: it walks the pool and unlinks what the rules have
+  already invalidated, and `cache:pool:prune` drives it.
 - **The rules stream must not be evicted.** Like Symfony's tag Sets it carries
   no TTL, so that `volatile-*` and `noeviction` never touch it — run one of
   those. Under `allkeys-*` it can go; the read path then fails safe, and an item
@@ -257,11 +299,16 @@ Not our tests: `AdapterTestCase` and `TagAwareTestTrait`, the suite
 |---|---|
 | PSR-6 conformance, with `TagAwareTestTrait` | **154 tests**, one skip |
 | PSR-16 conformance | **212 tests**, one skip |
-| whole suite | **411 tests**, two skips |
+| whole suite | **418 tests**, two skips |
 
-Both skips are `testPrune`: Redis expires items by itself, so this pool is not
-`Pruneable` — and neither is the adapter it replaces. The rule stream trims
-itself as rules are appended, so there is nothing to prune there either.
+Both skips are `testPrune`, which sleeps its way through four expiry deadlines
+to watch a pool collect what has expired. Redis does that by itself, which is
+why Symfony's own Redis adapters skip it too. This pool *is* `Pruneable`, but
+for the other reason: `prune()` unlinks the items a rule has **invalidated**
+and nobody has read since. That is ours to prove, and
+[`PruneTest`](tests/Adapter/PruneTest.php) does — including that it keeps an
+item written after the rule, stays inside its own namespace, and deletes
+nothing at all when the rules cannot be read.
 
 The rest of the suite is ours, and it breaks Redis on purpose: a rules stream
 that cannot be read, a pipeline that never comes back, a stream deleted under
@@ -342,7 +389,7 @@ can re-run rather than take on trust:
 
 | script | question it answers |
 |---|---|
-| `benchmarks/bench.php` | what does invalidating a tag cost as the match count grows, what does a read cost after it, and what does a fresh process pay — against both of Symfony's tag adapters? |
+| `benchmarks/bench.php` | what does invalidating a tag cost as the match count grows, what does a read cost after it, what does a fresh process pay, and what is the server left holding afterwards — against both of Symfony's tag adapters? |
 | `benchmarks/charts.php` | redraws the pictures above from those measurements |
 
 `unique=1` gives every item one tag of its own, the entity tag applications
