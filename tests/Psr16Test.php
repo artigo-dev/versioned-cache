@@ -31,7 +31,7 @@ use Symfony\Component\Cache\Psr16Cache;
 final class Psr16Test extends SimpleCacheTest
 {
     protected array $skippedTests = [
-        'testPrune' => 'Redis expires items itself, so this pool is not Pruneable.',
+        'testPrune' => 'This one watches a pool collect what expired, which Redis does itself; what prune() collects here is what was invalidated, and PruneTest covers that.',
     ];
 
     private static \Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster $redis;
