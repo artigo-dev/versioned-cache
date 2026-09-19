@@ -83,7 +83,9 @@ use Symfony\Component\Cache\PruneableInterface;
  *   default. An item must never outlive the rule that made it stale, or it
  *   would come back from the dead once that rule is trimmed away, so a longer
  *   TTL is capped and a warning is logged.
- * - **No tag enumeration.** There is no index to enumerate.
+ * - **No tag index to inspect.** Nothing can be asked which items a tag
+ *   names, the way SMEMBERS on a tag SET answers it for RedisTagAwareAdapter.
+ *   Symfony's own interface never exposed that, so no API goes with it.
  */
 final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implements PruneableInterface
 {

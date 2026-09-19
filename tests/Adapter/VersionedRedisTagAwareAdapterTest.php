@@ -35,7 +35,7 @@ final class VersionedRedisTagAwareAdapterTest extends AdapterTestCase
     use TagAwareTestTrait;
 
     protected array $skippedTests = [
-        'testPrune' => 'Redis expires items itself, so this pool is not Pruneable. Neither is the RedisTagAwareAdapter it replaces.',
+        'testPrune' => 'This one watches a pool collect what expired, which Redis does itself; what prune() collects here is what was invalidated, and PruneTest covers that.',
     ];
 
     private static \Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster $redis;
