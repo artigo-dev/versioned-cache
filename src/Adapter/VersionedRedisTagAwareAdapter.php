@@ -670,6 +670,18 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             }
         }
 
+        // Relay does not drop what it cached of a key a script writes: the
+        // miss another connection read stays served from its in-process cache
+        // until this connection takes in the server's invalidation, which it
+        // does here, without a round trip
+        if ([] !== $guarded && ($this->redis instanceof \Relay\Relay || $this->redis instanceof \Relay\Cluster)) {
+            try {
+                $this->redis->dispatchEvents();
+            } catch (\Exception) {
+                // the writes are on the server; the next command catches up
+            }
+        }
+
         foreach ($first as $id => $index) {
             $result = $results[$index] ?? null;
 
@@ -1059,7 +1071,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
         $nodes = [];
 
-        foreach ($this->redis->_hosts() as $host) {
+        $hosts = $this->redis->_hosts();
+
+        foreach (\is_array($hosts) ? $hosts : [] as $host) {
             if (!\is_string($host)) {
                 continue;
             }
@@ -1605,7 +1619,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             try {
                 $time = match (true) {
                     $this->redis instanceof \RedisCluster, $this->redis instanceof \Relay\Cluster => $this->redis->time($this->rulesKey),
-                    $this->redis instanceof \RedisArray => ($node = $this->redis->_instance($this->redis->_target($this->rulesKey))) instanceof \Redis ? $node->time() : null,
+                    $this->redis instanceof \RedisArray => $this->ownerOf($this->rulesKey)?->time(),
                     default => $this->redis->time(),
                 };
             } catch (\Exception) {
@@ -1786,7 +1800,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     {
         return ($this->redis instanceof \RedisCluster || $this->redis instanceof \Relay\Cluster)
             && $this->readsReplicas()
-            && method_exists($this->redis, 'hsetex');
+            && method_exists($this->redis, 'hsetex'); // @phpstan-ignore function.alreadyNarrowedType (the stubs describe phpredis 6.3; an older one has no hsetex())
     }
 
     /**
@@ -2005,9 +2019,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
         $arguments = $call[1] ?? null;
         $key = \is_array($arguments) && \is_string($arguments[0] ?? null) ? $arguments[0] : '';
-        $node = $this->redis->_instance($this->redis->_target($key));
+        $node = $this->ownerOf($key);
 
-        return $node instanceof \Redis ? $node->{$method}(...$call) : false;
+        return null !== $node ? $node->{$method}(...$call) : false;
     }
 
     /**
@@ -2016,11 +2030,23 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private function onOwningNode(string $key, string ...$arguments): mixed
     {
+        $node = $this->ownerOf($key);
+
+        return null !== $node ? $node->rawCommand(...$arguments) : false;
+    }
+
+    /**
+     * The node of a RedisArray that owns $key, or null where the array names
+     * no host for it.
+     */
+    private function ownerOf(string $key): ?\Redis
+    {
         \assert($this->redis instanceof \RedisArray);
 
-        $node = $this->redis->_instance($this->redis->_target($key));
+        $host = $this->redis->_target($key);
+        $node = \is_string($host) ? $this->redis->_instance($host) : null;
 
-        return $node instanceof \Redis ? $node->rawCommand(...$arguments) : false;
+        return $node instanceof \Redis ? $node : null;
     }
 
     /**

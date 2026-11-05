@@ -149,7 +149,9 @@ final class InvalidationGuardTest extends TestCase
 
     public function testAValueThatDoesNotUnmarshalIsAGuardedMiss(): void
     {
-        $this->raw->hMSet('guard:k', ['v' => 'not a marshalled value', 't' => '[]', 'm' => '0-0', 'e' => 'e0']);
+        // an object of a class that does not exist: the marshaller refuses it
+        // without a PHP warning, where igbinary warns about plain junk
+        $this->raw->hMSet('guard:k', ['v' => 'O:30:"Artigo\Cache\Tests\NoSuchClass":0:{}', 't' => '[]', 'm' => '0-0', 'e' => 'e0']);
 
         $a = $this->pool($this->a);
         $item = $a->getItem('k');
@@ -230,10 +232,8 @@ final class InvalidationGuardTest extends TestCase
         self::assertFalse($a->getItem('k')->isHit());
 
         if (\defined(ItemInterface::class.'::METADATA_SAVE_FAILED')) {
-            $failed = \constant(ItemInterface::class.'::METADATA_SAVE_FAILED');
-            self::assertIsString($failed);
             self::assertIsArray($metadata);
-            self::assertArrayNotHasKey($failed, $metadata, 'it was not refused: it landed, and reads stale');
+            self::assertArrayNotHasKey(ItemInterface::METADATA_SAVE_FAILED, $metadata, 'it was not refused: it landed, and reads stale');
         }
     }
 
@@ -418,6 +418,17 @@ final class InvalidationGuardTest extends TestCase
         self::assertFalse($a->getItem('x')->isHit());
     }
 
+    public function testAnotherConnectionSeesAGuardedWriteAtOnce(): void
+    {
+        // another connection read the miss first: Relay keeps what it read
+        self::assertFalse($this->pool(Connection::open())->getItem('k')->isHit());
+
+        $a = $this->pool($this->a);
+        self::assertTrue($a->save($a->getItem('k')->set('v')), 'a guarded write, after the read of its own pool');
+
+        self::assertTrue($this->pool(Connection::open())->getItem('k')->isHit(), 'no copy of the miss is served after the script wrote the key');
+    }
+
     public function testAnInvalidationAfterTheOwnRuleStillInvalidates(): void
     {
         $a = $this->pool($this->a);
@@ -490,7 +501,7 @@ final class InvalidationGuardTest extends TestCase
      */
     private function hSetEx(string $key, array $fields, int $ttlMs): void
     {
-        if (method_exists($this->raw, 'hsetex')) {
+        if (method_exists($this->raw, 'hsetex')) { // @phpstan-ignore function.alreadyNarrowedType (the stubs describe phpredis 6.3; an older one has no hsetex())
             $this->raw->hsetex($key, $fields, ['PX' => $ttlMs]);
 
             return;

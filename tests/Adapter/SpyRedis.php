@@ -37,6 +37,15 @@ final class SpyRedis extends \Redis
     public bool $execRaisesOnAForgottenScript = false;
 
     /**
+     * Forgets the ranges asked for so far.
+     */
+    public function forgetRanges(): void
+    {
+        $this->starts = [];
+        $this->counts = [];
+    }
+
+    /**
      * @return \Redis|array<mixed>|bool
      */
     public function xRange(string $key, string $start, string $end, int $count = -1): \Redis|array|bool
