@@ -37,7 +37,8 @@
     "suggest": {
         "artigo/cache-stampede": "Stampede protection that spans a fleet: Symfony's own guards one machine",
         "ext-apcu": "To share the rule set across the workers of a server, so a request adopts it instead of loading the stream (the default where it is enabled)",
-        "ext-relay": "To use Relay instead of ext-redis, answering reads from a replica in the process"
+        "ext-relay": "To use Relay instead of ext-redis, answering reads from a replica in the process",
+        "ext-zstd": "For ZstdMarshaller, which compresses values with zstd and tells a compressed one by its first four bytes"
     },
     "autoload": {
         "psr-4": {

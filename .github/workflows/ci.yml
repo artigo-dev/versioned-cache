@@ -69,7 +69,7 @@ jobs:
             - uses: shivammathur/setup-php@v2
               with:
                   php-version: "${{ matrix.php }}"
-                  extensions: redis, apcu
+                  extensions: redis, apcu, zstd
                   coverage: none
                   # Symfony validates cache keys inside \assert(), so with
                   # assertions compiled out a quarter of its own conformance
@@ -124,7 +124,7 @@ jobs:
             - uses: shivammathur/setup-php@v2
               with:
                   php-version: '8.4'
-                  extensions: redis, relay, apcu
+                  extensions: redis, relay, apcu, zstd
                   coverage: none
                   ini-values: zend.assertions=1, apc.enable_cli=1
 
@@ -159,7 +159,7 @@ jobs:
             - uses: shivammathur/setup-php@v2
               with:
                   php-version: '8.4'
-                  extensions: redis, relay, apcu
+                  extensions: redis, relay, apcu, zstd
                   coverage: none
                   ini-values: zend.assertions=1, apc.enable_cli=1
 
@@ -192,7 +192,7 @@ jobs:
             - uses: shivammathur/setup-php@v2
               with:
                   php-version: '8.4'
-                  extensions: redis, apcu
+                  extensions: redis, apcu, zstd
                   coverage: none
                   ini-values: zend.assertions=1, apc.enable_cli=1
 
@@ -217,7 +217,7 @@ jobs:
             - uses: shivammathur/setup-php@v2
               with:
                   php-version: '8.4'
-                  extensions: redis, apcu
+                  extensions: redis, apcu, zstd
                   coverage: none
 
             - uses: ramsey/composer-install@v4

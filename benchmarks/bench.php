@@ -30,6 +30,7 @@ declare(strict_types=1);
  *   php benchmarks/bench.php unique=1
  *   php benchmarks/bench.php unique=1 behind=100000
  *   php benchmarks/bench.php stores=versioned payload=model marshaller=deflate
+ *   php benchmarks/bench.php stores=versioned payload=model marshaller=zstd
  *   php -d apc.enable_cli=1 -d apc.shm_size=256M benchmarks/bench.php adopt=15000,100000
  *   php -d apc.enable_cli=1 benchmarks/bench.php reads=100
  *   php benchmarks/bench.php guard=1
@@ -39,7 +40,8 @@ declare(strict_types=1);
  *          fresh=N (re-create the pool every N reads in the FPM rows; 10),
  *          behind=N (how many unrelated rules land behind the fill; 10000),
  *          payload=model (a ~2.5 KB entity instead of 256 repeated bytes),
- *          marshaller=deflate (Symfony's DeflateMarshaller around the default)
+ *          marshaller=deflate (Symfony's DeflateMarshaller around the default),
+ *          marshaller=zstd (this package's ZstdMarshaller around the default)
  *
  * Three modes answer one question each and print their own table:
  *
@@ -63,6 +65,7 @@ use Artigo\Cache\Adapter\SharedRules;
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
 use Artigo\Cache\Benchmarks\Meter;
 use Artigo\Cache\Benchmarks\Result;
+use Artigo\Cache\Marshaller\ZstdMarshaller;
 use Symfony\Component\Cache\Adapter\AdapterInterface;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
 use Symfony\Component\Cache\Adapter\RedisTagAwareAdapter;
@@ -100,7 +103,11 @@ $fresh = max(1, (int) ($options['fresh'] ?? 10));
 // behind=N is how many unrelated rules land behind the fill in the long-log rows
 $behind = max(1, (int) ($options['behind'] ?? 10_000));
 $payload = 'model' === ($options['payload'] ?? '') ? 'model' : 'bytes';
-$marshaller = 'deflate' === ($options['marshaller'] ?? '') ? new DeflateMarshaller(new DefaultMarshaller()) : null;
+$marshaller = match ($options['marshaller'] ?? '') {
+    'deflate' => new DeflateMarshaller(new DefaultMarshaller()),
+    'zstd' => new ZstdMarshaller(new DefaultMarshaller()),
+    default => null,
+};
 
 // client=relay runs both adapters through Relay instead of ext-redis, which
 // answers reads from a replica in this process rather than over the socket

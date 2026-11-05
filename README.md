@@ -454,24 +454,83 @@ can arrive in several reads.
 
 **Compress in the marshaller, never in the client.** The adapter writes raw hash
 fields and reads them back with `HMGET`, so it refuses phpredis' own serializer
-and compression, as `RedisTagAwareAdapter` does. Symfony's `DeflateMarshaller`
-is where compression belongs, and it pays: bastnic measured 2 609 → 743 bytes
-per model and about 80 % less load on the cache nodes
+and compression, as `RedisTagAwareAdapter` does. The marshaller is where
+compression belongs, and it pays: bastnic measured 2 609 → 743 bytes per model
+and about 80 % less load on the cache nodes
 ([his post](https://gist.github.com/bastnic/b08fa600b19d24b2c839461c700f6cf3)).
-Decorate `cache.default_marshaller` with it, or, since FrameworkBundle 8.1, set
-it per pool with the pool's `marshaller` option. Here, for a ~2.5 KB entity
-(`bench.php stores=versioned payload=model`, with and without
-`marshaller=deflate`):
+Where ext-zstd is loaded, use this package's `ZstdMarshaller`; elsewhere,
+Symfony's `DeflateMarshaller`. Either works with any Symfony pool:
+
+```php
+use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
+use Artigo\Cache\Marshaller\ZstdMarshaller;
+use Symfony\Component\Cache\Marshaller\DefaultMarshaller;
+
+$pool = new VersionedRedisTagAwareAdapter($redis, marshaller: new ZstdMarshaller(new DefaultMarshaller()));
+```
+
+```yaml
+# config/services.yaml: every pool that uses the default marshaller
+services:
+    Artigo\Cache\Marshaller\ZstdMarshaller:
+        decorates: cache.default_marshaller
+        arguments: ['@.inner']
+```
+
+Since FrameworkBundle 8.1 a single pool can take it with its `marshaller`
+option instead. Here, for a ~2.5 KB entity (`bench.php stores=versioned
+payload=model`, without a marshaller option, then with `marshaller=deflate` and
+`marshaller=zstd`):
 
 | marshaller | bytes Redis received per item written | commands |
 |---|---:|---:|
 | `DefaultMarshaller` | 2 912 B | 5 per item |
 | `DeflateMarshaller` | **1 329 B** (−54 %) | 5 per item |
+| `ZstdMarshaller` | **1 376 B** (−53 %) | 5 per item |
 
 The bytes are the whole write — the `HMGET` that found the miss and the
 `EVALSHA` that carries the value, its tags, its watermark and the epochs; the
 five commands count the three the script runs — so the value itself shrank by
 more than that.
+
+**Zstd or deflate.** On the ~2.6 KB models zstd keeps 5 % more bytes and takes
+a third of deflate's time to write them and less than half to read them; on
+~300-byte records it keeps 9 % more and takes about 60 % of the time both ways;
+on a large fragment it is the same size at an eighth of the write time
+(`benchmarks/marshaller.php`, PHP 8.5, ext-zstd 0.15.2 with libzstd 1.5.7, the
+medians of three runs):
+
+| values | deflate (level -1): ratio · compress · decompress | zstd (level 3): ratio · compress · decompress |
+|---|---|---|
+| product models, ~2.6 KB | 0.482 · 50 µs · 13 µs | 0.508 · 17 µs · 5.3 µs |
+| records, ~300 B | 0.661 · 10 µs · 3.3 µs | 0.723 · 6.2 µs · 2.1 µs |
+| a rendered fragment, ~50 KB | 0.135 · 566 µs · 40 µs | 0.136 · 67 µs · 40 µs |
+
+A zstd frame begins with a four-byte magic number, so `ZstdMarshaller` tells a
+compressed value from a raw one with a 4-byte compare (30 ns), where
+`DeflateMarshaller` tries to inflate every value it reads (470 ns when the value
+was not deflated). That is what lets it keep a value raw: one shorter than the
+threshold, or one the frame would not shrink. A frame is smaller than the value
+only from about 90 bytes on, and around 100 bytes it saves 4 %, so values under
+256 bytes stay raw by default (`threshold`). A raw value that happens to begin
+with the magic number is compressed whatever its size, so whatever the
+marshaller writes and begins with it is a frame.
+
+Values written before the marshaller was added read as they are, unless one
+begins with the magic number: any stored value that does is read as a frame. A
+value `DeflateMarshaller` wrote has no header and reads as a miss (Symfony's
+own adapters log the failed unserialize), so moving a pool from one to the
+other is a cold cache. A value that begins with the magic number is read as
+exactly one frame, the way the marshaller writes it, and refused, so read as a
+miss, where it is anything else: where the header sets the reserved bit; where
+it states no size, a size of 0 or more than `maxLength` (16 MiB; longer values
+are stored raw), checked before inflating because the extension reserves the
+stated size first; where the frame's blocks, followed to the last one, do not
+end exactly where the value does (a frame cut short, a second frame, a
+skippable frame or any other bytes after it), which `zstd_uncompress()` alone
+would not notice; and where the frame does not inflate to the size it states.
+Frames carry no checksum: bytes damaged inside one can inflate to a different
+value of the right size, as with deflate.
 
 **Replicas (`failover=slaves`).** phpredis sends a cluster's read-only commands
 to replicas and everything else to the primaries:
@@ -823,7 +882,7 @@ Not our tests: `AdapterTestCase` and `TagAwareTestTrait`, the suite
 |---|---|
 | PSR-6 conformance, with `TagAwareTestTrait` | **154 tests**, one skip |
 | PSR-16 conformance | **212 tests** |
-| whole suite, on a single node | **527 tests**, eight skips |
+| whole suite, on a single node | **552 tests**, eight skips |
 
 The skip is `testPrune`, which sleeps its way through four expiry deadlines to
 watch a pool collect what has expired. Redis does that by itself, which is why
@@ -902,7 +961,7 @@ twelve real ones at the same cold key for that.
 
 PHP 8.2+, 64-bit · `symfony/cache` 6.4, 7.x or 8.x · **Redis 8.0+** ·
 `ext-apcu` recommended under PHP-FPM, for the shared rule set (see
-`rulesCache`)
+`rulesCache`) · `ext-zstd` for `ZstdMarshaller`
 
 Redis 8 is what makes a write a single command: `HSETEX` sets an item's fields
 and their expiry together, so there is no way for the data to land without the
@@ -928,8 +987,9 @@ node that owns it, and a raw command to the node that owns its key. A
 client-side key prefix (`OPT_PREFIX`) is honoured: the client puts it on the
 keys of typed calls and scripts, and the adapter on those of the raw commands,
 which a client sends as they are. CI runs the suite on PHP 8.2 to 8.5 against
-Symfony 6.4, 7.4 and 8.1, on Redis 8.0, 8.4 and the current 8.x and on Valkey
-9, through Relay, against a three-master cluster through ext-redis and
+Symfony 6.4, 7.4, 8.1 and the 8.2 development branch, on Redis 8.0, 8.4 and
+the current 8.x and on Valkey 9, through Relay, against a three-master
+cluster through ext-redis and
 through Relay, and against three masters with a replica each, read from the
 replicas (`failover=slaves`), every cluster leg with and without a key prefix;
 the array is two names for one server.
@@ -948,14 +1008,16 @@ can re-run rather than take on trust:
 | `benchmarks/race.php` | does a value computed before an invalidation survive it, and how many writes would one epoch per pool refuse? |
 | `benchmarks/soft.php` | what does a visitor wait for after a tag invalidation, hard and soft? (needs cache-stampede 2.0) |
 | `benchmarks/bench.php guard=1` | what does the invalidation guard cost a fill, a read and a delete? |
+| `benchmarks/marshaller.php` | what do deflate and zstd cost and save per value, from which size is a frame smaller than the value, and what does telling a raw value from a compressed one cost? (needs ext-zstd; no Redis) |
 | `benchmarks/charts.php` | redraws the pictures above from those measurements |
 
 `unique=1` gives every item one tag of its own, the entity tag applications
 really use; `fresh=N` re-creates the pool every N reads in the FPM rows, the
 way a request is a fresh process; `behind=N` sets how many unrelated rules land
 behind the fill (10 000); `payload=model` writes a ~2.5 KB entity instead of
-256 repeated bytes, and `marshaller=deflate` wraps the default marshaller in
-Symfony's `DeflateMarshaller`; `stores=` picks from `versioned`, `symfony`
+256 repeated bytes, and `marshaller=deflate` or `marshaller=zstd` wraps the
+default marshaller in Symfony's `DeflateMarshaller` or in `ZstdMarshaller`;
+`stores=` picks from `versioned`, `symfony`
 (`RedisTagAwareAdapter`) and `tagaware` (`TagAwareAdapter` over a `RedisAdapter`).
 
 The stampede benchmark moved to
