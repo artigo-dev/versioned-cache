@@ -14,6 +14,7 @@ namespace Artigo\Cache\Tests\Adapter;
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
 use Artigo\Cache\MemoLock;
 use Artigo\Cache\Tests\Connection;
+use Composer\InstalledVersions;
 use PHPUnit\Framework\TestCase;
 use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
@@ -142,11 +143,9 @@ final class VersionedWithMemoLockTest extends TestCase
         self::assertSame('computed by the next reader', $next, 'the refused value was never stored');
         self::assertLessThan(1.0, microtime(true) - $began, 'and nobody waited for it');
 
-        if (\defined(ItemInterface::class.'::METADATA_SAVE_FAILED') && self::stampedeReportsTheSave($this->redis)) {
-            $failed = \constant(ItemInterface::class.'::METADATA_SAVE_FAILED');
-            self::assertIsString($failed);
+        if (self::symfonyReportsAFailedSave() && self::stampedeReportsTheSave($this->redis)) {
             self::assertIsArray($metadata);
-            self::assertTrue($metadata[$failed] ?? false, 'the refusal reached the caller');
+            self::assertTrue($metadata[ItemInterface::METADATA_SAVE_FAILED] ?? false, 'the refusal reached the caller');
         }
     }
 
@@ -232,6 +231,18 @@ final class VersionedWithMemoLockTest extends TestCase
         self::assertGreaterThan(1.0, microtime(true) - $began, 'it waited past the tombstone');
         self::assertSame('forced after the wait', $value);
         self::assertSame('forced after the wait', $this->pool()->getItem('forced')->get(), 'it landed');
+    }
+
+    /**
+     * Whether symfony/cache puts a failed save in get()'s $metadata, which it
+     * does from 8.2 on. The constant alone says nothing: it comes with
+     * symfony/cache-contracts, which earlier versions install as well.
+     */
+    private static function symfonyReportsAFailedSave(): bool
+    {
+        $version = InstalledVersions::getVersion('symfony/cache');
+
+        return null !== $version && version_compare($version, '8.2.0.0-dev', '>=');
     }
 
     /**

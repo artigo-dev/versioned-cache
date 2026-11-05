@@ -57,7 +57,7 @@ final class RulesStreamTest extends TestCase
         self::assertTrue($pool->getItem('k')->isHit());
 
         $held = array_key_first((array) $this->other->xRange('stream:@rules', '-', '+'));
-        $this->redis->starts = [];
+        $this->redis->forgetRanges();
 
         $elsewhere->invalidateTags(['t']);
 
@@ -248,7 +248,7 @@ final class RulesStreamTest extends TestCase
         $pipe->exec();
 
         $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 1_000, rulesCache: false, rulesMaxTags: 0);
-        $this->redis->starts = [];
+        $this->redis->forgetRanges();
 
         self::assertFalse($pool->getItem('first')->isHit(), 'a rule of the first batch');
         self::assertFalse($pool->getItem('second')->isHit(), 'of the second');
