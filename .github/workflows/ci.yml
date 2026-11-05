@@ -36,11 +36,21 @@ jobs:
                     - php: '8.4'
                       symfony: '8.1.*'
                       redis: '8.0'
+                    - php: '8.4'
+                      symfony: '8.1.*'
+                      redis: '8.4'
                     # Valkey has HSETEX since 9.0
                     - php: '8.4'
                       symfony: '8.1.*'
                       redis: 'valkey-9'
                       image: 'valkey/valkey:9-alpine'
+                    # the next Symfony, where a refused write reaches the
+                    # caller as METADATA_SAVE_FAILED, with the lock's main
+                    # branch that reports it
+                    - php: '8.5'
+                      symfony: '8.2.x-dev'
+                      redis: '8'
+                      dev: true
 
         services:
             redis:
@@ -67,12 +77,27 @@ jobs:
                   # runs that suite itself.
                   ini-values: zend.assertions=1, apc.enable_cli=1
 
+            # a dev line needs dev stability, and the sibling's unreleased
+            # work comes from its main branch; neither is ever committed
+            - if: ${{ matrix.dev }}
+              run: |
+                  composer config minimum-stability dev
+                  composer config prefer-stable true
+                  composer require --dev --no-update artigo/cache-stampede:dev-main
+
             # resolve against the Symfony line of this leg rather than the
             # lock file, which pins the newest
             - uses: ramsey/composer-install@v4
               with:
                   dependency-versions: highest
                   composer-options: "--with=symfony/cache:${{ matrix.symfony }}"
+
+            # the conformance test the guard most easily breaks, first and
+            # alone, against whatever the next Symfony made of it
+            - if: ${{ matrix.dev }}
+              run: vendor/bin/phpunit -c phpunit.dist.xml --filter testInvalidateCommits
+              env:
+                  REDIS_DSN: redis://127.0.0.1:6379
 
             - run: vendor/bin/phpunit -c phpunit.dist.xml
               env:
@@ -142,9 +167,37 @@ jobs:
 
             # the MemoLock tests want a single node and skip themselves here;
             # what this job is for is the adapter against three masters
-            - run: vendor/bin/phpunit -c phpunit.dist.xml --filter VersionedRedisTagAwareAdapterTest
+            - run: vendor/bin/phpunit -c phpunit.dist.xml --filter 'VersionedRedisTagAwareAdapterTest|InvalidationGuardTest'
               env:
                   REDIS_DSN: "redis:?host[127.0.0.1:7000]&host[127.0.0.1:7001]&host[127.0.0.1:7002]&redis_cluster=1"
+
+    cluster-replicas:
+        name: Redis Cluster with replicas (failover=slaves)
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v5
+
+            # three masters with a replica each, from the test compose file
+            - run: docker compose -f compose.tests.yaml --profile cluster-replicas up -d --wait
+
+            - uses: shivammathur/setup-php@v2
+              with:
+                  php-version: '8.4'
+                  extensions: redis, apcu
+                  coverage: none
+                  ini-values: zend.assertions=1, apc.enable_cli=1
+
+            - uses: ramsey/composer-install@v4
+
+            # reads go to the replicas and lag behind the primaries: the
+            # conformance suite and the guard must hold all the same.
+            # RulesStreamTest needs a single node and skips itself here; the
+            # replica and pipeline tests run against stand-ins and say what
+            # they prove
+            - run: vendor/bin/phpunit -c phpunit.dist.xml --filter 'VersionedRedisTagAwareAdapterTest|InvalidationGuardTest|RulesStreamTest|ReplicaReadsTest|ClusterPipelineTest'
+              env:
+                  REDIS_DSN: "redis:?host[127.0.0.1:7110]&host[127.0.0.1:7111]&host[127.0.0.1:7112]&redis_cluster=1&failover=slaves"
 
     static:
         name: Coding standards and static analysis

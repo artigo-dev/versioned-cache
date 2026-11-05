@@ -74,6 +74,34 @@ services:
         profiles: ["flaky"]
         command: redis-server --maxmemory-policy volatile-ttl --save ""
 
+    # three masters with a replica each, for failover=slaves: reads go to the
+    # replicas, writes and scripts to the masters. Every node runs in this one
+    # container and announces 127.0.0.1, so the addresses the cluster hands
+    # out are the ones the host reaches.
+    #   docker compose -f compose.tests.yaml --profile cluster-replicas up -d --wait
+    #   REDIS_DSN="redis:?host[127.0.0.1:7110]&host[127.0.0.1:7111]&host[127.0.0.1:7112]&redis_cluster=1&failover=slaves"
+    redis-cluster-replicas:
+        image: redis:8-alpine
+        profiles: ["cluster-replicas"]
+        ports: ["7110-7115:7110-7115"]
+        # healthy once the slot map names every replica and each has synced:
+        # before that a read sent to a replica times out, and the adapter
+        # serves misses - correct, but not what the tests are there to see
+        healthcheck:
+            test: ["CMD-SHELL", "[ $$(redis-cli -p 7110 cluster slots | grep -cE '^711[345]$$') -ge 3 ] && for p in 7110 7111 7112 7113 7114 7115; do redis-cli -p $$p cluster info | grep -q cluster_state:ok || exit 1; done && for p in 7113 7114 7115; do redis-cli -p $$p info replication | grep -q master_link_status:up || exit 1; done"]
+            interval: 1s
+            timeout: 3s
+            retries: 60
+        command: >
+            sh -c 'for port in 7110 7111 7112 7113 7114 7115; do
+            redis-server --port $$port --cluster-enabled yes --cluster-config-file nodes-$$port.conf
+            --cluster-announce-ip 127.0.0.1 --maxmemory-policy volatile-ttl --save "" --daemonize yes;
+            done;
+            until redis-cli -p 7115 ping; do sleep 0.2; done;
+            redis-cli --cluster create 127.0.0.1:7110 127.0.0.1:7111 127.0.0.1:7112
+            127.0.0.1:7113 127.0.0.1:7114 127.0.0.1:7115 --cluster-replicas 1 --cluster-yes;
+            tail -f /dev/null'
+
     # kill the primary mid-write and watch what the adapter does
     redis-primary:
         <<: *evict

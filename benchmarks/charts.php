@@ -23,31 +23,31 @@ namespace Artigo\Cache\Benchmarks;
 
 /*
  * php benchmarks/bench.php items=20000
- * 20 000 items, 18 tags each, Redis 8, PHP 8.5. Commands executed by Redis to
- * invalidate one tag, by how many items that tag matched.
+ * 20 000 items, 18 tags each, Redis 8.10, PHP 8.5. Commands executed by Redis
+ * to invalidate one tag, by how many items that tag matched.
  */
 const INVALIDATION = [
     'labels' => ['1 000', '2 000', '20 000'],
     'series' => [
         ['name' => 'versioned', 'colour' => '#3ddc97', 'values' => [4, 4, 4]],
-        ['name' => 'RedisTagAwareAdapter', 'colour' => '#ff6b6b', 'values' => [1006, 2006, 20012]],
+        ['name' => 'RedisTagAwareAdapter', 'colour' => '#ff6b6b', 'values' => [1006, 2006, 20013]],
         ['name' => 'TagAwareAdapter', 'colour' => '#ffd166', 'values' => [1, 1, 1]],
     ],
 ];
 
 /*
  * php benchmarks/bench.php items=20000 · php benchmarks/bench.php items=20000 unique=1
- * The same 20 000 items read once each as hits, on Redis 8.8, PHP 8.5, over
- * loopback. Socket reads Redis did - round trips - by whether every item
+ * The same 20 000 items read once each as hits, on Redis 8.10, PHP 8.5, the
+ * benchmark in a container on the Redis container's network. Socket reads Redis did - round trips - by whether every item
  * carries a tag of its own (the entity tag applications really use) or only
  * tags it shares with others.
  */
 const READS = [
     'labels' => ['shared tags only', 'one tag of its own'],
     'series' => [
-        ['name' => 'versioned', 'colour' => '#3ddc97', 'values' => [20010, 20010]],
+        ['name' => 'versioned', 'colour' => '#3ddc97', 'values' => [20002, 20002]],
         ['name' => 'RedisTagAwareAdapter', 'colour' => '#ff6b6b', 'values' => [20000, 20000]],
-        ['name' => 'TagAwareAdapter', 'colour' => '#ffd166', 'values' => [29059, 40000]],
+        ['name' => 'TagAwareAdapter', 'colour' => '#ffd166', 'values' => [21415, 40000]],
     ],
 ];
 

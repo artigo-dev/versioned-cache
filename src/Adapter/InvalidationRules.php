@@ -37,6 +37,25 @@ namespace Artigo\Cache\Adapter;
  * its tags: the one verdict that cannot serve a value past its invalidation.
  * An item stamped 0-0 saw no rule and is exempt.
  *
+ * The set is bounded. Past $maxTags rules, tags and prefixes together, it
+ * keeps its newest 90 % and puts a floor in place of the rest: a rule for the
+ * whole pool at the newest id it dropped. Every dropped rule is at or below
+ * the floor, so whatever one of them invalidated, the floor invalidates too:
+ * an item stamped before it reads as a miss, never as a stale hit, and one
+ * stamped at or after it keeps its verdicts. The 10 % of headroom keeps a set
+ * at its bound from being cut again by every rule that follows.
+ *
+ * A tag rule may be hard. Beside the newest rule per tag, the set keeps the
+ * newest hard one, so that invalidatedAt() can tell a value a soft rule
+ * reached - which a reader may keep for a grace - from one a hard rule, a
+ * clear, a floor or a lost stream reached, which it may not.
+ *
+ * Rule ids are held as one integer each, the milliseconds above 20 bits of
+ * sequence, so a verdict is an integer comparison and the set crosses a
+ * request as a flat array. 20 bits leave 43 for the milliseconds, enough until
+ * the year 2248. A sequence too large for them can only invalidate: a rule's
+ * is clamped up, an item's watermark down (see rule() and mark()).
+ *
  * @internal
  */
 final class InvalidationRules
@@ -51,16 +70,31 @@ final class InvalidationRules
     private const FIELD_FIRST = 'first';
 
     /**
-     * The newest rule id naming each tag.
+     * Set in a rule to make it hard: see invalidatedAt().
+     */
+    public const HARD = 'h';
+
+    private const SEQUENCE_BITS = 20;
+    private const SEQUENCE_MAX = (1 << self::SEQUENCE_BITS) - 1;
+
+    /**
+     * The newest rule id naming each tag, packed (see rule()).
      *
-     * @var array<string, array{int, int}>
+     * @var array<string, int>
      */
     private array $tags = [];
 
     /**
-     * The prefix rules, oldest first.
+     * The newest hard rule id naming each tag, packed.
      *
-     * @var list<array{int, int, string}>
+     * @var array<string, int>
+     */
+    private array $hard = [];
+
+    /**
+     * The prefix rules, oldest first: packed id, prefix.
+     *
+     * @var list<array{int, string}>
      */
     private array $prefixes = [];
 
@@ -77,10 +111,12 @@ final class InvalidationRules
     /**
      * @param string $poolNamespace the prefix every id in the pool carries; a prefix rule equal to it covers the whole pool
      * @param int    $retentionMs   how long a rule can matter, being the longest an item may live
+     * @param int    $maxTags       how many rules the set holds before a floor takes the place of its oldest; 0 for no bound
      */
     public function __construct(
         private readonly string $poolNamespace,
         private readonly int $retentionMs,
+        private readonly int $maxTags = 0,
     ) {
     }
 
@@ -97,12 +133,13 @@ final class InvalidationRules
      * The shape that crosses requests (see SharedRules): plain arrays,
      * nothing else, so any cache pool stores it as it is.
      *
-     * @return array{tags: array<string, array{int, int}>, prefixes: list<array{int, int, string}>, last: string, first: string, first_opened: bool|null}
+     * @return array{tags: array<string, int>, hard: array<string, int>, prefixes: list<array{int, string}>, last: string, first: string, first_opened: bool|null}
      */
     public function toArray(): array
     {
         return [
             'tags' => $this->tags,
+            'hard' => $this->hard,
             'prefixes' => $this->prefixes,
             'last' => $this->last,
             'first' => $this->first,
@@ -111,12 +148,68 @@ final class InvalidationRules
     }
 
     /**
-     * Rebuilds a set from toArray(); null when the shape is not one we wrote.
+     * Rebuilds a set from toArray(), checking every rule; null when the shape
+     * is not one we wrote. For a medium others can write to.
      */
-    public static function fromArray(mixed $state, string $poolNamespace, int $retentionMs): ?self
+    public static function fromArray(mixed $state, string $poolNamespace, int $retentionMs, int $maxTags = 0): ?self
+    {
+        if (!\is_array($state) || !\is_array($state['tags'] ?? null) || !\is_array($state['hard'] ?? null) || !\is_array($state['prefixes'] ?? null)) {
+            return null;
+        }
+
+        $tags = self::packed($state['tags']);
+        $hard = self::packed($state['hard']);
+
+        if (null === $tags || null === $hard) {
+            return null;
+        }
+
+        $prefixes = [];
+
+        foreach ($state['prefixes'] as $rule) {
+            if (!\is_array($rule) || !\is_int($rule[0] ?? null) || !\is_string($rule[1] ?? null)) {
+                return null;
+            }
+
+            $prefixes[] = [$rule[0], $rule[1]];
+        }
+
+        return self::fromTrusted(['tags' => $tags, 'hard' => $hard, 'prefixes' => $prefixes] + $state, $poolNamespace, $retentionMs, $maxTags);
+    }
+
+    /**
+     * Tag => packed rule id, as toArray() wrote it; null when it is not.
+     *
+     * @param array<mixed> $rules
+     *
+     * @return array<string, int>|null
+     */
+    private static function packed(array $rules): ?array
+    {
+        $packed = [];
+
+        foreach ($rules as $tag => $rule) {
+            if (!\is_int($rule)) {
+                return null;
+            }
+
+            // a numeric tag came back as an int key, as PHP has it
+            $packed[(string) $tag] = $rule;
+        }
+
+        return $packed;
+    }
+
+    /**
+     * Rebuilds a set from toArray() without looking at each rule: for an entry
+     * only this package writes, under a format it has checked (see
+     * SharedRules). Null when the outer shape is not one we wrote.
+     */
+    public static function fromTrusted(mixed $state, string $poolNamespace, int $retentionMs, int $maxTags = 0): ?self
     {
         if (!\is_array($state)
             || !\is_array($state['tags'] ?? null)
+            || !\is_array($state['hard'] ?? null)
             || !\is_array($state['prefixes'] ?? null)
             || !\is_string($state['last'] ?? null)
             || !\is_string($state['first'] ?? null)
@@ -124,37 +217,48 @@ final class InvalidationRules
             return null;
         }
 
-        $tags = [];
-
-        foreach ($state['tags'] as $tag => $rule) {
-            if (!\is_array($rule) || !\is_int($rule[0] ?? null) || !\is_int($rule[1] ?? null)) {
-                return null;
-            }
-
-            // a numeric tag came back as an int key, as PHP has it
-            $tags[(string) $tag] = [$rule[0], $rule[1]];
-        }
-
-        $prefixes = [];
-
-        foreach ($state['prefixes'] as $rule) {
-            if (!\is_array($rule) || !\is_int($rule[0] ?? null) || !\is_int($rule[1] ?? null) || !\is_string($rule[2] ?? null)) {
-                return null;
-            }
-
-            $prefixes[] = [$rule[0], $rule[1], $rule[2]];
-        }
-
         $firstOpened = $state['first_opened'] ?? null;
 
-        $rules = new self($poolNamespace, $retentionMs);
+        /** @var array<string, int> $tags the format vouches for the rules */
+        $tags = $state['tags'];
+        /** @var array<string, int> $hard */
+        $hard = $state['hard'];
+        /** @var list<array{int, string}> $prefixes */
+        $prefixes = $state['prefixes'];
+
+        $rules = new self($poolNamespace, $retentionMs, $maxTags);
         $rules->tags = $tags;
+        $rules->hard = $hard;
         $rules->prefixes = $prefixes;
         $rules->last = $state['last'];
         $rules->first = $state['first'];
         $rules->firstOpened = \is_bool($firstOpened) ? $firstOpened : null;
 
         return $rules;
+    }
+
+    /**
+     * A rule's id as one integer, ordered as the ids are. A sequence too large
+     * for its bits is clamped up: the rule can only look newer than it is.
+     */
+    public static function rule(string $id): int
+    {
+        [$ms, $sequence] = self::split($id);
+
+        return $ms << self::SEQUENCE_BITS | min($sequence, self::SEQUENCE_MAX);
+    }
+
+    /**
+     * An item's watermark as one integer. A sequence too large for its bits
+     * is clamped down, and so is the largest that fits, which an overflowing
+     * rule of the same millisecond clamps up to: the item can only look older
+     * than it is, so an overflow invalidates and never serves stale.
+     */
+    public static function mark(string $id): int
+    {
+        [$ms, $sequence] = self::split($id);
+
+        return $ms << self::SEQUENCE_BITS | ($sequence >= self::SEQUENCE_MAX ? 0 : $sequence);
     }
 
     /**
@@ -169,6 +273,24 @@ final class InvalidationRules
     }
 
     /**
+     * Does an XRANGE that started at last() carry on from what is held? It
+     * does when it comes back starting with that id, or when nothing was held;
+     * otherwise absorbing it starts the set over.
+     *
+     * @param array<array-key, mixed> $entries id => fields, oldest first
+     */
+    public function continuedBy(array $entries): bool
+    {
+        if (self::NONE === $this->last) {
+            return true;
+        }
+
+        $start = array_key_first($entries);
+
+        return null !== $start && (string) $start === $this->last;
+    }
+
+    /**
      * Merges the entries of an XRANGE that started at last(), inclusively -
      * or at the beginning, when nothing was held yet.
      *
@@ -179,12 +301,13 @@ final class InvalidationRules
         if (self::NONE !== $this->last) {
             $start = array_key_first($entries);
 
-            if (null !== $start && (string) $start === $this->last) {
+            if (null !== $start && $this->continuedBy($entries)) {
                 unset($entries[$start]);
             } else {
                 // the stream moved from under us: whatever it holds now is
                 // the whole truth, and what we held is not part of it
                 $this->tags = [];
+                $this->hard = [];
                 $this->prefixes = [];
                 $this->last = self::NONE;
                 $this->first = self::NONE;
@@ -200,6 +323,29 @@ final class InvalidationRules
     }
 
     /**
+     * Adds the rule the adapter just appended, from the id the server answered,
+     * without reading the stream: only right for a rule appended directly after
+     * last(), which the caller has checked. Unlike absorb(), it never starts
+     * the set over.
+     *
+     * @param array{t?: list<string>, p?: string, h?: int} $rule
+     * @param bool                                         $opened whether the rule opened the stream
+     */
+    public function append(string $id, array $rule, bool $opened = false): void
+    {
+        $this->addRule($id, $rule, $opened);
+
+        // trimming walks every rule, too much to do per invalidation. A tag
+        // rule only moves the retention floor by the time since the last one,
+        // and a rule past the retention matches no live item, so that waits
+        // for the next absorb(); a clear of the whole pool, or a set past its
+        // bound, is trimmed now
+        if (($rule['p'] ?? null) === $this->poolNamespace || ($this->maxTags > 0 && \count($this->tags) + \count($this->prefixes) > $this->maxTags)) {
+            $this->trim();
+        }
+    }
+
+    /**
      * Has any rule the item has not seen invalidated it?
      *
      * @param list<string> $tags
@@ -210,21 +356,63 @@ final class InvalidationRules
             return true;
         }
 
-        [$ms, $sequence] = self::split($mark);
+        $seen = self::mark($mark);
 
         foreach ($tags as $tag) {
-            if (isset($this->tags[$tag]) && self::isNewer($this->tags[$tag], $ms, $sequence)) {
+            if (isset($this->tags[$tag]) && $this->tags[$tag] > $seen) {
                 return true;
             }
         }
 
-        foreach ($this->prefixes as [$ruleMs, $ruleSequence, $prefix]) {
-            if (self::isNewer([$ruleMs, $ruleSequence], $ms, $sequence) && str_starts_with($id, $prefix)) {
+        foreach ($this->prefixes as [$rule, $prefix]) {
+            if ($rule > $seen && str_starts_with($id, $prefix)) {
                 return true;
             }
         }
 
         return false;
+    }
+
+    /**
+     * When the rules that invalidate the item fell, if all of them were soft:
+     * the milliseconds of the newest rule it has not seen that names one of
+     * its tags. Null when one is not soft - a hard rule it has not seen names
+     * one of its tags, a prefix rule (a clear, the bound's floor) reaches it,
+     * or the stream lost what it saw - and when nothing invalidates it. The
+     * newest rule per tag is all that is kept, so a soft rule after a hard one
+     * leaves the hard one standing.
+     *
+     * @param list<string> $tags
+     */
+    public function invalidatedAt(string $id, array $tags, string $mark): ?int
+    {
+        if ($this->lostSince($mark)) {
+            return null;
+        }
+
+        $seen = self::mark($mark);
+
+        foreach ($this->prefixes as [$rule, $prefix]) {
+            if ($rule > $seen && str_starts_with($id, $prefix)) {
+                return null;
+            }
+        }
+
+        $newest = 0;
+
+        foreach ($tags as $tag) {
+            if (($this->hard[$tag] ?? 0) > $seen) {
+                return null;
+            }
+
+            $rule = $this->tags[$tag] ?? 0;
+
+            if ($rule > $seen && $rule > $newest) {
+                $newest = $rule;
+            }
+        }
+
+        return 0 === $newest ? null : $newest >> self::SEQUENCE_BITS;
     }
 
     /**
@@ -259,9 +447,7 @@ final class InvalidationRules
             return false;
         }
 
-        [$ms, $sequence] = self::split($mark);
-
-        return self::isNewer(self::split($this->first), $ms, $sequence);
+        return self::rule($this->first) > self::mark($mark);
     }
 
     /**
@@ -312,25 +498,38 @@ final class InvalidationRules
 
     private function add(string $id, mixed $entry): void
     {
-        [$ms, $sequence] = self::split($id);
         $encoded = \is_array($entry) ? $entry[self::FIELD_RULE] ?? '{}' : '{}';
         $rule = json_decode(\is_string($encoded) ? $encoded : '{}', true);
-        $rule = \is_array($rule) ? $rule : [];
+        $opened = \is_array($entry) ? $entry[self::FIELD_FIRST] ?? null : null;
+
+        $this->addRule($id, \is_array($rule) ? $rule : [], \is_scalar($opened) ? '1' === (string) $opened : null);
+    }
+
+    /**
+     * @param array<mixed> $rule
+     */
+    private function addRule(string $id, array $rule, ?bool $opened): void
+    {
+        $packed = self::rule($id);
+
+        $hard = !empty($rule[self::HARD]);
 
         // entries arrive oldest first, so the last write for a tag is the newest rule
         foreach (self::strings($rule['t'] ?? null) as $tag) {
-            $this->tags[$tag] = [$ms, $sequence];
+            $this->tags[$tag] = $packed;
+
+            if ($hard) {
+                $this->hard[$tag] = $packed;
+            }
         }
 
         if (\is_string($prefix = $rule['p'] ?? null)) {
-            $this->prefixes[] = [$ms, $sequence, $prefix];
+            $this->prefixes[] = [$packed, $prefix];
         }
 
         if (self::NONE === $this->first) {
-            $opened = \is_array($entry) ? $entry[self::FIELD_FIRST] ?? null : null;
-
             $this->first = $id;
-            $this->firstOpened = \is_scalar($opened) ? '1' === (string) $opened : null;
+            $this->firstOpened = $opened;
         }
 
         $this->last = $id;
@@ -340,7 +539,8 @@ final class InvalidationRules
      * Drops what can no longer decide anything: rules older than the longest
      * possible item lifetime, having nothing left alive to match, and rules
      * older than one covering the whole pool, which says everything they
-     * could say.
+     * could say - and, past the bound, the oldest rules, a floor taking their
+     * place (see cap()).
      */
     private function trim(): void
     {
@@ -348,18 +548,28 @@ final class InvalidationRules
             return;
         }
 
-        [$lastMs] = self::split($this->last);
-        $floor = [$lastMs - $this->retentionMs, 0];
+        $this->cap();
 
-        foreach ($this->prefixes as [$ms, $sequence, $prefix]) {
-            if ($prefix === $this->poolNamespace && self::isNewer([$ms, $sequence], $floor[0], $floor[1])) {
-                $floor = [$ms, $sequence];
+        [$lastMs] = self::split($this->last);
+        $floor = ($lastMs - $this->retentionMs) << self::SEQUENCE_BITS;
+
+        foreach ($this->prefixes as [$rule, $prefix]) {
+            if ($prefix === $this->poolNamespace && $rule > $floor) {
+                $floor = $rule;
             }
         }
 
-        foreach ($this->tags as $tag => [$ms, $sequence]) {
-            if (!self::isNewer([$ms, $sequence], $floor[0], $floor[1])) {
+        foreach ($this->tags as $tag => $rule) {
+            if ($rule <= $floor) {
                 unset($this->tags[$tag]);
+            }
+        }
+
+        // a hard rule at or below the floor is spoken for by it, the floor
+        // being hard itself
+        foreach ($this->hard as $tag => $rule) {
+            if ($rule <= $floor) {
+                unset($this->hard[$tag]);
             }
         }
 
@@ -367,7 +577,7 @@ final class InvalidationRules
 
         foreach ($this->prefixes as $rule) {
             // the rule that set the floor stays: it is the one still matching
-            if ($rule[0] === $floor[0] && $rule[1] === $floor[1] || self::isNewer($rule, $floor[0], $floor[1])) {
+            if ($rule[0] >= $floor) {
                 $kept[] = $rule;
             }
         }
@@ -376,10 +586,26 @@ final class InvalidationRules
     }
 
     /**
-     * @param array{0: int, 1: int, 2?: string} $rule
+     * Past the bound, a rule for the whole pool at the newest id beyond the
+     * newest 90 % of the rules: the floor, below which the rest of trim()
+     * drops everything it covers.
      */
-    private static function isNewer(array $rule, int $ms, int $sequence): bool
+    private function cap(): void
     {
-        return $rule[0] > $ms || ($rule[0] === $ms && $rule[1] > $sequence);
+        if (0 === $this->maxTags || \count($this->tags) + \count($this->prefixes) <= $this->maxTags) {
+            return;
+        }
+
+        $ids = array_values($this->tags);
+
+        foreach ($this->prefixes as [$rule]) {
+            $ids[] = $rule;
+        }
+
+        // newest first
+        rsort($ids);
+
+        // the oldest prefix rule from here on, so the list stays oldest first
+        array_unshift($this->prefixes, [$ids[intdiv($this->maxTags * 9, 10)], $this->poolNamespace]);
     }
 }

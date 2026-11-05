@@ -67,7 +67,9 @@ final class RulesStreamTest extends TestCase
 
     public function testAWriteAfterAFreshReadCostsNoWatermarkRoundTrip(): void
     {
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 1_000, rulesCache: false);
+        // the watermark of a plain write; a write that follows a read of the
+        // pool carries the read's mark and never asks (InvalidationGuardTest)
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 1_000, rulesCache: false, guardWindowSeconds: 0);
 
         $item = $pool->getItem('k');
         $this->redis->watermarks = 0;
@@ -77,7 +79,7 @@ final class RulesStreamTest extends TestCase
 
         self::assertSame(0, $this->redis->watermarks, 'the rule set read for the miss already knows the stream\'s head');
 
-        $exact = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
+        $exact = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false, guardWindowSeconds: 0);
         $item = $exact->getItem('k2');
         $this->redis->watermarks = 0;
 
@@ -87,12 +89,13 @@ final class RulesStreamTest extends TestCase
         self::assertSame(1, $this->redis->watermarks, 'with no cache window there is nothing fresh to read it from');
     }
 
-    public function testAnItemCommittedAfterAnInvalidationIsFresh(): void
+    public function testWithTheGuardOffAnItemCommittedAfterAnInvalidationIsFresh(): void
     {
-        // Symfony's TagAwareTestTrait::testInvalidateCommits pins this: the
-        // watermark is the stream's head at write time, whatever happened
-        // between computing the value and writing it
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
+        // without the guard, the watermark is the stream's head at write time,
+        // whatever happened between computing the value and writing it; with
+        // it, a rule from elsewhere in between makes the write stale
+        // (InvalidationGuardTest)
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false, guardWindowSeconds: 0);
         $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream', rulesCache: false);
 
         $item = $pool->getItem('slow');
@@ -223,6 +226,52 @@ final class RulesStreamTest extends TestCase
         self::assertTrue($pool->getItem('b')->isHit(), 'the opening rule judges by tags alone');
     }
 
+    public function testAStreamLongerThanOneBatchIsLoadedInBatches(): void
+    {
+        // items stamped before any rule, judged by their tags alone
+        $writer = new VersionedRedisTagAwareAdapter($this->other, 'stream', rulesCache: false);
+
+        foreach (['first' => 't-0', 'second' => 't-15000', 'third' => 't-24999', 'untouched' => 'nobody'] as $key => $tag) {
+            $item = $writer->getItem($key);
+            $item->set('v');
+            $item->tag([$tag]);
+            $writer->save($item);
+        }
+
+        // 25 000 rules, a tag each, straight into the stream
+        $pipe = $this->other->multi(\Redis::PIPELINE);
+
+        for ($i = 0; $i < 25_000; ++$i) {
+            $pipe->xAdd('stream:@rules', '*', ['t' => json_encode(['t' => ['t-'.$i]], \JSON_THROW_ON_ERROR), 'first' => 0 === $i ? '1' : '0']);
+        }
+
+        $pipe->exec();
+
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 1_000, rulesCache: false, rulesMaxTags: 0);
+        $this->redis->starts = [];
+
+        self::assertFalse($pool->getItem('first')->isHit(), 'a rule of the first batch');
+        self::assertFalse($pool->getItem('second')->isHit(), 'of the second');
+        self::assertFalse($pool->getItem('third')->isHit(), 'of the third');
+        self::assertTrue($pool->getItem('untouched')->isHit());
+        self::assertCount(3, $this->redis->starts, 'three ranges, each from the last id of the one before');
+        self::assertSame('-', $this->redis->starts[0]);
+        self::assertSame([10_000, 10_000, 10_000], $this->redis->counts);
+    }
+
+    public function testATagInvalidationIsFourCommands(): void
+    {
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCache: false);
+        // the first rule opens the stream, which takes an append more
+        self::assertTrue($pool->invalidateTags(['opening']));
+
+        $tag = $this->commandsFor(static fn (): bool => $pool->invalidateTags(['t']));
+        $clear = $this->commandsFor(static fn (): bool => $pool->clear());
+
+        self::assertSame(4, $tag, 'EVAL, XREVRANGE, XADD trimming as it appends, PERSIST');
+        self::assertSame(5, $clear, 'a clear of the whole pool also trims the stream back to itself');
+    }
+
     public function testTheRulesStreamCarriesNoTtl(): void
     {
         $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false);
@@ -235,6 +284,25 @@ final class RulesStreamTest extends TestCase
         $pool->invalidateTags(['t']);
 
         self::assertSame(-1, $this->other->pttl('stream:@rules'), 'the next rule strips it');
+    }
+
+    /**
+     * The commands the server ran for $work, less what reading the counter
+     * costs (no other client talks to the test server).
+     */
+    private function commandsFor(\Closure $work): int
+    {
+        $count = function (): int {
+            $total = ((array) $this->other->info('stats'))['total_commands_processed'] ?? null;
+
+            return is_numeric($total) ? (int) $total : 0;
+        };
+
+        $idle = -$count() + $count();
+        $before = $count();
+        $work();
+
+        return $count() - $before - $idle;
     }
 
     public function testASubNamespaceClearLeavesTheRestOfThePoolAlone(): void

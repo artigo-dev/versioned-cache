@@ -28,10 +28,31 @@ declare(strict_types=1);
  *   php benchmarks/bench.php items=50000 tags=20
  *   php benchmarks/bench.php stores=versioned
  *   php benchmarks/bench.php unique=1
+ *   php benchmarks/bench.php unique=1 behind=100000
+ *   php benchmarks/bench.php stores=versioned payload=model marshaller=deflate
+ *   php -d apc.enable_cli=1 -d apc.shm_size=256M benchmarks/bench.php adopt=15000,100000
+ *   php -d apc.enable_cli=1 benchmarks/bench.php reads=100
+ *   php benchmarks/bench.php guard=1
  *
  * Options: dsn=, items=, tags=, db=, stores=, client=relay, force=1,
  *          unique=1 (one tag of its own per item, the way an entity tag is),
- *          fresh=N (re-create the pool every N reads in the FPM rows; 10)
+ *          fresh=N (re-create the pool every N reads in the FPM rows; 10),
+ *          behind=N (how many unrelated rules land behind the fill; 10000),
+ *          payload=model (a ~2.5 KB entity instead of 256 repeated bytes),
+ *          marshaller=deflate (Symfony's DeflateMarshaller around the default)
+ *
+ * Three modes answer one question each and print their own table:
+ *
+ *   adopt=N,N... what a fresh pool pays to adopt a shared rule set of N
+ *                tags, with the default bound and without one, and what the
+ *                set takes in APCu (needs apc.enable_cli)
+ *   reads=N      round trips per request reading N keys, warm and cold,
+ *                through a get() loop and through getItems() and one batch
+ *                write, for every store; a cluster DSN works here
+ *   guard=1      what the invalidation guard costs this adapter: a fill
+ *                through get() misses and through getItems() and batch
+ *                writes, a read, and a delete with what it leaves behind for
+ *                the window, the guard on and off
  *
  * Each store gets its own Redis database and must find it empty; pass force=1
  * to flush whatever is there instead. The counters this reads are server-wide,
@@ -42,11 +63,17 @@ use Artigo\Cache\Adapter\SharedRules;
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
 use Artigo\Cache\Benchmarks\Meter;
 use Artigo\Cache\Benchmarks\Result;
+use Symfony\Component\Cache\Adapter\AdapterInterface;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
 use Symfony\Component\Cache\Adapter\RedisTagAwareAdapter;
 use Symfony\Component\Cache\Adapter\TagAwareAdapter;
 use Symfony\Component\Cache\Adapter\TagAwareAdapterInterface;
+use Symfony\Component\Cache\Marshaller\DefaultMarshaller;
+use Symfony\Component\Cache\Marshaller\DeflateMarshaller;
+use Symfony\Component\Cache\Marshaller\MarshallerInterface;
 use Symfony\Component\Cache\PruneableInterface;
+use Symfony\Contracts\Cache\CacheInterface;
+use Symfony\Contracts\Cache\ItemInterface;
 
 require __DIR__.'/../vendor/autoload.php';
 require __DIR__.'/src/meter.php';
@@ -70,6 +97,10 @@ $stores = explode(',', (string) ($options['stores'] ?? 'versioned,symfony,tagawa
 $unique = (bool) ($options['unique'] ?? false);
 // fresh=N re-creates the pool every N reads in the FPM rows: a request is a fresh process
 $fresh = max(1, (int) ($options['fresh'] ?? 10));
+// behind=N is how many unrelated rules land behind the fill in the long-log rows
+$behind = max(1, (int) ($options['behind'] ?? 10_000));
+$payload = 'model' === ($options['payload'] ?? '') ? 'model' : 'bytes';
+$marshaller = 'deflate' === ($options['marshaller'] ?? '') ? new DeflateMarshaller(new DefaultMarshaller()) : null;
 
 // client=relay runs both adapters through Relay instead of ext-redis, which
 // answers reads from a replica in this process rather than over the socket
@@ -82,6 +113,24 @@ $fanouts = [
     'partial' => 'tenth',
     'all' => 'everything',
 ];
+
+if (isset($options['adopt'])) {
+    adopt($dsn, $client, array_map(intval(...), explode(',', (string) $options['adopt'])), $firstDb, $force);
+
+    exit(0);
+}
+
+if (isset($options['guard'])) {
+    guard($dsn, $client, $items, $tagCount, $firstDb, $force);
+
+    exit(0);
+}
+
+if (isset($options['reads'])) {
+    reads($dsn, $client, max(1, (int) $options['reads']), $stores, $marshaller);
+
+    exit(0);
+}
 
 $probe = RedisAdapter::createConnection($dsn, $client);
 
@@ -151,16 +200,16 @@ foreach ($stores as $name) {
     // a pool as a request would build it; $shared = false keeps the versioned
     // pool's rule set to itself, for the row that shows what sharing saves
     $make = static fn (bool $shared = true): TagAwareAdapterInterface => match ($name) {
-        'versioned' => new VersionedRedisTagAwareAdapter($connection, 'bench', rulesCache: $shared ? null : false),
-        'symfony' => new RedisTagAwareAdapter($connection, 'bench'),
-        'tagaware' => new TagAwareAdapter(new RedisAdapter($connection, 'bench')),
+        'versioned' => new VersionedRedisTagAwareAdapter($connection, 'bench', marshaller: $marshaller, rulesCache: $shared ? null : false),
+        'symfony' => new RedisTagAwareAdapter($connection, 'bench', 0, $marshaller),
+        'tagaware' => new TagAwareAdapter(new RedisAdapter($connection, 'bench', 0, $marshaller)),
         default => throw new RuntimeException(sprintf('Unknown store "%s"; pick from versioned, symfony, tagaware.', $name)),
     };
 
     echo sprintf('%s%s', $name, \PHP_EOL);
 
     try {
-        run($meter, $make, $name, $items, $tagCount, $fanouts, $unique, $fresh, $connection);
+        run($meter, $make, $name, $items, $tagCount, $fanouts, $unique, $fresh, $connection, $behind, $payload);
     } catch (Throwable $e) {
         fwrite(\STDERR, sprintf('  ! %s: %s'.\PHP_EOL, $name, $e->getMessage()));
         $meter->note($name, 'failed', $e->getMessage());
@@ -186,13 +235,16 @@ function run(
     bool $unique,
     int $fresh,
     Redis|Relay\Relay $connection,
+    int $behind = 10_000,
+    string $payload = 'bytes',
 ): void {
     /** @var TagAwareAdapterInterface $pool */
     $pool = $make();
+    $value = 'model' === $payload ? model(1) : str_repeat('x', 256);
 
     // an untimed pass first, so class loading and script caching do not land
     // on whichever scenario happens to run first
-    fill($pool, 50, $tagCount, $unique);
+    fill($pool, 50, $tagCount, $unique, value: $value);
     $pool->clear();
 
     $report = static function (Result $result): void {
@@ -205,8 +257,13 @@ function run(
         );
     };
 
-    $report($meter->measure($name, 'fill', static fn () => fill($pool, $items, $tagCount, $unique)));
-    $report($meter->measure($name, 'overwrite', static fn () => fill($pool, $items, $tagCount, $unique)));
+    $received = $meter->bytesReceived();
+    $report($meter->measure($name, 'fill', static fn () => fill($pool, $items, $tagCount, $unique, value: $value)));
+    // what the fill put on the wire, per item: what a marshaller saves
+    $perItem = ($meter->bytesReceived() - $received) / $items;
+    $meter->note($name, 'fill: bytes received per item', sprintf('%s B', number_format($perItem)));
+    echo sprintf('  %-24s %s B%s', 'bytes per item', number_format($perItem), \PHP_EOL);
+    $report($meter->measure($name, 'overwrite', static fn () => fill($pool, $items, $tagCount, $unique, value: $value)));
     $report($meter->measure($name, 'read hit', static fn () => read($pool, $items)));
 
     $filled = $meter->usedMemory();
@@ -237,14 +294,15 @@ function run(
     // against the rules it has not seen. The eager adapter has no log and
     // pays at invalidation time instead.
     $pool->clear();
-    fill($pool, $items, $tagCount, $unique);
+    fill($pool, $items, $tagCount, $unique, value: $value);
+    $rules = number_format($behind, 0, '.', ' ');
 
-    $report($meter->measure($name, 'invalidate 10 000 unrelated tags', static function () use ($pool): void {
-        for ($i = 0; $i < 10_000; ++$i) {
+    $report($meter->measure($name, sprintf('invalidate %s unrelated tags', $rules), static function () use ($pool, $behind): void {
+        for ($i = 0; $i < $behind; ++$i) {
             $pool->invalidateTags(['nobody-'.$i]);
         }
     }));
-    $report($meter->measure($name, 'read hit, 10 000 rules behind', static fn () => read($pool, $items)));
+    $report($meter->measure($name, sprintf('read hit, %s rules behind', $rules), static fn () => read($pool, $items)));
 
     // the FPM model: a request is a fresh process, and a fresh pool holds no
     // rules. Behind the same 10 000 rules the pool is re-created every $fresh
@@ -256,6 +314,17 @@ function run(
     if ('versioned' === $name) {
         $report($meter->measure($name, sprintf('read hit, fresh pool every %d reads, no shared rules', $fresh), static fn () => readFresh(static fn () => $make(false), $items, $fresh)));
     }
+
+    // how many of those reads were still hits: past the bound a floor takes
+    // the place of the oldest rules, and an item older than it is a miss
+    $hits = 0;
+
+    for ($i = 0; $i < $items; ++$i) {
+        $hits += $make()->getItem('item-'.$i)->isHit() ? 1 : 0;
+    }
+
+    $meter->note($name, sprintf('hits after %s rules', $rules), sprintf('%s of %s', number_format($hits), number_format($items)));
+    echo sprintf('  %-24s %s of %s%s', 'hits after the rules', number_format($hits), number_format($items), \PHP_EOL);
 
     // What the server is left holding when nobody reads these items again -
     // the case an operator lives with, since a cache is mostly written to and
@@ -291,6 +360,92 @@ function run(
     } else {
         $meter->note($name, 'left after prune', 'not pruneable');
     }
+}
+
+/**
+ * The same work through the versioned pool with the guard on and off: what
+ * the write that follows a miss costs as a script, and what a delete leaves
+ * behind for the window.
+ *
+ * @param array<string, string> $client
+ */
+function guard(string $dsn, array $client, int $items, int $tagCount, int $db, bool $force): void
+{
+    $connection = RedisAdapter::createConnection($dsn.'/'.$db, $client);
+
+    if (!$connection instanceof Redis && !$connection instanceof Relay\Relay) {
+        fwrite(\STDERR, 'This benchmark needs a plain ext-redis connection.'.\PHP_EOL);
+
+        exit(1);
+    }
+
+    if ($connection->dbSize() > 0 && !$force) {
+        fwrite(\STDERR, sprintf('! database %d is not empty. Point db= somewhere empty, or pass force=1.'.\PHP_EOL, $db));
+
+        exit(1);
+    }
+
+    $meter = new Meter($connection);
+    $value = str_repeat('x', 256);
+    $tags = static fn (int $index): array => tagsFor($index, $tagCount, $items);
+
+    foreach (['the guard on' => 60, 'guardWindowSeconds: 0' => 0] as $name => $window) {
+        $make = static fn (): VersionedRedisTagAwareAdapter => new VersionedRedisTagAwareAdapter($connection, 'bench', guardWindowSeconds: $window);
+
+        echo $name.\PHP_EOL;
+        $connection->flushDb();
+        $empty = $meter->usedMemory();
+        $pool = $make();
+
+        $result = $meter->measure($name, 'fill through get() misses', static function () use ($pool, $items, $tags, $value): void {
+            for ($i = 0; $i < $items; ++$i) {
+                $pool->get('item-'.$i, static function (ItemInterface $item) use ($i, $tags, $value): string {
+                    $item->tag($tags($i));
+                    $item->expiresAfter(3600);
+
+                    return $value;
+                });
+            }
+        });
+        echo sprintf('  %-48s %8.3f s  %9s cmds  %9s reads%s', $result->scenario, $result->seconds, number_format($result->commands), number_format($result->reads), \PHP_EOL);
+
+        $connection->flushDb();
+        $pool = $make();
+
+        $result = $meter->measure($name, 'fill through getItems() + commit, 100 a batch', static function () use ($pool, $items, $tags, $value): void {
+            for ($first = 0; $first < $items; $first += 100) {
+                $keys = array_map(static fn (int $i): string => 'item-'.$i, range($first, min($items, $first + 100) - 1));
+
+                foreach ($pool->getItems($keys) as $key => $item) {
+                    if (!$item->isHit()) {
+                        $pool->saveDeferred($item->set($value)->tag($tags((int) substr((string) $key, 5)))->expiresAfter(3600));
+                    }
+                }
+
+                $pool->commit();
+            }
+        });
+        echo sprintf('  %-48s %8.3f s  %9s cmds  %9s reads%s', $result->scenario, $result->seconds, number_format($result->commands), number_format($result->reads), \PHP_EOL);
+
+        $result = $meter->measure($name, 'read hit', static fn () => read($pool, $items));
+        echo sprintf('  %-48s %8.3f s  %9s cmds  %9s reads%s', $result->scenario, $result->seconds, number_format($result->commands), number_format($result->reads), \PHP_EOL);
+
+        $result = $meter->measure($name, sprintf('delete every item, %s a call', number_format(1000)), static function () use ($pool, $items): void {
+            for ($first = 0; $first < $items; $first += 1000) {
+                $pool->deleteItems(array_map(static fn (int $i): string => 'item-'.$i, range($first, min($items, $first + 1000) - 1)));
+            }
+        });
+        echo sprintf('  %-48s %8.3f s  %9s cmds  %9s reads%s', $result->scenario, $result->seconds, number_format($result->commands), number_format($result->reads), \PHP_EOL);
+
+        // the rules stream stays either way; the tombstones are what the window holds
+        $held = max(0, $meter->usedMemory() - $empty);
+        $meter->note($name, 'left after the delete', sprintf('%s, %.1f MB', leftovers($connection), $held / 1048576));
+        echo sprintf('  %-48s %s, %.1f MB%s', 'left after the delete', leftovers($connection), $held / 1048576, \PHP_EOL);
+    }
+
+    $connection->flushDb();
+    echo \PHP_EOL;
+    table($meter->results());
 }
 
 /**
@@ -381,9 +536,9 @@ function readFresh(Closure $make, int $items, int $every): void
     }
 }
 
-function fill(TagAwareAdapterInterface $pool, int $items, int $tagCount, bool $unique = false, int $lifetime = 3600): void
+function fill(TagAwareAdapterInterface $pool, int $items, int $tagCount, bool $unique = false, int $lifetime = 3600, mixed $value = null): void
 {
-    $payload = str_repeat('x', 256);
+    $payload = $value ?? str_repeat('x', 256);
 
     for ($i = 0; $i < $items; ++$i) {
         $item = $pool->getItem('item-'.$i);
@@ -432,6 +587,320 @@ function tagsFor(int $index, int $tagCount, int $items, bool $unique = false): a
     }
 
     return $tags;
+}
+
+/**
+ * An entity the way an application caches one: nested arrays of short
+ * strings and numbers, about 2.5 KB serialized. Text is drawn from a small
+ * vocabulary, as product copy is, so it compresses the way real copy does
+ * rather than the way repeated bytes do.
+ *
+ * @return array<string, mixed>
+ */
+function model(int $seed): array
+{
+    mt_srand($seed);
+    $words = ['steel', 'frame', 'light', 'outdoor', 'water', 'resistant', 'black', 'compact', 'battery', 'model', 'cable', 'set', 'pack', 'premium', 'grip', 'season', 'large', 'small', 'mount', 'travel', 'kit', 'door', 'glass', 'wood', 'oak', 'linen', 'cotton', 'blue', 'green', 'warranty'];
+    $text = static function (int $count) use ($words): string {
+        $out = [];
+
+        for ($i = 0; $i < $count; ++$i) {
+            $out[] = $words[mt_rand(0, count($words) - 1)];
+        }
+
+        return ucfirst(implode(' ', $out)).'.';
+    };
+
+    $attributes = [];
+
+    for ($i = 0; $i < 12; ++$i) {
+        $attributes[] = ['code' => 'attr_'.mt_rand(100, 999), 'label' => $text(3), 'value' => $text(4)];
+    }
+
+    return [
+        'id' => mt_rand(1, 9_999_999),
+        'ean' => (string) mt_rand(1_000_000_000_000, 9_999_999_999_999),
+        'name' => $text(6),
+        'description' => $text(90),
+        'price' => ['amount' => mt_rand(100, 99_999), 'currency' => 'EUR', 'vat' => 20],
+        'stock' => ['available' => mt_rand(0, 500), 'warehouse' => 'W'.mt_rand(1, 9)],
+        'attributes' => $attributes,
+        'categories' => [mt_rand(1, 500), mt_rand(1, 500), mt_rand(1, 500)],
+    ];
+}
+
+/**
+ * What a fresh pool pays to adopt a shared rule set of each size, with the
+ * default bound and without one: the ms per fresh pool and the bytes the set
+ * takes in APCu. The rules go straight into the stream, a tag each; one pool
+ * loads and shares them, then fresh pools adopt the set and read one item.
+ * The 0-rule row is the floor: what a fresh pool and a read cost anyway.
+ *
+ * @param list<int>             $sizes
+ * @param array<string, string> $client
+ */
+function adopt(string $dsn, array $client, array $sizes, int $db, bool $force): void
+{
+    if (!SharedRules::apcuEnabled()) {
+        fwrite(\STDERR, '! adopt= needs APCu in this SAPI: run with -d apc.enable_cli=1.'.\PHP_EOL);
+
+        exit(1);
+    }
+
+    $connection = RedisAdapter::createConnection($dsn.'/'.$db, $client);
+
+    if (!$connection instanceof Redis && !$connection instanceof Relay\Relay) {
+        fwrite(\STDERR, 'adopt= needs a single node.'.\PHP_EOL);
+
+        exit(1);
+    }
+
+    if ($connection->dbSize() > 0 && !$force) {
+        fwrite(\STDERR, sprintf('! database %d is not empty. Point db= somewhere empty, or pass force=1.'.\PHP_EOL, $db));
+
+        exit(1);
+    }
+
+    $pools = 200;
+    $rows = [];
+
+    foreach ([0, ...$sizes] as $size) {
+        foreach (0 === $size ? [15_000] : [15_000, 0] as $bound) {
+            $connection->flushDb();
+            $shared = SharedRules::of(null, 'adopt:@rules', $connection);
+            $shared?->forget();
+
+            for ($i = 0; $i < $size; $i += 5_000) {
+                $pipe = $connection->multi(Redis::PIPELINE);
+
+                for ($j = $i; $j < min($size, $i + 5_000); ++$j) {
+                    $pipe->xAdd('adopt:@rules', '*', ['t' => json_encode(['t' => ['entity-'.$j]]), 'first' => 0 === $j ? '1' : '0']);
+                }
+
+                $pipe->exec();
+            }
+
+            $make = static fn (): VersionedRedisTagAwareAdapter => new VersionedRedisTagAwareAdapter($connection, 'adopt', rulesCacheMs: 600_000, rulesMaxTags: $bound);
+
+            $began = microtime(true);
+            $make()->getItem('x');
+            $load = microtime(true) - $began;
+
+            $began = microtime(true);
+
+            for ($p = 0; $p < $pools; ++$p) {
+                $make()->getItem('x');
+            }
+
+            $perPool = (microtime(true) - $began) / $pools;
+            $bytes = 0;
+
+            foreach (new APCUIterator('/^artigo\.versioned\./', \APC_ITER_MEM_SIZE) as $entry) {
+                $bytes += (int) $entry['mem_size'];
+            }
+
+            $label = 0 === $size ? '0 rules' : sprintf('%s rules, %s', number_format($size, 0, '.', ' '), 0 === $bound ? 'no bound' : 'bound '.number_format($bound, 0, '.', ' '));
+            $rows[] = [$label, $load, $perPool, $bytes];
+
+            echo sprintf('  %-34s load %8.1f ms   fresh pool %7.3f ms   APCu %8s KB%s', $label, $load * 1000, $perPool * 1000, number_format($bytes / 1024), \PHP_EOL);
+        }
+    }
+
+    $connection->flushDb();
+
+    echo \PHP_EOL.'| rule set | first load from the stream | a fresh pool adopting it, and one read | in APCu |'.\PHP_EOL;
+    echo '|---|---:|---:|---:|'.\PHP_EOL;
+
+    foreach ($rows as [$label, $load, $perPool, $bytes]) {
+        echo sprintf('| %s | %.1f ms | %.2f ms | %s KB |'.\PHP_EOL, $label, $load * 1000, $perPool * 1000, number_format($bytes / 1024));
+    }
+}
+
+/**
+ * Round trips per request reading $count keys, counted the way bastnic's
+ * lab:read counts them: socket reads on the server, summed over every node,
+ * replicas included. Each request is a fresh pool, as under PHP-FPM; the
+ * versioned pool adopts the rule set the previous request shared, as every
+ * request within rulesCacheMs of a refresh does.
+ *
+ * @param array<string, string> $client
+ * @param list<string>          $stores
+ */
+function reads(string $dsn, array $client, int $count, array $stores, ?MarshallerInterface $marshaller): void
+{
+    $connection = RedisAdapter::createConnection($dsn, $client + ['lazy' => false]);
+    $nodes = nodes($connection);
+    $keys = [];
+
+    for ($i = 0; $i < $count; ++$i) {
+        $keys[] = 'k'.$i;
+    }
+
+    // tiny values, as lab:read has them, so that one burst is one socket read
+    // and the reads counted are the round trips; a namespace per store, so
+    // that one store's clear() leaves the others alone
+    $value = 'v';
+    $makers = [
+        'versioned' => static fn (): AdapterInterface => new VersionedRedisTagAwareAdapter($connection, 'rv', marshaller: $marshaller),
+        'symfony' => static fn (): AdapterInterface => new RedisTagAwareAdapter($connection, 'rs', 0, $marshaller),
+        'tagaware' => static fn (): AdapterInterface => new TagAwareAdapter(new RedisAdapter($connection, 'rt', 0, $marshaller)),
+        'redis' => static fn (): AdapterInterface => new RedisAdapter($connection, 'rr', 0, $marshaller),
+    ];
+
+    $strategies = [
+        'get() loop' => static function (AdapterInterface $pool) use ($keys, $value): void {
+            // a pool that is not tag-aware refuses a tag on its items
+            $tagged = $pool instanceof TagAwareAdapterInterface;
+
+            foreach ($keys as $i => $key) {
+                assert($pool instanceof CacheInterface);
+                $pool->get($key, static function (ItemInterface $item) use ($i, $value, $tagged): string {
+                    if ($tagged) {
+                        $item->tag('t'.intdiv($i, 10));
+                    }
+
+                    return $value;
+                });
+            }
+        },
+        'getItems() + batch' => static function (AdapterInterface $pool) use ($keys, $value): void {
+            $missed = false;
+
+            foreach ($pool->getItems($keys) as $key => $item) {
+                if ($item->isHit()) {
+                    continue;
+                }
+
+                $item->set($value);
+
+                if ($pool instanceof TagAwareAdapterInterface) {
+                    $item->tag('t'.intdiv((int) substr((string) $key, 1), 10));
+                }
+
+                $pool->saveDeferred($item);
+                $missed = true;
+            }
+
+            if ($missed) {
+                $pool->commit();
+            }
+        },
+    ];
+
+    echo sprintf('%s | %d keys | %d node%s'.\PHP_EOL, $connection instanceof RedisCluster ? 'cluster' : 'standalone', $count, count($nodes), 1 === count($nodes) ? '' : 's');
+    echo '| strategy | warm | cold |'.\PHP_EOL.'|---|---:|---:|'.\PHP_EOL;
+
+    foreach ($strategies as $strategy => $request) {
+        foreach ($stores === ['versioned', 'symfony', 'tagaware'] ? array_keys($makers) : $stores as $store) {
+            $make = $makers[$store] ?? throw new RuntimeException(sprintf('Unknown store "%s".', $store));
+
+            // a rule in the stream, so the versioned pools have a set to share
+            $make()->clear();
+            $request($make());
+
+            // warm: every key there; the request before this one left the
+            // shared rule set fresh
+            $request($make());
+            $warm = roundTrips($nodes, static fn () => $request($make()));
+
+            // cold: every key gone
+            $make()->deleteItems($keys);
+            $cold = roundTrips($nodes, static fn () => $request($make()));
+
+            echo sprintf('| %s, `%s` | %d | %d |'.\PHP_EOL, $strategy, $store, $warm, $cold);
+        }
+    }
+
+    foreach ($makers as $make) {
+        $make()->clear();
+    }
+}
+
+/**
+ * Every node of the connection on a connection of its own: one for a single
+ * node, the masters for a cluster, and their replicas where reads go to them.
+ *
+ * @return list<Redis>
+ */
+function nodes(object $connection): array
+{
+    if ($connection instanceof Redis) {
+        $node = new Redis();
+        $node->connect($connection->getHost(), $connection->getPort());
+
+        return [$node];
+    }
+
+    if (!$connection instanceof RedisCluster) {
+        throw new RuntimeException('reads= needs ext-redis, standalone or cluster.');
+    }
+
+    $nodes = [];
+
+    foreach ($connection->_masters() as $master) {
+        [$host, $port] = is_array($master) ? $master : explode(':', (string) $master);
+        $node = new Redis();
+        $node->connect((string) $host, (int) $port);
+        $nodes[] = $node;
+
+        // a replica reads its primary's replication stream too: counted only
+        // where clients read from it, and then its reads are not all theirs
+        if (RedisCluster::FAILOVER_NONE === $connection->getOption(RedisCluster::OPT_SLAVE_FAILOVER)) {
+            continue;
+        }
+
+        $replication = $node->info('replication');
+
+        foreach ($replication as $field => $line) {
+            if (str_starts_with((string) $field, 'slave') && preg_match('/ip=([^,]+),port=(\d+)/', (string) $line, $match)) {
+                $replica = new Redis();
+                $replica->connect('127.0.0.1' === $match[1] || '::1' === $match[1] ? $match[1] : (string) $host, (int) $match[2]);
+                $nodes[] = $replica;
+            }
+        }
+    }
+
+    return $nodes;
+}
+
+/**
+ * Socket reads the nodes did during $work, less the one each INFO after it
+ * costs.
+ *
+ * @param list<Redis> $nodes
+ */
+function roundTrips(array $nodes, Closure $work): int
+{
+    $read = static function () use ($nodes): array {
+        $counts = [];
+
+        foreach ($nodes as $node) {
+            $counts['reads'] = ($counts['reads'] ?? 0) + (int) ($node->info('stats')['total_reads_processed'] ?? 0);
+
+            foreach ((array) $node->info('commandstats') as $name => $line) {
+                if (preg_match('/calls=(\d+)/', (string) $line, $match)) {
+                    $counts[(string) $name] = ($counts[(string) $name] ?? 0) + (int) $match[1];
+                }
+            }
+        }
+
+        return $counts;
+    };
+
+    $before = $read();
+    $work();
+    $after = $read();
+
+    if (getenv('BENCH_DEBUG')) {
+        foreach ($after as $name => $count) {
+            if ($count !== ($before[$name] ?? 0)) {
+                fwrite(\STDERR, sprintf('    %s +%d'.\PHP_EOL, $name, $count - ($before[$name] ?? 0)));
+            }
+        }
+    }
+
+    // the INFO calls after the work are one read per node
+    return $after['reads'] - $before['reads'] - 2 * count($nodes);
 }
 
 /**

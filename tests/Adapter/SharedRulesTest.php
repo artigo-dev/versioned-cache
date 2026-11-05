@@ -18,6 +18,7 @@ use Artigo\Cache\Tests\Connection;
 use PHPUnit\Framework\TestCase;
 use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
+use Symfony\Component\Cache\CacheItem;
 
 /**
  * The rule set shared by the workers of a server: what a fresh pool pays
@@ -37,6 +38,7 @@ final class SharedRulesTest extends TestCase
 
     private SpyRedis $redis;
     private SpyRedis $other;
+    private SpyRedis $third;
     private \Redis $plain;
     private ArrayAdapter $shared;
 
@@ -44,6 +46,7 @@ final class SharedRulesTest extends TestCase
     {
         $this->redis = Connection::openSingleNodeAs(SpyRedis::class);
         $this->other = Connection::openSingleNodeAs(SpyRedis::class);
+        $this->third = Connection::openSingleNodeAs(SpyRedis::class);
         $this->plain = Connection::openSingleNodeAs(\Redis::class);
         $this->shared = new ArrayAdapter();
         Connection::sweep($this->plain, self::NAMESPACE.'*');
@@ -84,13 +87,155 @@ final class SharedRulesTest extends TestCase
         $first->invalidateTags(['tag1']);
 
         self::assertFalse($first->getItem('item1')->isHit(), 'a process sees what it just invalidated');
-        self::assertCount($fetches + 1, $this->redis->starts, 'through one delta fetch');
+        self::assertCount($fetches, $this->redis->starts, 'from the reply, with nothing fetched');
 
         // and shares it back: a second pool adopts what the first fetched
         $second = $this->pool($this->other);
 
         self::assertFalse($second->getItem('item3')->isHit());
         self::assertSame([], $this->other->starts);
+    }
+
+    public function testTheNextRequestOnTheSameServerSeesTheInvalidation(): void
+    {
+        // a worker reads, and shares a fresh set with no rule for tag1
+        $reader = $this->pool($this->redis);
+        $this->write($reader, 'item', ['tag1']);
+        self::assertTrue($reader->getItem('item')->isHit());
+
+        // another request here only invalidates: it holds no set to add the
+        // rule to, so the shared set is still the one without it
+        self::assertTrue($this->pool($this->third)->invalidateTags(['tag1']));
+
+        // the next request adopts that set inside its window
+        $next = $this->pool($this->other);
+
+        self::assertFalse($next->getItem('item')->isHit(), 'a set read before an invalidation made on this server is not taken for fresh');
+    }
+
+    public function testAnOwnRuleIsHeldFromTheReplyNotFromARead(): void
+    {
+        $pool = $this->pool($this->redis);
+        $this->write($pool, 'item', ['tag1']);
+        self::assertTrue($pool->getItem('item')->isHit());
+        $starts = $this->redis->starts;
+
+        $pool->invalidateTags(['tag1']);
+
+        self::assertFalse($pool->getItem('item')->isHit(), 'the rule is held');
+        self::assertSame($starts, $this->redis->starts, 'and nothing was read for it');
+
+        $shared = $this->sharedRules()->load(self::NAMESPACE.':', 60_000);
+
+        self::assertNotNull($shared);
+        self::assertSame($this->streamHead(), $shared[0]->last(), 'the set ends at the id the server answered, and was shared');
+    }
+
+    public function testARuleAppendedInBetweenIsNotSkipped(): void
+    {
+        $pool = $this->pool($this->redis);
+        $this->write($pool, 'item1', ['tag1']);
+        $this->write($pool, 'item2', ['tag2']);
+        self::assertTrue($pool->getItem('item2')->isHit());
+
+        // another server invalidates tag2 after this pool read the stream, and
+        // this pool's own rule follows it: the set held does not end where the
+        // own rule was appended
+        $this->appendRule('tag2');
+        $pool->invalidateTags(['tag1']);
+
+        self::assertFalse($pool->getItem('item1')->isHit());
+        self::assertFalse($pool->getItem('item2')->isHit(), 'the rule in between was fetched, not skipped');
+    }
+
+    public function testBehindALocalInvalidationAWorkerFetchesEvenWhileAnotherRefreshes(): void
+    {
+        $reader = $this->pool($this->redis);
+        $this->write($reader, 'item', ['tag1']);
+        self::assertTrue($reader->getItem('item')->isHit());
+        self::assertTrue($this->pool($this->third)->invalidateTags(['tag1']));
+
+        // a worker elsewhere on this server is refreshing, and may have
+        // started before the rule was appended
+        $flag = $this->sharedRules();
+        self::assertTrue($flag->lead());
+
+        try {
+            $next = $this->pool($this->other);
+
+            self::assertFalse($next->getItem('item')->isHit(), 'the read fetches the rule itself rather than keep the set it adopted');
+        } finally {
+            $flag->release();
+        }
+    }
+
+    public function testAColdWorkerDoesNotTakeASetFromBeforeALocalInvalidationAsFinal(): void
+    {
+        $this->write($this->pool($this->redis, rulesCache: false), 'item', ['tag1']);
+
+        // the set the elected worker is about to share: read before the
+        // invalidation below, so it lacks the rule
+        $scratch = new ArrayAdapter();
+        $early = SharedRules::of($scratch, self::RULES_KEY, $this->redis);
+        self::assertNotNull($early);
+        $rules = new InvalidationRules(self::NAMESPACE.':', 2_592_000_000);
+        $rules->absorb((array) $this->plain->xRange(self::RULES_KEY, '-', '+'));
+        self::assertTrue($early->store($rules, microtime(true) * 1000));
+        usleep(2_000);
+
+        // a medium that shows nothing at the first look, and that set from the
+        // next one on: the leader's store landing while the cold worker waits
+        $medium = new class extends ArrayAdapter {
+            /** @var array<string, mixed> */
+            public array $later = [];
+
+            public function getItem(mixed $key): CacheItem
+            {
+                $item = parent::getItem($key);
+
+                if (!$item->isHit() && \array_key_exists($key, $this->later)) {
+                    $this->save(parent::getItem($key)->set($this->later[$key]));
+                    unset($this->later[$key]);
+                }
+
+                return $item;
+            }
+        };
+        $medium->later[$early->getKey()] = $scratch->getItem($early->getKey())->get();
+
+        self::assertTrue($this->pool($this->third, rulesCache: $medium)->invalidateTags(['tag1']));
+
+        // the elected worker is still at work
+        $flag = SharedRules::of($medium, self::RULES_KEY, $this->redis);
+        self::assertNotNull($flag);
+        self::assertTrue($flag->lead());
+
+        try {
+            $cold = $this->pool($this->other, rulesCache: $medium);
+
+            self::assertFalse($cold->getItem('item')->isHit(), 'the set it waited for is behind the invalidation: it loads the rules itself');
+        } finally {
+            $flag->release();
+        }
+
+        self::assertSame(['-'], $this->other->starts, 'once, from the beginning');
+    }
+
+    public function testASetReadAfterTheMarkIsFreshEvenWhereTheStreamLostTheRule(): void
+    {
+        self::assertTrue($this->pool($this->third)->invalidateTags(['tag1']));
+
+        // the stream is flushed after the invalidation: no set read now can
+        // hold the rule the mark names
+        $this->plain->del(self::RULES_KEY);
+
+        $pool = $this->pool($this->redis);
+        $this->write($pool, 'item', ['tag2']);
+        $starts = \count($this->redis->starts);
+
+        self::assertTrue($pool->getItem('item')->isHit());
+        self::assertTrue($pool->getItem('item')->isHit());
+        self::assertCount($starts, $this->redis->starts, 'read after the mark: fresh for its window, not fetched on every read');
     }
 
     public function testARuleAppendedElsewhereIsSeenAfterTheWindowThroughOneDelta(): void
@@ -260,6 +405,94 @@ final class SharedRulesTest extends TestCase
         }
 
         self::assertNull($default->load(self::NAMESPACE.':', 60_000), 'forgotten');
+    }
+
+    public function testAnApcuEntryOfAnotherFormatIsNotAdopted(): void
+    {
+        $default = SharedRules::of(null, self::RULES_KEY, $this->plain);
+
+        if (null === $default) {
+            self::markTestSkipped('APCu is not enabled for this SAPI (apc.enable_cli).');
+        }
+
+        $rules = new InvalidationRules(self::NAMESPACE.':', 60_000);
+        $rules->absorb(['1000-0' => ['t' => '{"t":["a"]}', 'first' => '1']]);
+
+        try {
+            self::assertTrue($default->store($rules, microtime(true) * 1000));
+            self::assertNotNull($default->load(self::NAMESPACE.':', 60_000), 'the current format is adopted');
+
+            // the same entry, as an earlier version would have labelled it
+            foreach (new \APCUIterator('/'.preg_quote($default->getKey(), '/').'$/') as $key => $entry) {
+                self::assertIsArray($entry);
+                self::assertIsArray($entry['value']);
+                apcu_store($key, ['format' => 1] + $entry['value']);
+            }
+
+            self::assertNull($default->load(self::NAMESPACE.':', 60_000), 'an entry of another format is a miss');
+        } finally {
+            $default->forget();
+        }
+    }
+
+    public function testTheStoredFormatIsPinned(): void
+    {
+        $default = SharedRules::of(null, self::RULES_KEY, $this->plain);
+
+        if (null === $default) {
+            self::markTestSkipped('APCu is not enabled for this SAPI (apc.enable_cli).');
+        }
+
+        $rules = new InvalidationRules(self::NAMESPACE.':', 2_592_000_000);
+        $rules->absorb([
+            '1000-0' => ['t' => '{"t":["a"]}', 'first' => '1'],
+            '2000-5' => ['t' => '{"t":["b"],"h":1}', 'first' => '0'],
+            '3000-0' => ['t' => '{"p":"shared:x"}', 'first' => '0'],
+        ]);
+
+        try {
+            self::assertTrue($default->store($rules, 12.5));
+
+            $stored = null;
+
+            foreach (new \APCUIterator('/'.preg_quote($default->getKey(), '/').'$/') as $entry) {
+                self::assertIsArray($entry);
+                $stored = $entry['value'];
+            }
+
+            self::assertSame([
+                'format' => 3,
+                'rules' => [
+                    'tags' => ['a' => 1_048_576_000, 'b' => 2_097_152_005],
+                    'hard' => ['b' => 2_097_152_005],
+                    'prefixes' => [[3_145_728_000, 'shared:x']],
+                    'last' => '3000-0',
+                    'first' => '1000-0',
+                    'first_opened' => true,
+                ],
+                'read_at_ms' => 12.5,
+            ], $stored, 'the stored shape changed: bump SharedRules::FORMAT, or an older worker reads it as its own');
+        } finally {
+            $default->forget();
+        }
+    }
+
+    public function testAPoolMediumStillChecksEveryRule(): void
+    {
+        $shared = $this->sharedRules();
+        $rules = new InvalidationRules(self::NAMESPACE.':', 60_000);
+        $rules->absorb(['1000-0' => ['t' => '{"t":["a"]}', 'first' => '1']]);
+        self::assertTrue($shared->store($rules, microtime(true) * 1000));
+
+        // another writer of the pool leaves a rule that is not an integer
+        $item = $this->shared->getItem($shared->getKey());
+        $entry = $item->get();
+        self::assertIsArray($entry);
+        self::assertIsArray($entry['rules']);
+        $entry['rules']['tags'] = ['a' => 'not a rule'];
+        $this->shared->save($item->set($entry));
+
+        self::assertNull($shared->load(self::NAMESPACE.':', 60_000));
     }
 
     private function pool(SpyRedis $redis, int $rulesCacheMs = 1_000, CacheItemPoolInterface|false|null $rulesCache = null): VersionedRedisTagAwareAdapter

@@ -44,6 +44,17 @@ use Symfony\Component\Cache\Adapter\ApcuAdapter;
  * read-at stamp stored with the set; the TTL only reclaims entries nobody
  * reads any more.
  *
+ * Beside the set lies the mark of the newest invalidation a process of this
+ * server made: when, and the rule id it got. A set read before that time and
+ * holding no rule that new may lack it, so no worker here takes it for fresh,
+ * whatever its stamp (see written()).
+ *
+ * The entry says which format wrote it. In APCu, which only this package's
+ * processes write, an entry of the current format is taken as it is, without
+ * checking each rule - that check costs more than the copy itself - and one of
+ * another format is a miss, as an absent one is. In a pool handed in, others
+ * may write too, and every rule is checked.
+ *
  * @internal
  */
 final class SharedRules
@@ -56,8 +67,17 @@ final class SharedRules
 
     private const APCU_PREFIX = 'artigo.versioned.';
 
+    /**
+     * The shape of the stored set: one integer per rule (InvalidationRules).
+     */
+    private const FORMAT = 3;
+
+    private const KEY_FORMAT = 'format';
     private const KEY_RULES = 'rules';
     private const KEY_READ_AT_MS = 'read_at_ms';
+    private const KEY_WRITTEN_AT_MS = 'written_at_ms';
+    private const KEY_WRITTEN_ID = 'written_id';
+    private const SUFFIX_WRITTEN = '_written';
 
     /**
      * The election flag while this worker holds it.
@@ -164,16 +184,19 @@ final class SharedRules
      *
      * @return array{InvalidationRules, float}|null
      */
-    public function load(string $poolNamespace, int $retentionMs): ?array
+    public function load(string $poolNamespace, int $retentionMs, int $maxTags = 0): ?array
     {
-        $entry = $this->read();
+        $entry = $this->read($this->key);
 
-        if (!\is_array($entry)) {
+        // an entry another version wrote is not ours to read: a miss
+        if (!\is_array($entry) || self::FORMAT !== ($entry[self::KEY_FORMAT] ?? null)) {
             return null;
         }
 
         $readAtMs = $entry[self::KEY_READ_AT_MS] ?? null;
-        $rules = InvalidationRules::fromArray($entry[self::KEY_RULES] ?? null, $poolNamespace, $retentionMs);
+        $rules = null === $this->pool
+            ? InvalidationRules::fromTrusted($entry[self::KEY_RULES] ?? null, $poolNamespace, $retentionMs, $maxTags)
+            : InvalidationRules::fromArray($entry[self::KEY_RULES] ?? null, $poolNamespace, $retentionMs, $maxTags);
 
         if (null === $rules || (!\is_float($readAtMs) && !\is_int($readAtMs))) {
             return null;
@@ -189,9 +212,10 @@ final class SharedRules
      */
     public function store(InvalidationRules $rules, float $readAtMs): bool
     {
-        $held = $this->read();
+        $held = $this->read($this->key);
 
-        if (\is_array($held)) {
+        // an entry of another format is overwritten, whatever it holds
+        if (\is_array($held) && self::FORMAT === ($held[self::KEY_FORMAT] ?? null)) {
             $heldLast = \is_array($held[self::KEY_RULES] ?? null) && \is_string($held[self::KEY_RULES]['last'] ?? null)
                 ? $held[self::KEY_RULES]['last']
                 : InvalidationRules::NONE;
@@ -201,24 +225,69 @@ final class SharedRules
             }
         }
 
-        return $this->write([
+        return $this->write($this->key, [
+            self::KEY_FORMAT => self::FORMAT,
             self::KEY_RULES => $rules->toArray(),
             self::KEY_READ_AT_MS => $readAtMs,
         ]);
     }
 
-    public function forget(): void
+    /**
+     * Records that a process of this server appended rule $id at $atMs (its
+     * clock, after the append returned). A set read before then that holds
+     * nothing as new as $id may lack the rule. Time and id each keep their
+     * newest value: two invalidations racing on one server leave the mark of
+     * the later one, or at worst of the earlier, whose window then bounds how
+     * long the later rule can go unseen.
+     */
+    public function written(float $atMs, string $id): void
     {
-        if (null === $this->pool) {
-            apcu_delete(self::APCU_PREFIX.$this->key);
+        [$heldAtMs, $heldId] = $this->writtenMark() ?? [0.0, InvalidationRules::NONE];
 
-            return;
+        $this->write($this->key.self::SUFFIX_WRITTEN, [
+            self::KEY_WRITTEN_AT_MS => max($heldAtMs, $atMs),
+            self::KEY_WRITTEN_ID => InvalidationRules::isNewerId($heldId, $id) ? $heldId : $id,
+        ]);
+    }
+
+    /**
+     * The newest invalidation a process of this server made, as written()
+     * recorded it, or null when none is.
+     *
+     * @return array{float, string}|null
+     */
+    public function writtenMark(): ?array
+    {
+        $entry = $this->read($this->key.self::SUFFIX_WRITTEN);
+
+        if (!\is_array($entry)) {
+            return null;
         }
 
-        try {
-            $this->pool->deleteItem($this->key);
-        } catch (\Exception) {
-            // nothing to forget, or nowhere to forget it
+        $atMs = $entry[self::KEY_WRITTEN_AT_MS] ?? null;
+        $id = $entry[self::KEY_WRITTEN_ID] ?? null;
+
+        if ((!\is_float($atMs) && !\is_int($atMs)) || !\is_string($id)) {
+            return null;
+        }
+
+        return [(float) $atMs, $id];
+    }
+
+    public function forget(): void
+    {
+        foreach ([$this->key, $this->key.self::SUFFIX_WRITTEN] as $key) {
+            if (null === $this->pool) {
+                apcu_delete(self::APCU_PREFIX.$key);
+
+                continue;
+            }
+
+            try {
+                $this->pool->deleteItem($key);
+            } catch (\Exception) {
+                // nothing to forget, or nowhere to forget it
+            }
         }
     }
 
@@ -292,18 +361,18 @@ final class SharedRules
     }
 
     /**
-     * The entry as stored, or null.
+     * An entry as stored, or null.
      */
-    private function read(): mixed
+    private function read(string $key): mixed
     {
         if (null === $this->pool) {
-            $entry = apcu_fetch(self::APCU_PREFIX.$this->key, $success);
+            $entry = apcu_fetch(self::APCU_PREFIX.$key, $success);
 
             return true === $success ? $entry : null;
         }
 
         try {
-            $item = $this->pool->getItem($this->key);
+            $item = $this->pool->getItem($key);
         } catch (\Exception) {
             return null;
         }
@@ -314,14 +383,14 @@ final class SharedRules
     /**
      * @param array<string, mixed> $entry
      */
-    private function write(array $entry): bool
+    private function write(string $key, array $entry): bool
     {
         if (null === $this->pool) {
-            return true === apcu_store(self::APCU_PREFIX.$this->key, $entry, self::TTL_SECONDS);
+            return true === apcu_store(self::APCU_PREFIX.$key, $entry, self::TTL_SECONDS);
         }
 
         try {
-            $item = $this->pool->getItem($this->key);
+            $item = $this->pool->getItem($key);
         } catch (\Exception) {
             return false;
         }

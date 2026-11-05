@@ -12,24 +12,24 @@
 <text x="68" y="129.5" font-size="11" fill="#8b8ba7" text-anchor="end">30,000</text>
 <line x1="78" y1="62.0" x2="510.0" y2="62.0" stroke="#1c1c2a" stroke-width="1"/>
 <text x="68" y="66.0" font-size="11" fill="#8b8ba7" text-anchor="end">40,000</text>
-<polyline points="108.0,131.5 480.0,62.0" fill="none" stroke="#ffd166" stroke-width="2.5" stroke-linejoin="round"/>
-<circle cx="108.0" cy="131.5" r="4.5" fill="#ffd166"/>
-<text x="108.0" y="119.5" font-size="11.5" font-weight="600" fill="#ffd166" text-anchor="middle">29,059</text>
+<polyline points="108.0,180.0 480.0,62.0" fill="none" stroke="#ffd166" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="108.0" cy="180.0" r="4.5" fill="#ffd166"/>
+<text x="108.0" y="168.0" font-size="11.5" font-weight="600" fill="#ffd166" text-anchor="middle">21,415</text>
 <circle cx="480.0" cy="62.0" r="4.5" fill="#ffd166"/>
 <text x="480.0" y="50.0" font-size="11.5" font-weight="600" fill="#ffd166" text-anchor="middle">40,000</text>
 <text x="494.0" y="66.0" font-size="13" font-weight="600" fill="#ffd166">TagAwareAdapter</text>
 <polyline points="108.0,189.0 480.0,189.0" fill="none" stroke="#ff6b6b" stroke-width="2.5" stroke-linejoin="round"/>
 <circle cx="108.0" cy="189.0" r="4.5" fill="#ff6b6b"/>
-<text x="108.0" y="220.9" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">20,000</text>
+<text x="108.0" y="221.0" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">20,000</text>
 <circle cx="480.0" cy="189.0" r="4.5" fill="#ff6b6b"/>
-<text x="480.0" y="220.9" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">20,000</text>
-<text x="510.0" y="207.9" font-size="13" font-weight="600" fill="#ff6b6b">RedisTagAwareAdapter</text>
-<polyline points="108.0,188.9 480.0,188.9" fill="none" stroke="#3ddc97" stroke-width="2.5" stroke-linejoin="round"/>
-<circle cx="108.0" cy="188.9" r="4.5" fill="#3ddc97"/>
-<text x="108.0" y="207.9" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">20,010</text>
-<circle cx="480.0" cy="188.9" r="4.5" fill="#3ddc97"/>
-<text x="480.0" y="207.9" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">20,010</text>
-<text x="494.0" y="192.9" font-size="13" font-weight="600" fill="#3ddc97">versioned</text>
+<text x="480.0" y="221.0" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">20,000</text>
+<text x="510.0" y="208.0" font-size="13" font-weight="600" fill="#ff6b6b">RedisTagAwareAdapter</text>
+<polyline points="108.0,189.0 480.0,189.0" fill="none" stroke="#3ddc97" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="108.0" cy="189.0" r="4.5" fill="#3ddc97"/>
+<text x="108.0" y="208.0" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">20,002</text>
+<circle cx="480.0" cy="189.0" r="4.5" fill="#3ddc97"/>
+<text x="480.0" y="208.0" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">20,002</text>
+<text x="494.0" y="193.0" font-size="13" font-weight="600" fill="#3ddc97">versioned</text>
 <line x1="78" y1="316.0" x2="510.0" y2="316.0" stroke="#26263a" stroke-width="1"/>
 <text x="108.0" y="338.0" font-size="12" fill="#b8b8c8" text-anchor="middle">shared tags only</text>
 <text x="480.0" y="338.0" font-size="12" fill="#b8b8c8" text-anchor="middle">one tag of its own</text>

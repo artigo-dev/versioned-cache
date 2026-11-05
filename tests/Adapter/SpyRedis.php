@@ -12,15 +12,29 @@ declare(strict_types=1);
 namespace Artigo\Cache\Tests\Adapter;
 
 /**
- * A connection that remembers where each XRANGE started and how often the
- * watermark was asked for.
+ * A connection that remembers where each XRANGE started, how many entries it
+ * asked for, and how often the watermark was asked for.
  */
 final class SpyRedis extends \Redis
 {
     /** @var list<string> */
     public array $starts = [];
 
+    /** @var list<int> */
+    public array $counts = [];
+
     public int $watermarks = 0;
+
+    public int $times = 0;
+
+    /** @var list<array{string, string}> each script sent: [evalsha or eval, its key] */
+    public array $scripts = [];
+
+    /** The next EVALSHA names a script the server cannot hold */
+    public bool $spoilNextSha = false;
+
+    /** A pipeline with an unanswered EVALSHA raises at exec(), as a client may */
+    public bool $execRaisesOnAForgottenScript = false;
 
     /**
      * @return \Redis|array<mixed>|bool
@@ -28,8 +42,58 @@ final class SpyRedis extends \Redis
     public function xRange(string $key, string $start, string $end, int $count = -1): \Redis|array|bool
     {
         $this->starts[] = $start;
+        $this->counts[] = $count;
 
         return parent::xRange($key, $start, $end, $count);
+    }
+
+    /**
+     * @param array<mixed> $args
+     */
+    public function evalsha(string $sha1, array $args = [], int $num_keys = 0): mixed
+    {
+        $this->scripts[] = ['evalsha', \is_string($args[0] ?? null) ? $args[0] : ''];
+
+        if ($this->spoilNextSha) {
+            $this->spoilNextSha = false;
+            $sha1 = str_repeat('0', 40);
+        }
+
+        return parent::evalsha($sha1, $args, $num_keys);
+    }
+
+    /**
+     * @param array<mixed> $args
+     */
+    public function eval(string $script, array $args = [], int $num_keys = 0): mixed
+    {
+        $this->scripts[] = ['eval', \is_string($args[0] ?? null) ? $args[0] : ''];
+
+        return parent::eval($script, $args, $num_keys);
+    }
+
+    /**
+     * @return \Redis|array<mixed>|false
+     */
+    public function exec(): \Redis|array|false
+    {
+        $results = parent::exec();
+
+        if ($this->execRaisesOnAForgottenScript && \is_array($results) && \in_array(false, $results, true)) {
+            throw new \RedisException('NOSCRIPT No matching script. Please use EVAL.');
+        }
+
+        return $results;
+    }
+
+    /**
+     * @return \Redis|array<mixed>
+     */
+    public function time(): \Redis|array
+    {
+        ++$this->times;
+
+        return parent::time();
     }
 
     /**
