@@ -39,9 +39,9 @@ final class Connection
     /**
      * Skips the calling test when nothing usable answers.
      */
-    public static function open(): \Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster
+    public static function open(?string $dsn = null): \Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster
     {
-        $dsn = self::dsn();
+        $dsn ??= self::dsn();
         $connection = null;
 
         if (self::isRelay() && !class_exists(\Relay\Relay::class)) {
@@ -63,6 +63,15 @@ final class Connection
         }
 
         return $connection;
+    }
+
+    /**
+     * The same, reading from the primaries only: what a test checks the
+     * server holds must not be a replica's lagging copy of it.
+     */
+    public static function openPrimaries(): \Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster
+    {
+        return self::open((string) preg_replace('/&failover=[a-z_]+/', '', self::dsn()));
     }
 
     /**

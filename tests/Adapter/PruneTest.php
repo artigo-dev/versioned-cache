@@ -125,6 +125,18 @@ final class PruneTest extends TestCase
         self::assertTrue($theirs->getItem('k')->isHit());
     }
 
+    public function testPruneSkipsTombstones(): void
+    {
+        $pool = $this->pool();
+        $this->save($pool, 'deleted', ['red']);
+        self::assertTrue($pool->deleteItem('deleted'));
+        $pool->invalidateTags(['red']);
+
+        self::assertTrue($pool->prune());
+
+        self::assertTrue($this->redis->hExists('prune:deleted', 'e'), 'a tombstone is not an item: it stays for its window');
+    }
+
     public function testPruneWithoutTheRulesDeletesNothingAndSaysSo(): void
     {
         $redis = Connection::openSingleNodeAs(BrokenRulesPruneRedis::class);

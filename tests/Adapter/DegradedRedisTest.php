@@ -16,6 +16,7 @@ use Artigo\Cache\Exception\InvalidArgumentException;
 use Artigo\Cache\Tests\Connection;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
+use Symfony\Component\Cache\CacheItem;
 
 /**
  * A cache must never be the reason a request fails, and it must never serve
@@ -57,6 +58,45 @@ final class DegradedRedisTest extends TestCase
         $redis->broken = false;
 
         self::assertTrue($pool->getItem('k')->isHit(), 'and the item is back the moment the rules are');
+    }
+
+    public function testAGuardedWriteGoesPlainWhenTheRulesCannotBeRead(): void
+    {
+        $redis = $this->open(BrokenRulesRedis::class);
+        $writer = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false);
+        self::assertTrue($writer->invalidateTags(['other']));
+        $head = array_key_first((array) $redis->xRevRange('degraded:@rules', '+', '-', 1));
+
+        // a read that never reached a verdict records nothing to guard
+        $redis->broken = true;
+        $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false);
+        $item = $pool->getItem('k');
+
+        self::assertTrue($pool->save($item->set('v')));
+        self::assertSame($head, $redis->hGet('degraded:k', 'm'), 'a plain write, stamped with the stream\'s head');
+    }
+
+    public function testAReadWithoutTheRulesArmsNoOtherKey(): void
+    {
+        $redis = $this->open(BrokenRulesRedis::class);
+        $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false);
+        $redis->broken = true;
+        $inner = null;
+
+        $pool->get('outer', static function () use ($redis, $pool, &$inner): string {
+            // the rules are back, and the callback reads another key
+            $redis->broken = false;
+            $inner = $pool->getItem('inner');
+
+            return 'outer';
+        });
+
+        // a delete elsewhere, after that read
+        $elsewhere = new VersionedRedisTagAwareAdapter($this->open(BrokenRulesRedis::class), 'degraded', rulesCacheMs: 0, rulesCache: false);
+        self::assertTrue($elsewhere->deleteItem('inner'));
+
+        self::assertInstanceOf(CacheItem::class, $inner);
+        self::assertFalse($pool->save($inner->set('computed before the delete')), 'the outer get() ended without taking the inner read along');
     }
 
     public function testAProcessHoldingRulesKeepsServingWhileTheyCannotBeRefreshed(): void

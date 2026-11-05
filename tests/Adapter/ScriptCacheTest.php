@@ -16,10 +16,11 @@ use Artigo\Cache\Tests\Connection;
 use PHPUnit\Framework\TestCase;
 
 /**
- * The write path is a plain HSETEX and the one script left - the appended
- * rule - travels as a body, so nothing the adapter does depends on the
- * server's script cache. A SCRIPT FLUSH, a restart or a failover must change
- * nothing, and this is where that is made sure of rather than assumed.
+ * A write that follows no read is a plain HSETEX, and the appended rule
+ * travels as a body; the write that follows a read is sent by sha1 and sent
+ * again as a body where the server has forgotten it. A SCRIPT FLUSH, a restart
+ * or a failover must change nothing, and this is where that is made sure of
+ * rather than assumed.
  */
 final class ScriptCacheTest extends TestCase
 {
@@ -62,6 +63,23 @@ final class ScriptCacheTest extends TestCase
         self::assertTrue($pool->invalidateTags(['articles']), 'the rule is still appended');
         self::assertFalse($pool->getItem('before')->isHit(), 'and still takes effect');
         self::assertFalse($pool->getItem('after')->isHit());
+    }
+
+    public function testAFlushBetweenAReadAndItsWriteChangesNothing(): void
+    {
+        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'scripts-test', rulesCacheMs: 0, rulesCache: false);
+        $warm = $pool->getItem('warm');
+        self::assertTrue($pool->save($warm->set('the script is held now')));
+
+        $value = $pool->get('armed', function (): string {
+            // the server forgets the script while the value is computed
+            $this->redis->script('flush');
+
+            return 'written after the flush';
+        });
+
+        self::assertSame('written after the flush', $value);
+        self::assertSame('written after the flush', $pool->getItem('armed')->get(), 'the guarded write landed all the same');
     }
 
     private function clean(): void

@@ -176,12 +176,159 @@ final class InvalidationRulesTest extends TestCase
         self::assertFalse($rules->invalidates('ns:x', ['z'], '50-0'));
     }
 
+    public function testPastTheBoundTheOldestRulesBecomeAFloor(): void
+    {
+        $rules = new InvalidationRules('ns:', 2_592_000_000, 15_000);
+        $entries = [];
+
+        // 16 000 rules, one tag each, the oldest at 1000-0
+        for ($i = 0; $i < 16_000; ++$i) {
+            $entries[(1_000 + $i).'-0'] = ['t' => json_encode(['t' => ['tag-'.$i]], \JSON_THROW_ON_ERROR)];
+        }
+
+        $rules->absorb($entries);
+        $state = $rules->toArray();
+
+        self::assertCount(13_500, $state['tags'], 'the newest 90 % of the bound are kept');
+        self::assertSame([[InvalidationRules::rule('3499-0'), 'ns:']], $state['prefixes'], 'and a rule for the whole pool at the newest one dropped');
+        self::assertTrue($rules->invalidates('ns:x', ['unrelated'], '3498-0'), 'stamped before the floor: a miss, whatever the dropped rules said');
+        self::assertFalse($rules->invalidates('ns:x', ['unrelated'], '3499-0'), 'stamped at the floor');
+        self::assertFalse($rules->invalidates('ns:x', ['tag-2500'], '3500-0'), 'a kept rule keeps its verdicts');
+        self::assertTrue($rules->invalidates('ns:x', ['tag-2500'], '3499-0'));
+    }
+
+    public function testTheFloorSurvivesToArray(): void
+    {
+        $rules = new InvalidationRules('ns:', 2_592_000_000, 10);
+        $entries = [];
+
+        for ($i = 0; $i < 12; ++$i) {
+            $entries[(1_000 + $i).'-0'] = ['t' => json_encode(['t' => ['tag-'.$i]], \JSON_THROW_ON_ERROR)];
+        }
+
+        $rules->absorb($entries);
+        $copy = InvalidationRules::fromArray($rules->toArray(), 'ns:', 2_592_000_000, 10);
+
+        self::assertNotNull($copy);
+        self::assertTrue($copy->invalidates('ns:x', ['unrelated'], '1001-0'), 'the floor came across with the rules');
+        self::assertFalse($copy->invalidates('ns:x', ['unrelated'], '1002-0'));
+    }
+
+    public function testAnAppendedRuleIsTrimmedWhereItCanDropSomething(): void
+    {
+        $rules = new InvalidationRules('ns:', 2_592_000_000, 10);
+        $entries = [];
+
+        for ($i = 0; $i < 10; ++$i) {
+            $entries[(1_000 + $i).'-0'] = ['t' => json_encode(['t' => ['tag-'.$i]], \JSON_THROW_ON_ERROR)];
+        }
+
+        $rules->absorb($entries);
+        $rules->append('2000-0', ['t' => ['tag-new']]);
+
+        self::assertCount(9, $rules->toArray()['tags'], 'past the bound: a floor in place of the oldest');
+        self::assertTrue($rules->invalidates('ns:x', ['unrelated'], '1000-0'), 'stamped before the floor, at 1001-0');
+
+        // unbounded, so that only the clear can be what trims
+        $unbounded = new InvalidationRules('ns:', 2_592_000_000);
+        $unbounded->absorb($entries);
+        $unbounded->append('3000-0', ['p' => 'ns:']);
+
+        self::assertSame([], $unbounded->toArray()['tags'], 'a clear of the whole pool says what every older rule said');
+        self::assertSame([[InvalidationRules::rule('3000-0'), 'ns:']], $unbounded->toArray()['prefixes']);
+    }
+
+    public function testAnIdPacksIntoOneIntegerInTheOrderOfTheIds(): void
+    {
+        foreach (['0-0', '1-0', '1793771155971-0', '1793771155971-17', '1793771155971-1048574'] as $id) {
+            $packed = InvalidationRules::rule($id);
+
+            self::assertSame($id, ($packed >> 20).'-'.($packed & 0xFFFFF), 'the milliseconds above, the sequence below');
+            self::assertSame($packed, InvalidationRules::mark($id), 'a sequence that fits packs the same either way');
+        }
+
+        self::assertLessThan(InvalidationRules::rule('1793771155971-18'), InvalidationRules::rule('1793771155971-17'));
+        self::assertLessThan(InvalidationRules::rule('1793771155972-0'), InvalidationRules::rule('1793771155971-1048574'));
+    }
+
+    public function testAnOverflowingRuleSequenceIsClampedUp(): void
+    {
+        // more rules in one millisecond than the sequence bits hold: the rule
+        // must still read newer than an item stamped earlier in that millisecond
+        $rules = $this->rules();
+        $rules->absorb(self::entries(['1000-2000000' => ['t' => ['a']]]));
+
+        self::assertTrue($rules->invalidates('ns:x', ['a'], '1000-500000'));
+    }
+
+    public function testAnOverflowingMarkSequenceIsClampedDown(): void
+    {
+        // both overflow, the rule after the item: clamped the same way, the two
+        // would tie, and a tie is "not newer" - a stale hit
+        $rules = $this->rules();
+        $rules->absorb(self::entries(['1000-2000000' => ['t' => ['a']]]));
+
+        self::assertTrue($rules->invalidates('ns:x', ['a'], '1000-1500000'));
+        self::assertTrue($rules->invalidates('ns:x', ['a'], '1000-1048575'), 'nor at the largest sequence that fits, which the rule clamps up to');
+    }
+
     public function testTheOlderOfTwoIds(): void
     {
         self::assertSame('100-0', InvalidationRules::older('100-0', '100-1'));
         self::assertSame('100-0', InvalidationRules::older('100-1', '100-0'));
         self::assertSame('99-5', InvalidationRules::older('100-0', '99-5'));
         self::assertSame('0-0', InvalidationRules::older('0-0', '1-0'));
+    }
+
+    public function testASoftVerdictCarriesTheNewestRuleTime(): void
+    {
+        $rules = $this->rules();
+        $rules->absorb(self::entries([
+            '100-0' => ['t' => ['a']],
+            '300-0' => ['t' => ['b']],
+            '400-0' => ['t' => ['c']],
+        ]));
+
+        self::assertSame(300, $rules->invalidatedAt('ns:x', ['a', 'b'], '50-0'), 'the newest of the rules it has not seen');
+        self::assertSame(300, $rules->invalidatedAt('ns:x', ['a', 'b'], '200-0'));
+        self::assertNull($rules->invalidatedAt('ns:x', ['a'], '200-0'), 'nothing it has not seen');
+    }
+
+    public function testAHardRuleOrAClearIsAHardVerdict(): void
+    {
+        $rules = $this->rules();
+        $rules->absorb(self::entries([
+            '100-0' => ['t' => ['a'], 'h' => 1],
+            '200-0' => ['t' => ['a']],
+            '300-0' => ['p' => 'ns:cleared'],
+        ]));
+
+        self::assertNull($rules->invalidatedAt('ns:x', ['a'], '50-0'), 'a hard rule it has not seen: a soft one after it changes nothing');
+        self::assertSame(200, $rules->invalidatedAt('ns:x', ['a'], '150-0'), 'the hard rule it has seen is behind it');
+        self::assertNull($rules->invalidatedAt('ns:cleared:x', ['a'], '150-0'), 'a clear reaches it, whatever soft rule does too');
+    }
+
+    public function testALostStreamIsAHardVerdict(): void
+    {
+        $rules = $this->rules();
+        $rules->absorb(self::entries(['100-0' => ['t' => ['a'], 'first' => true]]));
+
+        // the stream was lost and reborn: what stood between is gone
+        $rules->absorb(self::entries(['300-0' => ['t' => ['a'], 'first' => true]]));
+
+        self::assertTrue($rules->invalidates('ns:x', ['a'], '100-0'));
+        self::assertNull($rules->invalidatedAt('ns:x', ['a'], '100-0'), 'a soft rule names its tag, and still the verdict is hard');
+    }
+
+    public function testAHardRuleSurvivesTheTripThroughAnArray(): void
+    {
+        $rules = $this->rules();
+        $rules->absorb(self::entries(['100-0' => ['t' => ['a'], 'h' => 1], '200-0' => ['t' => ['a']]]));
+
+        $copy = InvalidationRules::fromArray($rules->toArray(), 'ns:', 2_592_000_000);
+
+        self::assertNotNull($copy);
+        self::assertNull($copy->invalidatedAt('ns:x', ['a'], '50-0'));
     }
 
     private function rules(): InvalidationRules

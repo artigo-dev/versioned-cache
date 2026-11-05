@@ -10,3 +10,5 @@
 
 # internal planning notes, never published
 /docs/plans/
+# RFC drafts, posted upstream by hand, never committed
+/docs/rfc/

@@ -86,6 +86,17 @@ final class Meter
         return $this->results;
     }
 
+    /**
+     * Bytes the server has received from every client so far: what a run puts
+     * on the wire, read as a difference.
+     */
+    public function bytesReceived(): int
+    {
+        $stats = $this->probe->info('stats');
+
+        return \is_array($stats) ? (int) ($stats['total_net_input_bytes'] ?? 0) : 0;
+    }
+
     public function usedMemory(): int
     {
         $memory = $this->probe->info('memory');
