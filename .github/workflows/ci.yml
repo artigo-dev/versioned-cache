@@ -77,13 +77,11 @@ jobs:
                   # runs that suite itself.
                   ini-values: zend.assertions=1, apc.enable_cli=1
 
-            # a dev line needs dev stability, and the sibling's unreleased
-            # work comes from its main branch; neither is ever committed
+            # a dev line needs dev stability, which is never committed
             - if: ${{ matrix.dev }}
               run: |
                   composer config minimum-stability dev
                   composer config prefer-stable true
-                  composer require --dev --no-update artigo/cache-stampede:dev-main
 
             # resolve against the Symfony line of this leg rather than the
             # lock file, which pins the newest
