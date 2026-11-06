@@ -12,11 +12,11 @@ declare(strict_types=1);
 namespace Artigo\Cache\Tests\Adapter;
 
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
+use Artigo\Cache\Stale\RefreshQueue;
+use Artigo\Cache\StaleCache;
 use Artigo\Cache\Tests\Connection;
 use PHPUnit\Framework\TestCase;
-use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Contracts\Cache\ItemInterface;
-use Symfony\Contracts\Cache\TagAwareCacheInterface;
 
 /**
  * What a soft tag invalidation leaves: a miss for every read, and the value
@@ -256,31 +256,19 @@ final class SoftInvalidationTest extends TestCase
 
     public function testAStaleCacheDoesNotServeADeletedValue(): void
     {
-        // by name: the installed cache-stampede may predate them
-        $staleCache = 'Artigo\\Cache\\StaleCache';
-        $refreshQueue = 'Artigo\\Cache\\Stale\\RefreshQueue';
-
-        if (!class_exists($staleCache) || !class_exists($refreshQueue)) {
-            self::markTestSkipped('This artigo/cache-stampede has no soft StaleCache.');
-        }
-
         $compute = static fn (string $value): \Closure => static function (ItemInterface $item) use ($value): string {
             $item->expiresAfter(300)->tag('menu');
 
             return $value;
         };
 
-        /** @var CacheItemPoolInterface&TagAwareCacheInterface $writer */
-        $writer = new $staleCache($this->pool(), staleSeconds: 60, soft: true);
+        $writer = new StaleCache($this->pool(), staleSeconds: 60, soft: true);
         $writer->get('k', $compute('before'));
         self::assertTrue($writer->invalidateTags(['menu']));
 
         // one request: a look at the key, a delete, a read
-        /** @var CacheItemPoolInterface&TagAwareCacheInterface $pool */
-        $pool = new $staleCache($this->pool(), staleSeconds: 60, soft: true);
-        $setDeferrer = [$pool, 'setDeferrer'];
-        self::assertIsCallable($setDeferrer);
-        $setDeferrer(new $refreshQueue());
+        $pool = new StaleCache($this->pool(), staleSeconds: 60, soft: true);
+        $pool->setDeferrer(new RefreshQueue());
 
         self::assertFalse($pool->hasItem('k'));
         self::assertTrue($pool->deleteItem('k'));
