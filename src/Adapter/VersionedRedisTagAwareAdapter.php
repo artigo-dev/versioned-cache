@@ -73,10 +73,15 @@ use Symfony\Component\Cache\PruneableInterface;
  * $rulesMaxTags: past it, a floor takes the place of the oldest rules, and an
  * item older than the floor reads as a miss (see InvalidationRules).
  *
- * An invalidation made here is seen at once, by this process and by the next
- * request on this server: the rule is added to the held set from the id the
- * server answered, and a mark beside the shared set keeps every worker from
- * taking an older set for fresh.
+ * An invalidation made here is seen at once by this process and, where the
+ * set is shared, by every worker of this server: the rule is added to the
+ * held set from the id the server answered, and a mark beside the shared set
+ * keeps every worker from taking an older set for fresh. Two invalidations
+ * racing on one server may leave the mark of the earlier one (see
+ * SharedRules::written()); the later is then seen as one made on another
+ * server is: within $rulesCacheMs, or within $rulesCacheMs plus one second
+ * while another worker is refreshing the set (see RULES_GRACE_MS). Without a
+ * shared set, another instance sees the rule within $rulesCacheMs.
  *
  * A write that follows a read is guarded (see get() and MissRecords): every
  * write gives the item a fresh epoch, a delete leaves a tombstone holding a
@@ -84,15 +89,18 @@ use Symfony\Component\Cache\PruneableInterface;
  * only where the epoch is still the one the miss saw - one script, the only
  * one on the write path. A write refused that way answers false, so a value
  * computed from data that was deleted or invalidated while it was computed is
- * never stored as fresh. $guardWindowSeconds = 0 switches the guard off.
+ * never stored as fresh. A read that could not reach the rules is guarded
+ * too, as having seen none. $guardWindowSeconds = 0 switches the guard off.
  *
  * A tag invalidation is soft unless invalidateTags() is told it is hard.
  * With $softGraceSeconds, a read that finds an item only soft rules reached,
  * the newest less than the grace ago, does not drop it: it is a miss all the
  * same, and is kept for takeAgedItem(), which StaleCache's soft mode serves
- * stale while it is refreshed. A delete, a clear, a hard rule, the bound's
- * floor and a lost stream stay hard. The age is counted on the server's
- * clock, read once per process.
+ * stale while it is refreshed, until the next read, write or delete of the
+ * key, or a clear or a hard invalidation, through this pool. hasItem() and
+ * prune() leave such an item on the server. A delete, a clear, a hard rule,
+ * the bound's floor and a lost stream stay hard. The age is counted on the
+ * server's clock, read once per process.
  *
  * On a cluster read from its replicas (failover=slaves), the item reads and
  * the rule fetches may come from a replica that lags. A lagging item looks
@@ -107,9 +115,13 @@ use Symfony\Component\Cache\PruneableInterface;
  *   read drops it or its TTL runs out. Reading a fully invalidated set is
  *   roughly twice the cost of reading a live one, and prune() is what takes
  *   back the items nobody reads again.
- * - **Invalidation becomes visible within `rulesCacheMs`**, because the rule
- *   set is cached in the process for that long. Pass 0 for exact reads, at
- *   the price of loading the rules on every one.
+ * - **Invalidation made elsewhere becomes visible within `rulesCacheMs`**,
+ *   because a rule set is reused for that long, or within `rulesCacheMs`
+ *   plus one second while another worker of the server is refreshing it:
+ *   meanwhile the others serve the set they hold, and past that they fetch
+ *   on their own. While the stream cannot be read at all, the last set read
+ *   stays in use. Pass 0 for exact reads, at the price of loading the rules
+ *   on every one.
  * - **`$rulesRetentionSeconds` is the maximum item lifetime**, not only the
  *   default. An item must never outlive the rule that made it stale, or it
  *   would come back from the dead once that rule is trimmed away, so a longer
@@ -138,17 +150,28 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     private const FIELD_EPOCH = 'e';
 
     /**
-     * How long a worker holding no rules waits for the one elected to load
-     * the stream before loading it on its own: the cold start of a server
-     * whose shared pool was just emptied, where every request would otherwise
-     * load the whole stream at once. In milliseconds.
+     * How long a worker that holds no rule set waits for the one elected to
+     * load it before loading it on its own: the cold start of a server whose
+     * shared pool was just emptied, where every request would otherwise load
+     * the whole stream at once. A worker holding a set never waits (see
+     * RULES_GRACE_MS). In milliseconds.
      */
     private const COLD_WAIT_MS = 250;
 
     /**
-     * How often that worker looks whether the load has landed, in milliseconds.
+     * How often that worker looks whether the load has landed, in
+     * milliseconds.
      */
     private const COLD_POLL_MS = 2;
+
+    /**
+     * How long past $rulesCacheMs a worker keeps serving the set it holds
+     * while another worker is refreshing it: no wait and no fetch. Past
+     * that, it fetches what it lacks on its own. So an invalidation made
+     * elsewhere is seen within $rulesCacheMs, or within $rulesCacheMs plus
+     * this while the set is being refreshed. In milliseconds.
+     */
+    private const RULES_GRACE_MS = 1_000;
 
     /**
      * How many keys a prune names, reads and judges at a time.
@@ -187,9 +210,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * TTL is capped to the retention, and the trim above drops only what
      * nothing alive can match.
      *
-     * The one script in this adapter, because the trim needs the id XADD just
-     * generated. Sent as a body: an invalidation is rare, and a body needs no
-     * script cache to be intact.
+     * A script because the trim needs the id XADD just generated; the other
+     * two are the guarded write and the range asked of a primary. Sent as a
+     * body: an invalidation is rare, and a body needs no script cache to be
+     * intact.
      */
     private const SCRIPT_INVALIDATE = <<<'LUA'
         local retention = tonumber(ARGV[2])
@@ -461,6 +485,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             return false;
         }
 
+        // a hard rule may reach any kept copy, and they are this request's
+        // scratch: dropping them all costs less than judging each
+        if ($hard) {
+            $this->aged = [];
+        }
+
         return $this->addRule(InvalidationRules::strings(array_unique(InvalidationRules::strings($tags))), null, $hard);
     }
 
@@ -468,6 +498,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * Hands out, once, the value a read of $key found reached by soft rules
      * only and kept: what it holds, its tags, and how long ago the newest of
      * those rules fell. Null when there is none, or it does not unmarshal.
+     * The next read, write or delete of $key through this pool drops it, and
+     * a clear, a hard invalidation or a reset drops every copy (see
+     * AgedItemsInterface).
      *
      * @experimental
      *
@@ -523,10 +556,11 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * many items, none of them read afterwards.
      *
      * The walk asks the rule set it already holds exactly the question a read
-     * asks, item by item, and unlinks what answers yes. There is no index to
-     * consult and none to repair: this gives memory back, it does not make the
-     * pool any more correct, and a pool that is never pruned is correct all
-     * the same. Symfony's cache:pool:prune command drives it.
+     * asks, item by item, and unlinks what a read would drop: an item only
+     * soft rules reached, within the grace, stays, as a read keeps it. There
+     * is no index to consult and none to repair: this gives memory back, it
+     * does not make the pool any more correct, and a pool that is never pruned
+     * is correct all the same. Symfony's cache:pool:prune command drives it.
      *
      * The rules are read once, at the start. A rule appended during the walk
      * is not applied this time, and an item written during it carries a mark
@@ -590,6 +624,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     protected function doSave(array $values, int $lifetime, array $addTagData = [], array $removeTagData = []): array
     {
+        // a kept copy is older than the value written over it
+        $this->forgetAged(array_keys($values));
+
         $payloads = [];
         $tags = [];
 
@@ -722,6 +759,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             return;
         }
 
+        // an aged copy stands for what the last read found: this read decides
+        // afresh whether to keep one, and a tombstone or a hard verdict does not
+        $this->forgetAged($ids);
+
         // the read of a get() in progress arms its id (see get()), whether or
         // not a verdict follows: left pending, it would arm the next read of
         // another key inside the callback
@@ -733,15 +774,17 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             $this->pendingArm = null;
         }
 
-        // without the rules, fresh cannot be told from stale: every item is a
-        // miss for now, and nothing is dropped on a verdict we cannot reach
-        if (null === $rules = $this->rules()) {
-            return;
-        }
-
         // a batch is remembered whole, however large (see MissRecords)
         if (0 < $this->guardWindowMs) {
             $this->records->reserve(\count($ids));
+        }
+
+        // without the rules, fresh cannot be told from stale: every item is a
+        // miss for now, and nothing is dropped on a verdict we cannot reach
+        if (null === $rules = $this->rules()) {
+            $this->rememberUnjudged($ids);
+
+            return;
         }
 
         $fields = [self::FIELD_VALUE, self::FIELD_TAGS, self::FIELD_MARK, self::FIELD_EPOCH];
@@ -758,11 +801,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         foreach ($ids as $index => $id) {
             $row = $rows[$index] ?? null;
             $epoch = \is_array($row) && \is_string($row[self::FIELD_EPOCH] ?? null) ? $row[self::FIELD_EPOCH] : '';
-            $armed = $id === $arming || \in_array($id, $this->armed, true);
 
             // nothing, or a tombstone: what follows is a computation to guard
             if (!\is_array($row) || !\is_string($row[self::FIELD_VALUE] ?? null) || !\is_string($row[self::FIELD_TAGS] ?? null)) {
-                $this->remember($id, $held, $epoch, $armed);
+                $this->remember($id, $held, $epoch);
 
                 continue;
             }
@@ -771,7 +813,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             $mark = $row[self::FIELD_MARK] ?? null;
 
             if ($rules->invalidates($id, $tags, \is_string($mark) ? $mark : InvalidationRules::NONE)) {
-                $this->remember($id, $held, $epoch, $armed);
+                $this->remember($id, $held, $epoch);
 
                 // within the grace of the soft rules that reached it, kept for
                 // takeAgedItem() rather than dropped: a miss either way
@@ -792,15 +834,15 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
             if (!\is_array($value) || !\array_key_exists('value', $value)) {
                 $stale[] = $id;
-                $this->remember($id, $held, $epoch, $armed);
+                $this->remember($id, $held, $epoch);
 
                 continue;
             }
 
             // a hit forgets the read before it, unless a get() is about to
             // recompute it anyway
-            if ($armed) {
-                $this->remember($id, $held, $epoch, true);
+            if ($id === $arming || \in_array($id, $this->armed, true)) {
+                $this->remember($id, $held, $epoch);
             } else {
                 $this->records->drop($id);
             }
@@ -822,10 +864,15 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
-     * Reads the tags and the watermark only: the answer needs no value.
+     * Reads the tags and the watermark only: the answer needs no value. An
+     * item only soft rules reached, within the grace, is a miss here too, and
+     * stays on the server for the read that may keep it (see doFetch()).
      */
     protected function doHave(string $id): bool
     {
+        // a read of the key: what an earlier one kept is not vouched for
+        $this->forgetAged([$id]);
+
         if (null === $rules = $this->rules()) {
             return false;
         }
@@ -836,10 +883,14 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             return false;
         }
 
+        $tags = InvalidationRules::strings(json_decode($row[self::FIELD_TAGS], true));
         $mark = $row[self::FIELD_MARK] ?? null;
+        $mark = \is_string($mark) ? $mark : InvalidationRules::NONE;
 
-        if ($rules->invalidates($id, InvalidationRules::strings(json_decode($row[self::FIELD_TAGS], true)), \is_string($mark) ? $mark : InvalidationRules::NONE)) {
-            $this->dropStale([$id]);
+        if ($rules->invalidates($id, $tags, $mark)) {
+            if (null === $this->softAge($rules, $id, $tags, $mark)) {
+                $this->dropStale([$id]);
+            }
 
             return false;
         }
@@ -869,6 +920,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         }
 
         $this->records->drop(...$ids);
+
+        // a deleted value is not served stale
+        $this->forgetAged($ids);
 
         if (0 === $this->guardWindowMs) {
             return $this->unlink($ids);
@@ -953,13 +1007,17 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     protected function doClear(string $namespace): bool
     {
+        // a cleared value is not served stale
+        $this->aged = [];
+
         return $this->addRule([], $namespace, true);
     }
 
     /**
      * Reads the tags and the watermark of a batch of keys, and unlinks those
-     * the rules invalidate. The rules key is skipped: it is a stream, and the
-     * record of the invalidations rather than a thing they can reach.
+     * the rules invalidate, save what only soft rules reached within the
+     * grace. The rules key is skipped: it is a stream, and the record of the
+     * invalidations rather than a thing they can reach.
      *
      * @param list<string> $keys
      */
@@ -993,9 +1051,13 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
                 continue;
             }
 
+            $tags = InvalidationRules::strings(json_decode($row[self::FIELD_TAGS], true));
             $mark = $row[self::FIELD_MARK] ?? null;
+            $mark = \is_string($mark) ? $mark : InvalidationRules::NONE;
 
-            if ($rules->invalidates($id, InvalidationRules::strings(json_decode($row[self::FIELD_TAGS], true)), \is_string($mark) ? $mark : InvalidationRules::NONE)) {
+            // what only soft rules reached stays for the grace, as a read
+            // keeps it for takeAgedItem()
+            if ($rules->invalidates($id, $tags, $mark) && null === $this->softAge($rules, $id, $tags, $mark)) {
                 $stale[] = $id;
             }
         }
@@ -1023,7 +1085,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         // also routes the reads and the unlinks afterwards
         if ($this->redis instanceof \RedisCluster || $this->redis instanceof \Relay\Cluster) {
             foreach ($this->redis->_masters() as $master) {
-                $address = self::address($master);
+                $address = self::address($master) ?? throw new CacheException(\sprintf('The cluster named a master as %s, which cannot be scanned.', get_debug_type($master)));
                 $cursor = null;
 
                 do {
@@ -1114,23 +1176,20 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
-     * How a master names itself to the client that has to be told which one to
-     * scan: phpredis answers [host, port], Relay the same, and both take the
-     * address back as one string.
+     * A master as the client that has to be told which one to scan takes it:
+     * [host, port], as _masters() answers. phpredis and Relay alike hash a
+     * "host:port" string as a key, prefix included, and scan whichever master
+     * owns that slot.
+     *
+     * @return array{string, int}|null
      */
-    private static function address(mixed $master): string
+    private static function address(mixed $master): ?array
     {
-        if (!\is_array($master)) {
-            return \is_scalar($master) ? (string) $master : '';
+        if (!\is_array($master) || !\is_string($master[0] ?? null) || !\is_int($master[1] ?? null)) {
+            return null;
         }
 
-        $parts = [];
-
-        foreach ($master as $part) {
-            $parts[] = \is_scalar($part) ? (string) $part : '';
-        }
-
-        return implode(':', $parts);
+        return [$master[0], $master[1]];
     }
 
     /**
@@ -1154,6 +1213,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         }
 
         $scan = $redis->getOption($isRelay ? \Relay\Relay::OPT_SCAN : \Redis::OPT_SCAN);
+
+        // and so does this one, which the walk applies to every node alike
+        if (\is_array($scan)) {
+            $scan = reset($scan);
+        }
+
         $scan = \is_int($scan) || \is_string($scan) ? (int) $scan : 0;
 
         $prefixesItself = $isRelay
@@ -1195,7 +1260,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         ];
 
         try {
-            $result = $this->redis->eval(self::SCRIPT_INVALIDATE, $arguments, 1);
+            $result = $this->rulesNode()->eval(self::SCRIPT_INVALIDATE, $arguments, 1);
         } catch (\Exception $e) {
             CacheItem::log($this->logger, 'Failed to append the invalidation rule: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
 
@@ -1250,7 +1315,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         }
 
         try {
-            $last = $this->redis->xRevRange($this->rulesKey, '+', '-', 1);
+            $last = $this->rulesNode()->xRevRange($this->rulesKey, '+', '-', 1);
         } catch (\Exception $e) {
             // an item stamped 0-0 has seen no rules, so every rule applies to
             // it: we lose the item, never serve it past its invalidation
@@ -1277,12 +1342,13 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * unless what is held is newer, and final when it is fresh - no round
      * trip; otherwise a refresh: XRANGE from the last id held, a batch at a
      * time, absorbed, stamped and stored for the next worker. Where several
-     * workers cross the window together, one is elected to refresh and the
-     * others keep the set they hold for this read - one refresh away from
-     * exact, never blocked. A worker that holds nothing, on a server whose
-     * pool was just emptied, waits for the leader's load for a bounded time
-     * (COLD_WAIT_MS) rather than join a herd of full loads, then loads on its
-     * own. Exact reads ($rulesCacheMs = 0) elect nobody: every read
+     * workers cross the window together, one is elected to refresh. The
+     * others serve the set they hold for a bounded grace (RULES_GRACE_MS)
+     * past the window; past that, each fetches what it lacks from the last
+     * id it holds, without waiting, and leaves the sharing to the leader. A
+     * worker holding no set has nothing to serve: it waits for the leader's
+     * set for a bounded time (COLD_WAIT_MS), then loads the whole stream on
+     * its own. Exact reads ($rulesCacheMs = 0) elect nobody: every read
      * refreshes, and so does a read behind an invalidation made on this
      * server, whose rule the leader's refresh may have started without.
      *
@@ -1304,6 +1370,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
         $shared = $this->sharedRules;
         $leader = null;
+        $publish = true;
 
         if (null !== $shared) {
             if ($this->adoptSharedRules($shared) && $this->rulesAreFresh()) {
@@ -1314,16 +1381,15 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
                 $leader = $shared->lead() ? $shared : null;
 
                 if (null === $leader) {
-                    // another worker is refreshing right now: what we hold is
-                    // one refresh away from exact, good enough for this read
-                    if (null !== $this->rules) {
+                    // another worker is refreshing right now: a held set is
+                    // served for the grace, and with none we wait for its set
+                    if (null !== $this->rules ? $this->rulesWithinGrace() : $this->awaitSharedRules($shared)) {
                         return $this->rules;
                     }
 
-                    // holding nothing, wait for the leader's load instead
-                    if ($this->awaitSharedRules($shared)) {
-                        return $this->rules;
-                    }
+                    // past the grace, or it did not come in time: fetch what
+                    // we lack ourselves, and leave sharing it to the leader
+                    $publish = false;
                 }
             }
         }
@@ -1341,8 +1407,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             $this->rules = $rules;
             $this->rulesReadAt = $readAtMs;
 
-            $this->sharedRules?->store($rules, $readAtMs);
-            $this->unshared = false;
+            if ($publish) {
+                $this->sharedRules?->store($rules, $readAtMs);
+                $this->unshared = false;
+            }
 
             return $rules;
         } finally {
@@ -1368,10 +1436,11 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             $start = InvalidationRules::NONE === $from ? '-' : $from;
 
             try {
-                $entries = $this->redis->xRange($this->rulesKey, $start, '+', self::RULES_BATCH);
+                $node = $this->rulesNode();
+                $entries = $node->xRange($this->rulesKey, $start, '+', self::RULES_BATCH);
 
                 if (\is_array($entries) && $this->readsReplicas() && $this->replicaMayLag($rules, $entries)) {
-                    $entries = self::entriesOf($this->redis->eval(self::SCRIPT_RANGE, [$this->rulesKey, $start, (string) self::RULES_BATCH], 1));
+                    $entries = self::entriesOf($node->eval(self::SCRIPT_RANGE, [$this->rulesKey, $start, (string) self::RULES_BATCH], 1));
                 }
             } catch (\Exception $e) {
                 CacheItem::log($this->logger, 'Failed to load the invalidation rules: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
@@ -1504,11 +1573,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
-     * Waits, briefly, for the worker elected to load the stream to share it:
-     * looks every COLD_POLL_MS for at most COLD_WAIT_MS, and gives up early
-     * when the leader has gone without leaving a set. True when a set was
-     * adopted that is not behind an invalidation made on this server; one
-     * that is may lack its rule, and this read loads on its own.
+     * Waits, briefly, for the worker elected to load the stream to share its
+     * set, where this worker holds none: looks every COLD_POLL_MS for at most
+     * COLD_WAIT_MS, and gives up early when the leader has gone. True when a
+     * fresh set was adopted; one read longer than $rulesCacheMs ago, or behind
+     * an invalidation made on this server, is not, and this read fetches on
+     * its own.
      */
     private function awaitSharedRules(SharedRules $shared): bool
     {
@@ -1517,12 +1587,23 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         do {
             usleep(self::COLD_POLL_MS * 1000);
 
-            if ($this->adoptSharedRules($shared) && !$this->behindLocalInvalidation()) {
+            if ($this->adoptSharedRules($shared) && $this->rulesAreFresh()) {
                 return true;
             }
         } while ($shared->isRefreshing() && microtime(true) < $deadline);
 
-        return false;
+        // the leader may have stored its set between the last look and letting go
+        return $this->adoptSharedRules($shared) && $this->rulesAreFresh();
+    }
+
+    /**
+     * Is the set held no older than $rulesCacheMs plus the grace? Then it is
+     * served while another worker refreshes it.
+     */
+    private function rulesWithinGrace(): bool
+    {
+        return null !== $this->rulesReadAt
+            && microtime(true) * 1000 - $this->rulesReadAt <= $this->rulesCacheMs + self::RULES_GRACE_MS;
     }
 
     private function rulesAreFresh(): bool
@@ -1607,6 +1688,20 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
+     * @param list<string> $ids
+     */
+    private function forgetAged(array $ids): void
+    {
+        if ([] === $this->aged) {
+            return;
+        }
+
+        foreach ($ids as $id) {
+            unset($this->aged[$id]);
+        }
+    }
+
+    /**
      * The server's clock in milliseconds: the offset read once per process and
      * pool, our clock carrying it on. Null when it cannot be read, which makes
      * every verdict hard until it can.
@@ -1652,10 +1747,47 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     /**
      * Remembers a read a write may follow, where the guard is on.
      */
-    private function remember(string $id, string $mark, string $epoch, bool $armed): void
+    private function remember(string $id, string $mark, string $epoch): void
     {
         if (0 < $this->guardWindowMs) {
-            $this->records->take($id, $mark, $epoch, $armed);
+            $this->records->take($id, $mark, $epoch);
+        }
+    }
+
+    /**
+     * Remembers a read that could not reach the rules: the write that follows
+     * is compared with the epoch each item has now, and stamped as having seen
+     * no rule, so a delete during the computation refuses it and every rule
+     * judges it. An epoch that cannot be read counts as none, which refuses
+     * the write wherever the item has one.
+     *
+     * @param list<string> $ids
+     */
+    private function rememberUnjudged(array $ids): void
+    {
+        if (0 === $this->guardWindowMs) {
+            return;
+        }
+
+        $calls = [];
+
+        foreach ($ids as $id) {
+            $calls[] = ['hMGet', $id, [self::FIELD_EPOCH]];
+        }
+
+        try {
+            $rows = $this->pipeline($calls);
+        } catch (\Exception $e) {
+            CacheItem::log($this->logger, 'Failed to read the epochs: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+
+            $rows = [];
+        }
+
+        foreach ($ids as $index => $id) {
+            $row = $rows[$index] ?? null;
+            $epoch = \is_array($row) && \is_string($row[self::FIELD_EPOCH] ?? null) ? $row[self::FIELD_EPOCH] : '';
+
+            $this->remember($id, InvalidationRules::NONE, $epoch);
         }
     }
 
@@ -1804,8 +1936,8 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
-     * A write command by its wire name, addressed by key where a cluster
-     * routes by it.
+     * A write command by its wire name, addressed by key where a cluster or
+     * an array routes by it.
      *
      * Everything travels as a string on purpose. phpredis marshals the
      * integers of its typed methods through a C long, which is 32 bits wide
@@ -1814,15 +1946,51 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * now a negative number, deletes the key it was meant to keep. The
      * protocol is strings anyway.
      *
+     * A raw command goes out as it is, where a typed call and a script's KEYS
+     * carry the client's key prefix: the key it names is prefixed here. The
+     * address stays the bare key. phpredis's and Relay's cluster clients both
+     * prefix it to find the slot - Relay's rawCommand() leaves only the
+     * arguments unprefixed - and an array picks the node of a typed call by
+     * it. A prefixed address would be prefixed twice: phpredis would send the
+     * command to the wrong master and throw on its MOVED, Relay would follow
+     * the MOVED, a round trip late.
+     *
      * @return array{0: string, ...}
      */
     private function command(string $command, string $key, string ...$arguments): array
     {
         $arguments = array_values($arguments);
 
-        return $this->redis instanceof \RedisCluster || $this->redis instanceof \Relay\Cluster
-            ? ['rawCommand', $key, $command, $key, ...$arguments]
-            : ['rawCommand', $command, $key, ...$arguments];
+        return $this->redis instanceof \Redis || $this->redis instanceof \Relay\Relay
+            ? ['rawCommand', $command, $this->serverKey($key), ...$arguments]
+            : ['rawCommand', $key, $command, $this->serverKey($key), ...$arguments];
+    }
+
+    /**
+     * $key as the server stores it: with the client's prefix (OPT_PREFIX),
+     * which a raw command does not add. The nodes of an array share the
+     * option; the one that owns the key is asked.
+     */
+    private function serverKey(string $key): string
+    {
+        $client = $this->redis instanceof \RedisArray ? $this->ownerOf($key) : $this->redis;
+        $prefixed = $client?->_prefix($key);
+
+        return \is_string($prefixed) ? $prefixed : $key;
+    }
+
+    /**
+     * The connection that answers for the rules stream: the client itself,
+     * which routes by key, or the node of an array that owns the stream - an
+     * array sends a script to wherever its body hashes, not its key.
+     */
+    private function rulesNode(): \Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster
+    {
+        if (!$this->redis instanceof \RedisArray) {
+            return $this->redis;
+        }
+
+        return $this->ownerOf($this->rulesKey) ?? throw new CacheException(\sprintf('No node of the array owns "%s".', $this->rulesKey));
     }
 
     /**
@@ -1863,8 +2031,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
                     $arguments[] = \is_scalar($argument) ? (string) $argument : '';
                 }
 
-                // [command, key, ...]: the key is what says which node to ask
-                $results[] = $this->onOwningNode($arguments[1] ?? '', ...$arguments);
+                // [key, command, ...]: the key is what says which node to ask
+                $key = array_shift($arguments) ?? '';
+                $results[] = $this->onOwningNode($key, ...$arguments);
             }
 
             return $results;

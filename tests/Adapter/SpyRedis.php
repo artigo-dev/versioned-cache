@@ -36,6 +36,9 @@ final class SpyRedis extends \Redis
     /** A pipeline with an unanswered EVALSHA raises at exec(), as a client may */
     public bool $execRaisesOnAForgottenScript = false;
 
+    /** XRANGE raises, as when the node holding the stream cannot be reached */
+    public bool $rangesFail = false;
+
     /**
      * Forgets the ranges asked for so far.
      */
@@ -52,6 +55,10 @@ final class SpyRedis extends \Redis
     {
         $this->starts[] = $start;
         $this->counts[] = $count;
+
+        if ($this->rangesFail) {
+            throw new \RedisException('the node holding the rules stream is down');
+        }
 
         return parent::xRange($key, $start, $end, $count);
     }
