@@ -882,7 +882,7 @@ Not our tests: `AdapterTestCase` and `TagAwareTestTrait`, the suite
 |---|---|
 | PSR-6 conformance, with `TagAwareTestTrait` | **154 tests**, one skip |
 | PSR-16 conformance | **212 tests** |
-| whole suite, on a single node | **552 tests**, eight skips |
+| whole suite, on a single node | **552 tests**, five skips |
 
 The skip is `testPrune`, which sleeps its way through four expiry deadlines to
 watch a pool collect what has expired. Redis does that by itself, which is why
@@ -893,11 +893,10 @@ garbage-collects tag Sets"*. This pool *is* `Pruneable`, for the other reason:
 since. That is ours to prove, and
 [`PruneTest`](tests/Adapter/PruneTest.php) does - including that it keeps an
 item written after the rule, stays inside its own namespace, and deletes
-nothing at all when the rules cannot be read. Of the other seven, two of
+nothing at all when the rules cannot be read. Of the other four, two of
 `ClientPrefixTest`'s need a cluster: that a write or a delete goes straight
-to the master of its key, and that `prune()` walks every master. Three need
-`artigo/cache-stampede` 2.0's `StaleCache`, where the dev requirement installs
-1.1. Two wait for something outside the package: Symfony's `BatchCache`,
+to the master of its key, and that `prune()` walks every master. Two wait
+for something outside the package: Symfony's `BatchCache`,
 whose writes `InvalidationGuardTest` will guard once it ships, and a phpredis
 built with compression, which the test of a client that compresses on its own
 needs.
