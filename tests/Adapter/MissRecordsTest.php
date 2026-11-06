@@ -25,28 +25,28 @@ final class MissRecordsTest extends TestCase
         $records = new MissRecords();
 
         for ($i = 0; $i <= MissRecords::CAP; ++$i) {
-            $records->take('k'.$i, '1-0', '', false);
+            $records->take('k'.$i, '1-0', '');
         }
 
         self::assertSame(MissRecords::CAP, $records->count());
         self::assertNull($records->of('k0'), 'the oldest went');
-        self::assertSame(['1-0', '', false], $records->of('k1'));
-        self::assertSame(['1-0', '', false], $records->of('k'.MissRecords::CAP));
+        self::assertSame(['1-0', ''], $records->of('k1'));
+        self::assertSame(['1-0', ''], $records->of('k'.MissRecords::CAP));
     }
 
     public function testAReadTakenAgainIsTheNewest(): void
     {
         $records = new MissRecords();
-        $records->take('again', '1-0', 'a', false);
+        $records->take('again', '1-0', 'a');
 
         for ($i = 1; $i < MissRecords::CAP; ++$i) {
-            $records->take('k'.$i, '1-0', '', false);
+            $records->take('k'.$i, '1-0', '');
         }
 
-        $records->take('again', '2-0', 'b', true);
-        $records->take('one-more', '2-0', '', false);
+        $records->take('again', '2-0', 'b');
+        $records->take('one-more', '2-0', '');
 
-        self::assertSame(['2-0', 'b', true], $records->of('again'), 'replaced, and kept as the newest');
+        self::assertSame(['2-0', 'b'], $records->of('again'), 'replaced, and kept as the newest');
         self::assertNull($records->of('k1'), 'the oldest went instead');
     }
 
@@ -56,7 +56,7 @@ final class MissRecordsTest extends TestCase
         $records->reserve(1_500);
 
         for ($i = 0; $i < 2_500; ++$i) {
-            $records->take('k'.$i, '1-0', '', false);
+            $records->take('k'.$i, '1-0', '');
         }
 
         self::assertSame(2_500, $records->count(), 'the floor, and room for the batch on top');
@@ -65,7 +65,7 @@ final class MissRecordsTest extends TestCase
         $records->clear();
 
         for ($i = 0; $i <= MissRecords::CAP; ++$i) {
-            $records->take('k'.$i, '1-0', '', false);
+            $records->take('k'.$i, '1-0', '');
         }
 
         self::assertSame(MissRecords::CAP, $records->count(), 'clear() gives the room back');
@@ -74,12 +74,12 @@ final class MissRecordsTest extends TestCase
     public function testOnlyTheReadsThatSawTheStreamUpToTheRuleMoveOn(): void
     {
         $records = new MissRecords();
-        $records->take('up-to-it', '5-0', 'a', false);
-        $records->take('behind-it', '4-0', 'b', true);
+        $records->take('up-to-it', '5-0', 'a');
+        $records->take('behind-it', '4-0', 'b');
 
         $records->restamp('5-0', '6-0');
 
-        self::assertSame(['6-0', 'a', false], $records->of('up-to-it'));
-        self::assertSame(['4-0', 'b', true], $records->of('behind-it'), 'a rule stands between it and ours');
+        self::assertSame(['6-0', 'a'], $records->of('up-to-it'));
+        self::assertSame(['4-0', 'b'], $records->of('behind-it'), 'a rule stands between it and ours');
     }
 }

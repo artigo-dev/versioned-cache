@@ -159,17 +159,25 @@ jobs:
             - uses: shivammathur/setup-php@v2
               with:
                   php-version: '8.4'
-                  extensions: redis, apcu
+                  extensions: redis, relay, apcu
                   coverage: none
                   ini-values: zend.assertions=1, apc.enable_cli=1
 
             - uses: ramsey/composer-install@v4
 
             # the MemoLock tests want a single node and skip themselves here;
-            # what this job is for is the adapter against three masters
-            - run: vendor/bin/phpunit -c phpunit.dist.xml --filter 'VersionedRedisTagAwareAdapterTest|InvalidationGuardTest'
+            # what this job is for is the adapter against three masters, with
+            # and without a client-side key prefix
+            - run: vendor/bin/phpunit -c phpunit.dist.xml --filter 'VersionedRedisTagAwareAdapterTest|InvalidationGuardTest|ClientPrefixTest'
               env:
                   REDIS_DSN: "redis:?host[127.0.0.1:7000]&host[127.0.0.1:7001]&host[127.0.0.1:7002]&redis_cluster=1"
+
+            # the same masters through Relay's cluster client, which routes
+            # and redirects otherwise than phpredis's
+            - run: vendor/bin/phpunit -c phpunit.dist.xml --filter 'VersionedRedisTagAwareAdapterTest|InvalidationGuardTest|ClientPrefixTest'
+              env:
+                  REDIS_DSN: "redis:?host[127.0.0.1:7000]&host[127.0.0.1:7001]&host[127.0.0.1:7002]&redis_cluster=1"
+                  REDIS_CLIENT: relay
 
     cluster-replicas:
         name: Redis Cluster with replicas (failover=slaves)
@@ -195,7 +203,7 @@ jobs:
             # RulesStreamTest needs a single node and skips itself here; the
             # replica and pipeline tests run against stand-ins and say what
             # they prove
-            - run: vendor/bin/phpunit -c phpunit.dist.xml --filter 'VersionedRedisTagAwareAdapterTest|InvalidationGuardTest|RulesStreamTest|ReplicaReadsTest|ClusterPipelineTest'
+            - run: vendor/bin/phpunit -c phpunit.dist.xml --filter 'VersionedRedisTagAwareAdapterTest|InvalidationGuardTest|ClientPrefixTest|RulesStreamTest|ReplicaReadsTest|ClusterPipelineTest'
               env:
                   REDIS_DSN: "redis:?host[127.0.0.1:7110]&host[127.0.0.1:7111]&host[127.0.0.1:7112]&redis_cluster=1&failover=slaves"
 

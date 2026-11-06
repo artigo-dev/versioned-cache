@@ -14,11 +14,16 @@ namespace Artigo\Cache\Tests\Adapter;
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
 use Artigo\Cache\Tests\Connection;
 use PHPUnit\Framework\TestCase;
+use Psr\Cache\CacheItemPoolInterface;
+use Symfony\Contracts\Cache\ItemInterface;
+use Symfony\Contracts\Cache\TagAwareCacheInterface;
 
 /**
  * What a soft tag invalidation leaves: a miss for every read, and the value
- * kept for the grace, for whoever may serve it stale. What stays hard: a hard
- * rule, a delete, a clear.
+ * kept for the grace, for whoever may serve it stale, until the next read,
+ * write or delete of the key, or a clear or a hard invalidation, through the
+ * pool. What stays hard: a hard rule, a delete, a clear.
+ * hasItem() and prune() leave what a read may keep.
  */
 final class SoftInvalidationTest extends TestCase
 {
@@ -140,6 +145,185 @@ final class SoftInvalidationTest extends TestCase
 
         self::assertNull($reader->takeAgedItem('deleted'));
         self::assertNull($reader->takeAgedItem('cleared'), 'a clear is a prefix rule, and a prefix rule is hard');
+    }
+
+    public function testAnOwnDeleteOrClearDropsWhatAReadKept(): void
+    {
+        $this->write('deleted', 'before', 'menu');
+        $this->write('cleared', 'before', 'menu');
+        self::assertTrue($this->pool()->invalidateTags(['menu']));
+
+        $reader = $this->pool();
+        self::assertFalse($reader->getItem('deleted')->isHit());
+        self::assertFalse($reader->getItem('cleared')->isHit());
+
+        self::assertTrue($reader->deleteItem('deleted'));
+        self::assertNull($reader->takeAgedItem('deleted'), 'a deleted value is not handed out');
+
+        self::assertTrue($reader->clear());
+        self::assertNull($reader->takeAgedItem('cleared'), 'nor a cleared one');
+    }
+
+    public function testAnOwnHardInvalidationDropsWhatAReadKept(): void
+    {
+        $writer = $this->pool();
+        self::assertTrue($writer->save($writer->getItem('k')->set('before')->tag(['menu', 'price'])));
+        self::assertTrue($this->pool()->invalidateTags(['menu']));
+
+        $reader = $this->pool();
+        $bystander = $this->pool();
+        self::assertFalse($reader->getItem('k')->isHit());
+        self::assertFalse($bystander->getItem('k')->isHit());
+
+        // a hard rule on a tag the kept value carries
+        self::assertTrue($reader->invalidateTags(['price'], hard: true));
+
+        self::assertNull($reader->takeAgedItem('k'), 'invalidated hard after the read: not handed out');
+        self::assertNotNull($bystander->takeAgedItem('k'), 'a pool that did not invalidate keeps what it read until its next read of the key');
+    }
+
+    public function testAnOwnWriteDropsWhatAReadKeptOfTheKeysItWrites(): void
+    {
+        $this->write('written', 'before', 'menu');
+        $this->write('other', 'before', 'menu');
+        self::assertTrue($this->pool()->invalidateTags(['menu']));
+
+        $reader = $this->pool();
+        self::assertFalse($reader->getItem('other')->isHit());
+        $item = $reader->getItem('written');
+        self::assertFalse($item->isHit());
+
+        self::assertTrue($reader->save($item->set('after')->tag('menu')));
+
+        self::assertNull($reader->takeAgedItem('written'), 'a value written over is not handed out');
+        self::assertNotNull($reader->takeAgedItem('other'), 'the copy of a key it did not write stays');
+        self::assertSame('after', $this->pool()->getItem('written')->get());
+    }
+
+    public function testAResetDropsWhatAReadKept(): void
+    {
+        $this->write('k', 'before', 'menu');
+        self::assertTrue($this->pool()->invalidateTags(['menu']));
+
+        $reader = $this->pool();
+        self::assertFalse($reader->getItem('k')->isHit());
+
+        // the end of a request, or of a message a worker handled
+        $reader->reset();
+
+        self::assertNull($reader->takeAgedItem('k'), 'a kept copy is the request\'s own');
+    }
+
+    public function testAReadAfterAHardChangeElsewhereDropsWhatAnEarlierReadKept(): void
+    {
+        $changes = [
+            'a delete' => static fn (VersionedRedisTagAwareAdapter $pool, string $key): bool => $pool->deleteItem($key),
+            'a hard rule' => static fn (VersionedRedisTagAwareAdapter $pool, string $key): bool => $pool->invalidateTags([$key], hard: true),
+            'a clear' => static fn (VersionedRedisTagAwareAdapter $pool, string $key): bool => $pool->clear($key),
+        ];
+
+        foreach ($changes as $change => $apply) {
+            $key = 'k'.md5($change);
+            $pool = $this->pool();
+            self::assertTrue($pool->save($pool->getItem($key)->set('before')->tag(['menu', $key])));
+            self::assertTrue($this->pool()->invalidateTags(['menu']));
+
+            // a read keeps it, and nothing takes it
+            $reader = $this->pool();
+            self::assertFalse($reader->getItem($key)->isHit());
+
+            // elsewhere, the value changes for good; the next read finds that
+            self::assertTrue($apply($this->pool(), $key));
+            self::assertFalse($reader->getItem($key)->isHit());
+
+            self::assertNull($reader->takeAgedItem($key), \sprintf('after %s, nothing is handed out', $change));
+        }
+    }
+
+    public function testEveryReadOfTheKeyDecidesAfresh(): void
+    {
+        $this->write('k', 'before', 'menu');
+        self::assertTrue($this->pool()->invalidateTags(['menu']));
+
+        $reader = $this->pool();
+        $reader->getItem('k');
+        self::assertFalse($reader->hasItem('k'));
+        self::assertNull($reader->takeAgedItem('k'), 'hasItem() is a read of the key too');
+
+        $reader->getItem('k');
+        self::assertNotNull($reader->takeAgedItem('k'), 'and the read after it keeps it again');
+    }
+
+    public function testAStaleCacheDoesNotServeADeletedValue(): void
+    {
+        // by name: the installed cache-stampede may predate them
+        $staleCache = 'Artigo\\Cache\\StaleCache';
+        $refreshQueue = 'Artigo\\Cache\\Stale\\RefreshQueue';
+
+        if (!class_exists($staleCache) || !class_exists($refreshQueue)) {
+            self::markTestSkipped('This artigo/cache-stampede has no soft StaleCache.');
+        }
+
+        $compute = static fn (string $value): \Closure => static function (ItemInterface $item) use ($value): string {
+            $item->expiresAfter(300)->tag('menu');
+
+            return $value;
+        };
+
+        /** @var CacheItemPoolInterface&TagAwareCacheInterface $writer */
+        $writer = new $staleCache($this->pool(), staleSeconds: 60, soft: true);
+        $writer->get('k', $compute('before'));
+        self::assertTrue($writer->invalidateTags(['menu']));
+
+        // one request: a look at the key, a delete, a read
+        /** @var CacheItemPoolInterface&TagAwareCacheInterface $pool */
+        $pool = new $staleCache($this->pool(), staleSeconds: 60, soft: true);
+        $setDeferrer = [$pool, 'setDeferrer'];
+        self::assertIsCallable($setDeferrer);
+        $setDeferrer(new $refreshQueue());
+
+        self::assertFalse($pool->hasItem('k'));
+        self::assertTrue($pool->deleteItem('k'));
+
+        self::assertSame('computed after the delete', $pool->get('k', $compute('computed after the delete')), 'the deleted value is not served stale');
+    }
+
+    public function testPruneLeavesWhatOnlySoftRulesReachedWithinTheGrace(): void
+    {
+        $this->write('soft', 'before', 'menu');
+        $this->write('hard', 'before', 'price');
+        self::assertTrue($this->pool()->invalidateTags(['menu']));
+        self::assertTrue($this->pool()->invalidateTags(['price'], hard: true));
+
+        self::assertTrue($this->pool()->prune());
+
+        self::assertSame(1, $this->exists('soft'), 'a soft rule within the grace: kept');
+        self::assertSame(0, $this->exists('hard'), 'a hard rule: unlinked');
+
+        $reader = $this->pool();
+        self::assertFalse($reader->getItem('soft')->isHit());
+        self::assertNotNull($reader->takeAgedItem('soft'), 'for the read that keeps it aged');
+
+        self::assertTrue($this->pool(graceSeconds: 0)->prune());
+        self::assertSame(0, $this->exists('soft'), 'a pool without a grace unlinks it');
+    }
+
+    public function testHasItemMissesWhatOnlySoftRulesReachedAndLeavesIt(): void
+    {
+        $this->write('soft', 'before', 'menu');
+        $this->write('hard', 'before', 'price');
+        self::assertTrue($this->pool()->invalidateTags(['menu']));
+        self::assertTrue($this->pool()->invalidateTags(['price'], hard: true));
+
+        self::assertFalse($this->pool()->hasItem('soft'), 'a miss, as every strict read');
+        self::assertFalse($this->pool()->hasItem('hard'));
+
+        self::assertSame(1, $this->exists('soft'), 'a soft rule within the grace: kept');
+        self::assertSame(0, $this->exists('hard'), 'a hard rule: dropped');
+
+        $reader = $this->pool();
+        self::assertFalse($reader->getItem('soft')->isHit());
+        self::assertNotNull($reader->takeAgedItem('soft'), 'for the read that keeps it aged');
     }
 
     public function testTheServerClockIsReadOnceAndUsedAsAnOffset(): void

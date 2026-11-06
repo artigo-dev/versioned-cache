@@ -35,8 +35,10 @@ use Symfony\Component\Cache\Adapter\ApcuAdapter;
  *
  * Where several workers cross the window together, one is elected to refresh
  * - a non-blocking flock() on a file under the temp dir, per host, released
- * by the OS if the leader dies, the primitive LockRegistry itself uses - and
- * the others keep the set they hold for that read.
+ * by the OS if the leader dies, the primitive LockRegistry itself uses. The
+ * others serve the set they hold for a bounded grace, then fetch on their own
+ * without storing what they fetched; one that holds none waits for the
+ * leader's set, briefly, before it loads the stream itself.
  *
  * The entry is keyed by the rules key and an identity of the connection, so
  * two pools that share one server and one namespace but talk to different
@@ -143,8 +145,11 @@ final class SharedRules
 
     /**
      * What tells this connection's Redis from another one reached from the
-     * same server: host, port and database where the client can say, the
-     * masters of a cluster, the class alone when nothing else is offered.
+     * same server: host, port and database where the client can say - an
+     * array's hosts and the database of each node - the masters of a
+     * cluster, the class alone when nothing else is offered -
+     * and a client-side key prefix, under which the same namespace names
+     * another stream.
      */
     public static function identityOf(object $redis): string
     {
@@ -160,6 +165,44 @@ final class SharedRules
             } catch (\Throwable) {
                 // a client that cannot say leaves the class to tell
             }
+        }
+
+        // an array has no getDbNum() of its own: each node says which
+        // database it was switched to
+        if ($redis instanceof \RedisArray) {
+            $databases = [];
+
+            try {
+                $hosts = $redis->_hosts();
+
+                foreach (\is_array($hosts) ? $hosts : [] as $host) {
+                    $node = \is_string($host) ? $redis->_instance($host) : null;
+
+                    if ($node instanceof \Redis) {
+                        $databases[$host] = $node->getDbNum();
+                    }
+                }
+            } catch (\Throwable) {
+                // a node that cannot say leaves the hosts to tell
+            }
+
+            $parts[] = ['databases' => $databases];
+        }
+
+        try {
+            // an array has no _prefix() of its own; its nodes share the option
+            $prefix = $redis instanceof \RedisArray ? $redis->getOption(\Redis::OPT_PREFIX) : (method_exists($redis, '_prefix') ? $redis->_prefix('') : null);
+        } catch (\Throwable) {
+            $prefix = null;
+        }
+
+        // without one, the identity is what it always was
+        if (\is_array($prefix)) {
+            $prefix = reset($prefix);
+        }
+
+        if (\is_string($prefix) && '' !== $prefix) {
+            $parts[] = ['prefix' => $prefix];
         }
 
         return (string) json_encode($parts);

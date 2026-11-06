@@ -73,10 +73,11 @@ $pool->prune();                        // and the memory back, at your leisure
 
 Invalidating deletes nothing, on purpose: a stale item is dropped by the
 reader that finds it. `prune()` is for the items nobody reads again — it walks
-the pool, asks the rules the same question a read asks, and unlinks what
-answers yes. Symfony's `cache:pool:prune` drives it, so a nightly cron is all
-it takes. Nothing depends on it: a pool that is never pruned is just as
-correct, only larger.
+the pool, asks the rules the same question a read asks, and unlinks what a read
+would drop: an item a [soft invalidation](#soft-invalidation) reached stays for
+its grace, as a read keeps it. Symfony's `cache:pool:prune` drives it, so a
+nightly cron is all it takes. Nothing depends on it: a pool that is never
+pruned is just as correct, only larger.
 
 Six settings beyond Symfony's:
 
@@ -101,24 +102,36 @@ stale, or it would come back from the dead once that rule is trimmed away. A
 longer TTL is capped to it, and logged once.
 
 `rulesCacheMs` is how long a rule set may be reused before it is refreshed. It
-is the window within which an invalidation made elsewhere becomes visible. A
-refresh fetches only what was appended since the last one, in batches of ten
-thousand rules, and a read is judged against the newest rule per tag it
-carries, so neither the refresh nor the read grows with the length of the log.
-An invalidation made on the same server is seen at once, by every worker: the
-process that made it adds the rule to its set from the id Redis answered, and
-leaves a mark beside the shared set that keeps every worker from taking an
-older set for fresh.
+bounds how long an invalidation made elsewhere goes unseen: it is visible
+within `rulesCacheMs`, or within `rulesCacheMs` plus one second while another
+worker of the server is refreshing the set, which the others serve meanwhile
+rather than all fetch at once. A refresh fetches only what was appended since
+the last one, in batches of ten thousand rules, and a read is judged against
+the newest rule per tag it carries, so neither the refresh nor the read grows
+with the length of the log. While the stream cannot be read at all, a worker
+keeps the set it last read, and one holding none reads every item as a miss.
+
+An invalidation made on the same server is seen at once by the process that
+made it, which adds the rule to its set from the id Redis answered, and, where
+the set is shared, by every worker of the server: a mark beside the shared set
+keeps each of them from taking an older set for fresh. Two invalidations racing
+on one server may leave the mark of the earlier one
+(`SharedRules::written()`); the later is then seen as one made elsewhere is.
+With `rulesCache: false` there is no mark and no election, and another
+instance sees the rule within `rulesCacheMs`.
 
 `rulesCache` is where the workers of a server share that rule set, so that a
 fresh process — every request, under PHP-FPM — adopts it instead of loading the
 whole stream before its first hit. It is an `ApcuAdapter` by default where APCu
 is enabled, any PSR-6 pool you pass otherwise, or `false` to keep the set per
 instance. When the set turns stale, one worker is elected to refresh it (a
-non-blocking `flock()` on a file, per host, the primitive `LockRegistry` uses)
-and the others keep it for that read; on a server whose pool was just emptied,
-one worker loads the stream and the others wait for it, briefly, instead of
-loading it too.
+non-blocking `flock()` on a file, per host, the primitive `LockRegistry` uses).
+The others serve the set they hold for one second more, at no round trip;
+past that, each fetches what it lacks from the last rule id it holds, without
+waiting, and leaves the sharing to the elected worker. A worker that holds no
+set — on a server whose pool was just emptied — waits for the elected
+worker's set, 250 ms at most, before it loads the whole stream itself, so
+that they do not all load it at once.
 
 `rulesMaxTags` bounds that set, because every request copies it. Past the
 bound — tags and clears together — the set keeps its newest 90 % and puts a
@@ -483,8 +496,9 @@ connection the writes go out as typed `hsetex()`, `expire()`, `hdel()` and
 its slot went to, a replica, which refuses it. **`failover=slaves` therefore
 needs phpredis 6.3 or later**, the first with `hsetex()`; an older one keeps
 the raw command, and its writes fail once a read of the same slot has gone to
-a replica. Relay's cluster client is given the same typed calls; no CI leg
-runs a Relay cluster, so that path is untested.
+a replica. Relay's cluster client is given the same typed calls; CI runs
+Relay against three masters, but not reading from replicas, so that path is
+untested.
 
 **The hash encoding.** An item is a four-field hash — value, tags, watermark
 and the guard's epoch — and Redis keeps a hash as a compact `listpack` only
@@ -558,7 +572,11 @@ Every cache trades something, and two rows of that table are the price.
   which on a fast network is more than the round trips it saves; the bound
   keeps it near a millisecond.
 - **An invalidation made elsewhere becomes visible within `rulesCacheMs`**, one
-  second by default. Pass `0` for exact reads, at a round trip each.
+  second by default, or within `rulesCacheMs` plus one second while another
+  worker of the server is refreshing the set: the others serve the set they
+  hold meanwhile, and fetch on their own past that. While the stream cannot be
+  read, the last set read stays in use. Pass `0` for exact reads, at a round
+  trip each.
 - **The rule set has to live somewhere between requests.** Without APCu and
   without a pool passed as `rulesCache`, every request loads the rules of the
   whole retention window before its first hit — about a hundred bytes per rule
@@ -599,9 +617,11 @@ miss.
 
 **Which writes are guarded.** The pool remembers, per key, the reads a write
 may follow: a miss, a tombstone, a stale item, a value that does not
-unmarshal, and a hit that `get()` is about to recompute (`$beta = INF`, or an
-early expiration). A plain hit forgets the read before it; so does a write
-that lands and the pool's own delete of the key. The pool's own
+unmarshal, a hit that `get()` is about to recompute (`$beta = INF`, or an
+early expiration), and a read that could not load the rules, remembered as
+having seen none, so that every rule judges what it computes. A plain hit
+forgets the read before it; so does a write that lands and the pool's own
+delete of the key. The pool's own
 `invalidateTags()` and `clear()` move the reads that had seen the stream up to
 them on to the new rule: a value computed by the pool that invalidated is not
 judged stale by its own invalidation, which `TagAwareTestTrait`'s
@@ -755,7 +775,17 @@ read alike.
   miss. And the invalidation: `hard: true` overrules every value.
 - **What stays hard.** A hard rule, a delete, a clear, the bound's floor and a
   lost stream. The newest hard rule per tag is kept beside the newest rule, so
-  a soft invalidation after a hard one leaves the hard one standing.
+  a soft invalidation after a hard one leaves the hard one standing. What a
+  read kept is handed out once, and goes before that with the next read,
+  write or delete of the key through the pool; a clear, a hard invalidation
+  or a `reset()` through the pool drops every kept copy. So a value this pool
+  wrote, deleted, cleared or invalidated hard after its read is never handed
+  out. A change made through another pool or process does not reach a copy
+  already kept: the copy lasts until this pool next reads the key, or one of
+  the above drops it.
+- **`hasItem()` and `prune()`** judge as a read does: such an item is a miss,
+  and stays on the server for the read that may keep it, until its grace has
+  passed.
 - **The window** counts from the newest invalidation that reached the item,
   on the server's clock, read once per process; `softGraceSeconds` bounds how
   long an item is kept for it, and `StaleCache`'s stale and error times apply
@@ -793,7 +823,7 @@ Not our tests: `AdapterTestCase` and `TagAwareTestTrait`, the suite
 |---|---|
 | PSR-6 conformance, with `TagAwareTestTrait` | **154 tests**, one skip |
 | PSR-16 conformance | **212 tests** |
-| whole suite | **473 tests**, three skips |
+| whole suite, on a single node | **527 tests**, eight skips |
 
 The skip is `testPrune`, which sleeps its way through four expiry deadlines to
 watch a pool collect what has expired. Redis does that by itself, which is why
@@ -804,16 +834,22 @@ garbage-collects tag Sets"*. This pool *is* `Pruneable`, for the other reason:
 since. That is ours to prove, and
 [`PruneTest`](tests/Adapter/PruneTest.php) does - including that it keeps an
 item written after the rule, stays inside its own namespace, and deletes
-nothing at all when the rules cannot be read. The other two skips wait for
-something outside the package: Symfony's `BatchCache`, whose writes
-`InvalidationGuardTest` will guard once it ships, and a phpredis built with
-compression, which the test of a client that compresses on its own needs.
+nothing at all when the rules cannot be read. Of the other seven, two of
+`ClientPrefixTest`'s need a cluster: that a write or a delete goes straight
+to the master of its key, and that `prune()` walks every master. Three need
+`artigo/cache-stampede` 2.0's `StaleCache`, where the dev requirement installs
+1.1. Two wait for something outside the package: Symfony's `BatchCache`,
+whose writes `InvalidationGuardTest` will guard once it ships, and a phpredis
+built with compression, which the test of a client that compresses on its own
+needs.
 
 The rest of the suite is ours, and it breaks Redis on purpose: a rules stream
 that cannot be read, a pipeline that never comes back, a stream deleted under
 a running process, a client that serializes on its own. Each has to degrade to
 a miss or a refusal, never to a stale hit and never to an exception in the
-request.
+request. A read that cannot load the rules is a miss, and the value computed
+after it is still guarded, stamped as having seen no rule: a delete during the
+computation refuses it, and every rule judges it.
 
 ## Use them together
 
@@ -875,18 +911,28 @@ outside the write that follows a miss (see
 [the invalidation guard](#the-invalidation-guard)). That one is sent by its
 sha1 and sent again as a body where the server does not hold it, so a
 `SCRIPT FLUSH`, restart or failover costs one round trip per node and no
-`FUNCTION LOAD` is ever needed. The other script, on every invalidation, is the
+`FUNCTION LOAD` is ever needed. A second script, on every invalidation, is the
 appended rule — it needs the id `XADD` just generated, and the id before it —
-and it travels as a body. The key is given the TTL of its longest-lived field,
-so a `volatile-*` eviction policy still sees it. Stream ids hold milliseconds,
-which a 32-bit integer cannot: the constructor refuses a 32-bit PHP.
+and it travels as a body, as does the third: the one-line `XRANGE` asked of a
+primary when a replica's answer is in doubt (see
+[Replicas](#running-it-in-production)). The key is given the TTL of its
+longest-lived field, so a `volatile-*` eviction policy still sees it. Stream
+ids hold milliseconds, which a 32-bit integer cannot: the constructor refuses a
+32-bit PHP.
 
-Clients: **ext-redis** or **Relay**. Standalone or **cluster** — every command
-the adapter issues touches a single key, so three masters are no different from
-one. CI runs the suite on PHP 8.2 to 8.5 against Symfony 6.4, 7.4 and 8.1, on
-Redis 8.0, 8.4 and the current 8.x and on Valkey 9, through Relay, against a
-three-master cluster, and against three masters with a replica each, read from
-the replicas (`failover=slaves`).
+Clients: **ext-redis** or **Relay**. Standalone, **cluster** or ext-redis'
+`RedisArray` — every command the adapter issues touches a single key, so three
+masters are no different from one. An array runs a script on the node its
+body hashes to, so every command that names the rules stream is sent to the
+node that owns it, and a raw command to the node that owns its key. A
+client-side key prefix (`OPT_PREFIX`) is honoured: the client puts it on the
+keys of typed calls and scripts, and the adapter on those of the raw commands,
+which a client sends as they are. CI runs the suite on PHP 8.2 to 8.5 against
+Symfony 6.4, 7.4 and 8.1, on Redis 8.0, 8.4 and the current 8.x and on Valkey
+9, through Relay, against a three-master cluster through ext-redis and
+through Relay, and against three masters with a replica each, read from the
+replicas (`failover=slaves`), every cluster leg with and without a key prefix;
+the array is two names for one server.
 
 ## Benchmarks
 

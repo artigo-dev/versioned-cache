@@ -33,7 +33,7 @@ final class MissRecords
     public const CAP = 1_000;
 
     /**
-     * @var array<string, array{string, string, bool}> id => [mark, epoch, armed]
+     * @var array<string, array{string, string}> id => [mark, epoch]
      */
     private array $records = [];
 
@@ -53,10 +53,10 @@ final class MissRecords
      * Remembers a read of $id, replacing an older one and making it the
      * newest.
      */
-    public function take(string $id, string $mark, string $epoch, bool $armed): void
+    public function take(string $id, string $mark, string $epoch): void
     {
         unset($this->records[$id]);
-        $this->records[$id] = [$mark, $epoch, $armed];
+        $this->records[$id] = [$mark, $epoch];
 
         if ($this->cap < \count($this->records)) {
             unset($this->records[array_key_first($this->records)]);
@@ -64,7 +64,7 @@ final class MissRecords
     }
 
     /**
-     * @return array{string, string, bool}|null [mark, epoch, armed]
+     * @return array{string, string}|null [mark, epoch]
      */
     public function of(string $id): ?array
     {
@@ -94,9 +94,9 @@ final class MissRecords
      */
     public function restamp(string $previous, string $id): void
     {
-        foreach ($this->records as $recordId => [$mark, $epoch, $armed]) {
+        foreach ($this->records as $recordId => [$mark, $epoch]) {
             if ($mark === $previous) {
-                $this->records[$recordId] = [$id, $epoch, $armed];
+                $this->records[$recordId] = [$id, $epoch];
             }
         }
     }

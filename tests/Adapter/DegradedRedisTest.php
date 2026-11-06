@@ -17,6 +17,7 @@ use Artigo\Cache\Tests\Connection;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
 use Symfony\Component\Cache\CacheItem;
+use Symfony\Contracts\Cache\ItemInterface;
 
 /**
  * A cache must never be the reason a request fails, and it must never serve
@@ -60,20 +61,82 @@ final class DegradedRedisTest extends TestCase
         self::assertTrue($pool->getItem('k')->isHit(), 'and the item is back the moment the rules are');
     }
 
-    public function testAGuardedWriteGoesPlainWhenTheRulesCannotBeRead(): void
+    public function testAWriteAfterAReadWithoutTheRulesIsStampedAsHavingSeenNone(): void
     {
         $redis = $this->open(BrokenRulesRedis::class);
         $writer = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false);
         self::assertTrue($writer->invalidateTags(['other']));
-        $head = array_key_first((array) $redis->xRevRange('degraded:@rules', '+', '-', 1));
 
-        // a read that never reached a verdict records nothing to guard
+        // a read that never reached a verdict: a miss, remembered all the same
         $redis->broken = true;
         $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false);
         $item = $pool->getItem('k');
+        self::assertFalse($item->isHit());
 
-        self::assertTrue($pool->save($item->set('v')));
-        self::assertSame($head, $redis->hGet('degraded:k', 'm'), 'a plain write, stamped with the stream\'s head');
+        self::assertTrue($pool->save($item->set('v')->tag('t')), 'nothing changed the epoch it saw');
+        self::assertSame('0-0', $redis->hGet('degraded:k', 'm'), 'every rule judges it');
+
+        $redis->broken = false;
+
+        self::assertTrue($pool->getItem('k')->isHit(), 'and none names its tag');
+    }
+
+    public function testAWriteAfterAReadWithoutTheRulesLandsOverAnItemThatExists(): void
+    {
+        $redis = $this->open(BrokenRulesRedis::class);
+        $writer = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false);
+        self::assertTrue($writer->save($writer->getItem('k')->set('before')->tag('t')));
+        self::assertTrue($writer->invalidateTags(['other']));
+        self::assertIsString($redis->hGet('degraded:k', 'e'), 'the item has an epoch');
+
+        // a read that cannot load the rules still reads the epoch the item has
+        $redis->broken = true;
+        $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false);
+        $item = $pool->getItem('k');
+        self::assertFalse($item->isHit());
+
+        self::assertTrue($pool->save($item->set('after')->tag('t')), 'nothing changed the item since the read');
+        self::assertSame('0-0', $redis->hGet('degraded:k', 'm'), 'stamped as having seen no rule');
+
+        $redis->broken = false;
+
+        self::assertSame('after', (new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false))->getItem('k')->get());
+    }
+
+    public function testAChangeWhileAComputationWhoseReadMissedTheRulesRunsIsNeverServed(): void
+    {
+        $changes = [
+            'a delete' => static fn (VersionedRedisTagAwareAdapter $pool, string $key): bool => $pool->deleteItem($key),
+            'a tag invalidation' => static fn (VersionedRedisTagAwareAdapter $pool, string $key): bool => $pool->invalidateTags([$key]),
+        ];
+
+        // every connection first: opening one sweeps what the others wrote
+        $redis = $this->open(BrokenRulesRedis::class);
+        $other = new VersionedRedisTagAwareAdapter($this->open(\Redis::class), 'degraded', rulesCacheMs: 0, rulesCache: false);
+        $reads = $this->open(\Redis::class);
+
+        // the stream holds rules, as it does in production
+        self::assertTrue($other->invalidateTags(['unrelated']));
+
+        foreach ($changes as $change => $apply) {
+            $key = 'k'.md5($change);
+            $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false);
+
+            // the read cannot load the rules; by the write they are back
+            $redis->broken = true;
+            $value = $pool->get($key, static function (ItemInterface $item) use ($redis, $other, $apply, $key): string {
+                $redis->broken = false;
+                $item->tag($key);
+                self::assertTrue($apply($other, $key));
+
+                return 'computed from what was there before';
+            });
+
+            self::assertSame('computed from what was there before', $value, 'the caller still gets its value');
+
+            $reader = new VersionedRedisTagAwareAdapter($reads, 'degraded', rulesCacheMs: 0, rulesCache: false);
+            self::assertFalse($reader->getItem($key)->isHit(), \sprintf('%s during the computation stands', $change));
+        }
     }
 
     public function testAReadWithoutTheRulesArmsNoOtherKey(): void
