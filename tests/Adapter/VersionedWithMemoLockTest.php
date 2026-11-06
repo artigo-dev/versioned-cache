@@ -13,13 +13,12 @@ namespace Artigo\Cache\Tests\Adapter;
 
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
 use Artigo\Cache\MemoLock;
+use Artigo\Cache\StaleCache;
 use Artigo\Cache\Tests\Connection;
 use Composer\InstalledVersions;
 use PHPUnit\Framework\TestCase;
-use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
 use Symfony\Component\Cache\CacheItem;
-use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\ItemInterface;
 
 /**
@@ -174,15 +173,7 @@ final class VersionedWithMemoLockTest extends TestCase
 
     public function testADeleteDuringAStaleRefreshRefusesItsWrite(): void
     {
-        // by name: the installed release may predate it
-        $staleCache = 'Artigo\\Cache\\StaleCache';
-
-        if (!class_exists($staleCache)) {
-            self::markTestSkipped('This artigo/cache-stampede has no StaleCache.');
-        }
-
-        /** @var CacheItemPoolInterface&CacheInterface $stale */
-        $stale = new $staleCache($this->pool(), staleSeconds: 60, election: new MemoLock($this->redis));
+        $stale = new StaleCache($this->pool(), staleSeconds: 60, election: new MemoLock($this->redis));
 
         // a value whose lifetime ended a second ago
         $item = $stale->getItem('refreshed')->set('old');
