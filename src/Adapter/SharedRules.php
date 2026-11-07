@@ -51,7 +51,7 @@ use Symfony\Component\Cache\Adapter\ApcuAdapter;
  * Beside the set lies the mark of the newest invalidation a process of this
  * server made: when, and the rule id it got. A set read before that time and
  * holding no rule that new may lack it, so no worker here takes it for fresh,
- * whatever its stamp (see written()).
+ * whatever its stamp (see written()). The mark only moves forward.
  *
  * The entry says which format wrote it. In APCu, which only this package's
  * processes write, an entry of the current format is taken as it is, without
@@ -92,12 +92,21 @@ final class SharedRules
     private const KEY_FORMAT = 'format';
     private const KEY_RULES = 'rules';
     private const KEY_READ_AT_MS = 'read_at_ms';
-    private const KEY_WRITTEN_AT_MS = 'written_at_ms';
-    private const KEY_WRITTEN_ID = 'written_id';
+    private const KEY_MARK_AT_MS = 'at_ms';
+    private const KEY_MARK_ID = 'id';
     private const KEY_OUTAGE = 'outage';
     private const KEY_ENDED_AT_MS = 'ended_at_ms';
     private const KEY_SUCCESS_AT_MS = 'success_at_ms';
-    private const SUFFIX_WRITTEN = '_written';
+    private const SUFFIX_MARK = '_mark';
+    private const SUFFIX_MARK_AT_MS = '_mark_at_ms';
+    private const SUFFIX_MARK_ID = '_mark_id';
+
+    /**
+     * A rule id in the mark is one integer, the milliseconds above this many
+     * bits of sequence (see packId()).
+     */
+    private const MARK_SEQUENCE_BITS = 20;
+    private const MARK_SEQUENCE_MAX = (1 << self::MARK_SEQUENCE_BITS) - 1;
     private const SUFFIX_FLAG = '_flag';
     private const SUFFIX_ATTEMPT = '_attempt';
 
@@ -309,19 +318,33 @@ final class SharedRules
     /**
      * Records that a process of this server appended rule $id at $atMs (its
      * clock, after the append returned). A set read before then that holds
-     * nothing as new as $id may lack the rule. Time and id each keep their
-     * newest value: two invalidations racing on one server leave the mark of
-     * the later one, or at worst of the earlier, whose window then bounds how
-     * long the later rule can go unseen.
+     * nothing as new as $id may lack the rule. Time and id each only move
+     * forward, in one step each: two invalidations racing on one server leave
+     * the later one's, where a read and a write could leave the earlier's
+     * over it. In APCu each is an integer raised by compare-and-swap; in a
+     * pool, the read and the write are serialised by the host's lock.
      */
     public function written(float $atMs, string $id): void
     {
-        [$heldAtMs, $heldId] = $this->writtenMark() ?? [0.0, InvalidationRules::NONE];
+        // never earlier than the moment the append returned
+        $at = (int) ceil($atMs);
+        $packed = self::packId($id);
 
-        $this->write($this->key.self::SUFFIX_WRITTEN, [
-            self::KEY_WRITTEN_AT_MS => max($heldAtMs, $atMs),
-            self::KEY_WRITTEN_ID => InvalidationRules::isNewerId($heldId, $id) ? $heldId : $id,
-        ]);
+        if (null === $this->pool) {
+            self::raise(self::APCU_PREFIX.$this->key.self::SUFFIX_MARK_ID, $packed);
+            self::raise(self::APCU_PREFIX.$this->key.self::SUFFIX_MARK_AT_MS, $at);
+
+            return;
+        }
+
+        $this->underMutex(function () use ($at, $packed): void {
+            [$heldAt, $heldId] = $this->poolMark() ?? [0, 0];
+
+            $this->write($this->key.self::SUFFIX_MARK, [
+                self::KEY_MARK_AT_MS => max($heldAt, $at),
+                self::KEY_MARK_ID => max($heldId, $packed),
+            ]);
+        });
     }
 
     /**
@@ -332,20 +355,79 @@ final class SharedRules
      */
     public function writtenMark(): ?array
     {
-        $entry = $this->read($this->key.self::SUFFIX_WRITTEN);
-
-        if (!\is_array($entry)) {
-            return null;
+        if (null === $this->pool) {
+            $at = $this->read($this->key.self::SUFFIX_MARK_AT_MS);
+            $packed = $this->read($this->key.self::SUFFIX_MARK_ID);
+            $mark = \is_int($at) && \is_int($packed) ? [$at, $packed] : null;
+        } else {
+            $mark = $this->poolMark();
         }
 
-        $atMs = $entry[self::KEY_WRITTEN_AT_MS] ?? null;
-        $id = $entry[self::KEY_WRITTEN_ID] ?? null;
+        return null === $mark ? null : [(float) $mark[0], self::unpackId($mark[1])];
+    }
 
-        if ((!\is_float($atMs) && !\is_int($atMs)) || !\is_string($id)) {
-            return null;
+    /**
+     * The mark as a pool keeps it: its time and its packed id.
+     *
+     * @return array{int, int}|null
+     */
+    private function poolMark(): ?array
+    {
+        $entry = $this->read($this->key.self::SUFFIX_MARK);
+        $at = \is_array($entry) ? $entry[self::KEY_MARK_AT_MS] ?? null : null;
+        $packed = \is_array($entry) ? $entry[self::KEY_MARK_ID] ?? null : null;
+
+        return \is_int($at) && \is_int($packed) ? [$at, $packed] : null;
+    }
+
+    /**
+     * Raises the integer APCu holds at $key to $value, unless it holds as
+     * much already: of two workers raising it at once, the larger value stays.
+     */
+    private static function raise(string $key, int $value): void
+    {
+        // each failed swap means another worker raised it: a few rounds settle it
+        for ($round = 0; $round < 64; ++$round) {
+            $held = apcu_fetch($key, $found);
+
+            if (true !== $found) {
+                // added, or a store that refuses: nothing more to do
+                if (apcu_add($key, $value, self::TTL_SECONDS) || !apcu_exists($key)) {
+                    return;
+                }
+
+                continue;
+            }
+
+            if (!\is_int($held)) {
+                apcu_delete($key);
+
+                continue;
+            }
+
+            if ($held >= $value || apcu_cas($key, $held, $value)) {
+                return;
+            }
         }
+    }
 
-        return [(float) $atMs, $id];
+    /**
+     * A rule id as one integer, ordered as the ids are: the milliseconds above
+     * MARK_SEQUENCE_BITS of sequence, which last until the year 2248. A
+     * sequence too large for its bits is stored as the next millisecond's id:
+     * later than the rule, never earlier, so it can only make a set look
+     * behind, never hide that it is.
+     */
+    private static function packId(string $id): int
+    {
+        [$ms, $sequence] = InvalidationRules::split($id);
+
+        return $sequence > self::MARK_SEQUENCE_MAX ? ($ms + 1) << self::MARK_SEQUENCE_BITS : $ms << self::MARK_SEQUENCE_BITS | $sequence;
+    }
+
+    private static function unpackId(int $packed): string
+    {
+        return ($packed >> self::MARK_SEQUENCE_BITS).'-'.($packed & self::MARK_SEQUENCE_MAX);
     }
 
     /**
@@ -484,7 +566,7 @@ final class SharedRules
 
     public function forget(): void
     {
-        foreach ([$this->key, $this->key.self::SUFFIX_WRITTEN, $this->key.self::SUFFIX_FLAG, $this->key.self::SUFFIX_ATTEMPT] as $key) {
+        foreach ([$this->key, $this->key.self::SUFFIX_MARK, $this->key.self::SUFFIX_MARK_AT_MS, $this->key.self::SUFFIX_MARK_ID, $this->key.self::SUFFIX_FLAG, $this->key.self::SUFFIX_ATTEMPT] as $key) {
             $this->delete($key);
         }
     }

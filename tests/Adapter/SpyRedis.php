@@ -51,6 +51,9 @@ final class SpyRedis extends \Redis
     /** Runs once, inside the next XRANGE: what other workers do while it is in flight */
     public ?\Closure $duringRange = null;
 
+    /** Runs once, before the next EVAL: what other workers do while it is on its way */
+    public ?\Closure $beforeScript = null;
+
     /**
      * Forgets the ranges asked for so far.
      */
@@ -109,6 +112,11 @@ final class SpyRedis extends \Redis
     public function eval(string $script, array $args = [], int $num_keys = 0): mixed
     {
         $this->scripts[] = ['eval', \is_string($args[0] ?? null) ? $args[0] : ''];
+
+        if (null !== $before = $this->beforeScript) {
+            $this->beforeScript = null;
+            $before();
+        }
 
         return parent::eval($script, $args, $num_keys);
     }

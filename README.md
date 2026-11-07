@@ -417,24 +417,28 @@ outage among them.
   value it would replace is deleted (see [the guard](#the-invalidation-guard)).
 - An invalidation made on this server: where the invalidating process's copy
   ends at the rule the new one follows, it adds the rule from the id Redis
-  answered. A mark beside the shared set records the newest rule a process of
-  this server appended, and a copy read before the mark that lacks the rule
-  is behind: it judges no read until it is reloaded, through the flag like
-  any reload — never by a fetch of its own. The first invalidation of a
-  request — a pool since its last `reset()` — shares its copy at once, in the
-  `invalidateTags()` call, before it marks the server: a worker that sees the
-  mark finds a shared copy that already holds the rule, adopts it, and judges
-  by it — no fetch, no misses. That covers the usual save: one call. Later
-  invalidations in the same request share nothing in the call; the copy is
-  shared once when the request ends, by `reset()` (Messenger's
-  `services_resetter` between messages calls it) or when the pool goes away,
-  never at a read. Until then the other workers are behind those later
-  rules, and reload through the flag. Where another rule landed in between,
-  nothing is shared either. During an outage, or while a reload hangs past a second, a copy
-  behind judges reads as any copy does, and the invalidation is seen once the
-  stream answers again. Two invalidations racing on one server may leave the
-  mark of the earlier one (`SharedRules::written()`); the later is then seen
-  as one made elsewhere is.
+  answered. The reply proves that copy holds everything appended before the
+  call, so it is stamped with the moment just before it, and the others take
+  it for as fresh as that. A mark beside the shared set records the newest
+  rule a process of this server appended, and the time after the reply; a
+  copy read before the mark that lacks the rule is behind: it judges no read
+  until it is reloaded, through the flag like any reload — never by a fetch
+  of its own. The first invalidation of a request — a pool since its last
+  `reset()` — shares its copy at once, in the `invalidateTags()` call,
+  before it marks the server: a worker that sees the mark finds a shared
+  copy that already holds the rule, adopts it, and judges by it — no fetch,
+  no misses. That covers the usual save: one call. Later invalidations in
+  the same request share nothing in the call; the copy is shared once when
+  the request ends, by `reset()` (Messenger's `services_resetter` between
+  messages calls it) or when the pool goes away, never at a read. Until then
+  the other workers are behind those later rules, and reload through the
+  flag. Where another rule landed in between, nothing is shared either.
+  During an outage, or while a reload hangs past a second, a copy behind
+  judges reads as any copy does, and the invalidation is seen once the
+  stream answers again. The mark only moves forward: its time and its rule
+  id are each raised in one step — a compare-and-swap in APCu, the host's
+  file lock in a pool you pass — so two invalidations racing on one server
+  leave the later one's.
 - A share stores the whole copy and reads the entry back first, so a newer
   set is not overwritten: about 0.28 ms for a set of 2 000 rules in APCu,
   1.28 ms for 10 000 and 1.67 ms for 15 000 (in a pool you pass, what a
@@ -1446,7 +1450,7 @@ Not our tests: `AdapterTestCase` and `TagAwareTestTrait`, the suite
 |---|---|
 | PSR-6 conformance, with `TagAwareTestTrait` | **154 tests**, one skip |
 | PSR-16 conformance | **212 tests** |
-| whole suite, on a single node | **600 tests**, five skips |
+| whole suite, on a single node | **605 tests**, five skips |
 
 The skip is `testPrune`, which sleeps its way through four expiry deadlines to
 watch a pool collect what has expired. Redis does that by itself, which is why
