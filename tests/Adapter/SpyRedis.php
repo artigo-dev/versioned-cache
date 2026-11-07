@@ -13,7 +13,7 @@ namespace Artigo\Cache\Tests\Adapter;
 
 /**
  * A connection that remembers where each XRANGE started, how many entries it
- * asked for, and how often the watermark was asked for.
+ * asked for, and how often the stream's head was asked for.
  */
 final class SpyRedis extends \Redis
 {
@@ -39,6 +39,18 @@ final class SpyRedis extends \Redis
     /** XRANGE raises, as when the node holding the stream cannot be reached */
     public bool $rangesFail = false;
 
+    /** How long an XRANGE that raises takes first, as a read timeout does */
+    public int $failAfterMs = 0;
+
+    /** How long an XRANGE takes before it answers, as a slow node does */
+    public int $answerAfterMs = 0;
+
+    /** XRANGE answers false, as phpredis does on an error reply (BUSY, LOADING) */
+    public bool $rangesAnswerFalse = false;
+
+    /** Runs once, inside the next XRANGE: what other workers do while it is in flight */
+    public ?\Closure $duringRange = null;
+
     /**
      * Forgets the ranges asked for so far.
      */
@@ -56,9 +68,22 @@ final class SpyRedis extends \Redis
         $this->starts[] = $start;
         $this->counts[] = $count;
 
+        if (null !== $during = $this->duringRange) {
+            $this->duringRange = null;
+            $during();
+        }
+
         if ($this->rangesFail) {
+            usleep($this->failAfterMs * 1000);
+
             throw new \RedisException('the node holding the rules stream is down');
         }
+
+        if ($this->rangesAnswerFalse) {
+            return false;
+        }
+
+        usleep($this->answerAfterMs * 1000);
 
         return parent::xRange($key, $start, $end, $count);
     }

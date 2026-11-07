@@ -153,9 +153,10 @@ final class PruneTest extends TestCase
         self::assertFalse($pool->prune(), 'a verdict it could not reach is not a verdict');
         self::assertSame(1, $redis->exists('prune:k'), 'and nothing was deleted on the strength of it');
 
+        // once the rules can be read, a prune reaches its verdict
         $redis->broken = false;
 
-        self::assertTrue($pool->prune());
+        self::assertTrue((new VersionedRedisTagAwareAdapter($redis, 'prune', rulesCacheMs: 0, rulesCache: false))->prune());
         self::assertSame(0, $redis->exists('prune:k'));
     }
 

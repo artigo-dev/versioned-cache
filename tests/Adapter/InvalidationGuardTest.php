@@ -180,21 +180,25 @@ final class InvalidationGuardTest extends TestCase
         $this->hSetEx('guard:k', ['v' => 'x', 't' => '[]', 'm' => '0-0'], 400);
         $this->raw->pExpire('guard:k', 400);
 
-        $a = $this->pool($this->a, 1);
+        // deadlines on the server's clock, from either side of the delete: a
+        // check that runs late still falls inside the two-second window
+        $a = $this->pool($this->a, 2);
+        $before = $this->serverTime();
         $a->deleteItem('k');
+        $after = $this->serverTime();
 
         self::assertSame(['e'], array_keys((array) $this->raw->hGetAll('guard:k')));
-        self::assertLessThanOrEqual(1_000, $this->raw->pttl('guard:k'));
+        self::assertLessThanOrEqual(2_000, $this->raw->pttl('guard:k'));
         self::assertFalse($a->getItem('k')->isHit());
 
-        $this->waitPast(0.6);
+        $this->waitUntil($before + 0.8);
         self::assertSame(1, $this->exists('guard:k'), 'past the item\'s own TTL, the tombstone is still there');
 
-        $this->waitPast(1.2);
+        $this->waitUntil($after + 2.2);
         self::assertSame(0, $this->exists('guard:k'), 'past the window, nothing is');
 
         self::assertTrue($a->save($a->getItem('k')->set('v')->expiresAfter(60)));
-        self::assertGreaterThan(1_000, $this->raw->pttl('guard:k'), 'a later write has a TTL of its own');
+        self::assertGreaterThan(2_000, $this->raw->pttl('guard:k'), 'a later write has a TTL of its own');
     }
 
     public function testARawValueIsRemovedNotTombstoned(): void
@@ -478,11 +482,17 @@ final class InvalidationGuardTest extends TestCase
      */
     private function waitPast(float $seconds): void
     {
-        $deadline = $this->serverTime() + $seconds;
+        $this->waitUntil($this->serverTime() + $seconds);
+    }
 
-        do {
+    /**
+     * Sleeps until the server's clock reads $deadline.
+     */
+    private function waitUntil(float $deadline): void
+    {
+        while ($this->serverTime() < $deadline) {
             usleep(50_000);
-        } while ($this->serverTime() < $deadline);
+        }
     }
 
     private function serverTime(): float

@@ -18,18 +18,19 @@ use Artigo\Cache\Tests\Connection;
 use PHPUnit\Framework\TestCase;
 use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
-use Symfony\Component\Cache\CacheItem;
+use Symfony\Component\Cache\Adapter\FilesystemAdapter;
 
 /**
  * The rule set shared by the workers of a server: what a fresh pool pays
  * when another one has already loaded the rules, how a rule appended by this
- * process or by another one reaches everybody, and who refreshes when several
- * workers cross the window together.
+ * process or by another one reaches everybody, and the flag and the record of
+ * the last attempt kept beside it.
  *
  * Two pools over two connections, sharing one ArrayAdapter, stand for two
  * workers on one server - the same shape APCu gives them in production,
- * without needing APCu here. The election flag is a file lock, so it is
- * real even inside one process: a second handle cannot take a held lock.
+ * without needing APCu here. The flag lives in the same medium, so a second
+ * SharedRules on it stands for another worker taking it. How a read takes the
+ * set while it is reloaded is RuleSetReloadTest's.
  */
 final class SharedRulesTest extends TestCase
 {
@@ -148,79 +149,6 @@ final class SharedRulesTest extends TestCase
         self::assertFalse($pool->getItem('item2')->isHit(), 'the rule in between was fetched, not skipped');
     }
 
-    public function testBehindALocalInvalidationAWorkerFetchesEvenWhileAnotherRefreshes(): void
-    {
-        $reader = $this->pool($this->redis);
-        $this->write($reader, 'item', ['tag1']);
-        self::assertTrue($reader->getItem('item')->isHit());
-        self::assertTrue($this->pool($this->third)->invalidateTags(['tag1']));
-
-        // a worker elsewhere on this server is refreshing, and may have
-        // started before the rule was appended
-        $flag = $this->sharedRules();
-        self::assertTrue($flag->lead());
-
-        try {
-            $next = $this->pool($this->other);
-
-            self::assertFalse($next->getItem('item')->isHit(), 'the read fetches the rule itself rather than keep the set it adopted');
-        } finally {
-            $flag->release();
-        }
-    }
-
-    public function testAColdWorkerDoesNotTakeASetFromBeforeALocalInvalidationAsFinal(): void
-    {
-        $this->write($this->pool($this->redis, rulesCache: false), 'item', ['tag1']);
-
-        // the set the elected worker is about to share: read before the
-        // invalidation below, so it lacks the rule
-        $scratch = new ArrayAdapter();
-        $early = SharedRules::of($scratch, self::RULES_KEY, $this->redis);
-        self::assertNotNull($early);
-        $rules = new InvalidationRules(self::NAMESPACE.':', 2_592_000_000);
-        $rules->absorb((array) $this->plain->xRange(self::RULES_KEY, '-', '+'));
-        self::assertTrue($early->store($rules, microtime(true) * 1000));
-        usleep(2_000);
-
-        // a medium that shows nothing at the first look, and that set from the
-        // next one on: the leader's store landing while the cold worker waits
-        $medium = new class extends ArrayAdapter {
-            /** @var array<string, mixed> */
-            public array $later = [];
-
-            public function getItem(mixed $key): CacheItem
-            {
-                $item = parent::getItem($key);
-
-                if (!$item->isHit() && \array_key_exists($key, $this->later)) {
-                    $this->save(parent::getItem($key)->set($this->later[$key]));
-                    unset($this->later[$key]);
-                }
-
-                return $item;
-            }
-        };
-        $medium->later[$early->getKey()] = $scratch->getItem($early->getKey())->get();
-
-        self::assertTrue($this->pool($this->third, rulesCache: $medium)->invalidateTags(['tag1']));
-
-        // the elected worker is still at work
-        $flag = SharedRules::of($medium, self::RULES_KEY, $this->redis);
-        self::assertNotNull($flag);
-        self::assertTrue($flag->lead());
-
-        try {
-            $cold = $this->pool($this->other, rulesCache: $medium);
-
-            self::assertFalse($cold->getItem('item')->isHit(), 'the set it waited for is behind the invalidation: it loads the rules itself');
-        } finally {
-            $flag->release();
-        }
-
-        self::assertSame(['-'], $this->other->starts, 'once, from the beginning');
-    }
-
     public function testASetReadAfterTheMarkIsFreshEvenWhereTheStreamLostTheRule(): void
     {
         self::assertTrue($this->pool($this->third)->invalidateTags(['tag1']));
@@ -274,69 +202,30 @@ final class SharedRulesTest extends TestCase
 
         self::assertNotNull($loaded);
         self::assertSame('2000-0', $loaded[0]->last());
+
+        self::assertTrue($shared->store($older, 3.0, true), 'a set that started over replaces it');
+
+        $loaded = $shared->load(self::NAMESPACE.':', 60_000);
+
+        self::assertNotNull($loaded);
+        self::assertSame(['1000-0', 3.0], [$loaded[0]->last(), $loaded[1]]);
     }
 
-    public function testWithinTheGraceAHeldSetIsServedWhileAnotherWorkerRefreshes(): void
+    public function testAColdWorkerElectedDuringAnOutageLoadsTheStreamAndEndsIt(): void
     {
-        // past the window, within the grace: another server's rule not yet in
-        [, $aged] = $this->shareASetAged(50 + intdiv($this->graceMs(), 2));
-        $flag = $this->sharedRules();
-        self::assertTrue($flag->lead());
+        $this->write($this->pool($this->redis, rulesCache: false), 'item', ['tag1']);
+        $this->appendRule('tag1');
 
-        try {
-            $second = $this->pool($this->other, 50);
-            $began = microtime(true);
+        // nothing shared, and the last attempt ended more than a second ago
+        $endedAtMs = microtime(true) * 1000 - 1_100;
+        $this->sharedRules()->attemptEnded($endedAtMs - 10, false, $endedAtMs);
 
-            self::assertTrue($second->getItem('item1')->isHit(), 'the set it holds is served as it is');
-            self::assertLessThan(0.1, microtime(true) - $began, 'without waiting for the elected worker');
-            self::assertSame([], $this->other->starts, 'and without a fetch');
-        } finally {
-            $flag->release();
-        }
+        $cold = $this->pool($this->other);
 
-        $this->assertSharedEntryIs($aged);
-    }
-
-    public function testPastTheGraceAWorkerFetchesWhatItLacksWithoutWaiting(): void
-    {
-        [$last, $aged] = $this->shareASetAged(50 + $this->graceMs() + 500);
-        $flag = $this->sharedRules();
-        self::assertTrue($flag->lead());
-
-        try {
-            $second = $this->pool($this->other, 50);
-            $began = microtime(true);
-
-            self::assertFalse($second->getItem('item1')->isHit(), 'past the grace the rule from elsewhere is in');
-            self::assertLessThan(0.1, microtime(true) - $began, 'without waiting for the elected worker');
-            self::assertSame([$last], $this->other->starts, 'through one delta fetch from the id it held');
-        } finally {
-            $flag->release();
-        }
-
-        $this->assertSharedEntryIs($aged);
-    }
-
-    public function testPastTheGraceAStreamThatCannotBeReadLeavesTheHeldSetServed(): void
-    {
-        [$last, $aged] = $this->shareASetAged(50 + $this->graceMs() + 500);
-        $flag = $this->sharedRules();
-        self::assertTrue($flag->lead());
-        $this->other->rangesFail = true;
-
-        try {
-            $second = $this->pool($this->other, 50);
-            $began = microtime(true);
-
-            self::assertTrue($second->getItem('item1')->isHit(), 'the set it holds, rather than no rules at all');
-            self::assertTrue($second->getItem('item1')->isHit());
-            self::assertLessThan(0.1, microtime(true) - $began, 'without waiting for the elected worker');
-            self::assertSame([$last, $last], $this->other->starts, 'one failed delta fetch per read');
-        } finally {
-            $flag->release();
-        }
-
-        $this->assertSharedEntryIs($aged);
+        self::assertFalse($cold->getItem('item')->isHit(), 'it tries again, and loads the stream');
+        self::assertSame(['-'], $this->other->starts);
+        self::assertFalse($this->sharedRules()->lastAttempt()[0], 'which ends the outage');
+        self::assertNotNull($this->sharedRules()->load(self::NAMESPACE.':', 60_000), 'and shares what it read');
     }
 
     public function testAWorkerPastTheWindowAdoptsAFresherSharedSetAtOnce(): void
@@ -362,202 +251,11 @@ final class SharedRulesTest extends TestCase
         self::assertTrue($flag->lead());
 
         try {
-            self::assertFalse($worker->getItem('item')->isHit(), 'the fresher set is adopted, rather than the held one served for the grace');
+            self::assertFalse($worker->getItem('item')->isHit(), 'the fresher set is adopted, rather than the held one served while the reload runs');
             self::assertSame([], $this->other->starts, 'and nothing was fetched for it');
         } finally {
             $flag->release();
         }
-    }
-
-    public function testAColdWorkerAdoptsTheElectedLoadWhileItWaits(): void
-    {
-        // a medium whose entry the elected worker stores while the other waits
-        $medium = new class extends ArrayAdapter {
-            /** @var array<string, mixed> */
-            public array $later = [];
-
-            /** @var array<string, int> */
-            private array $looks = [];
-
-            public function getItem(mixed $key): CacheItem
-            {
-                // the first look finds nothing, the next the elected worker's set
-                if (\array_key_exists($key, $this->later)) {
-                    $this->looks[$key] = ($this->looks[$key] ?? 0) + 1;
-
-                    if (2 <= $this->looks[$key]) {
-                        $this->save(parent::getItem($key)->set($this->later[$key]));
-                        unset($this->later[$key]);
-                    }
-                }
-
-                return parent::getItem($key);
-            }
-        };
-
-        $this->write($this->pool($this->redis, rulesCache: false), 'item', ['tag1']);
-        $this->appendRule('tag1');
-        [$key, $entry] = $this->electedEntry();
-        $medium->later[$key] = $entry;
-
-        $flag = SharedRules::of($medium, self::RULES_KEY, $this->redis);
-        self::assertNotNull($flag);
-        self::assertTrue($flag->lead());
-
-        try {
-            $cold = $this->pool($this->other, rulesCache: $medium);
-            $began = microtime(true);
-
-            self::assertFalse($cold->getItem('item')->isHit(), 'the elected worker\'s set holds the rule');
-            self::assertLessThan(0.2, microtime(true) - $began, 'taken while it waited, not after the budget');
-            self::assertSame([], $this->other->starts, 'and nothing was fetched for it');
-        } finally {
-            $flag->release();
-        }
-    }
-
-    public function testAColdWorkerWaitingTakesNoSetReadBeforeTheWindow(): void
-    {
-        // a medium whose entry shows up at the second look: while the worker waits
-        $medium = new class extends ArrayAdapter {
-            /** @var array<string, mixed> */
-            public array $later = [];
-
-            /** @var array<string, int> */
-            private array $looks = [];
-
-            public function getItem(mixed $key): CacheItem
-            {
-                if (\array_key_exists($key, $this->later)) {
-                    $this->looks[$key] = ($this->looks[$key] ?? 0) + 1;
-
-                    if (2 <= $this->looks[$key]) {
-                        $this->save(parent::getItem($key)->set($this->later[$key]));
-                        unset($this->later[$key]);
-                    }
-                }
-
-                return parent::getItem($key);
-            }
-        };
-
-        $this->write($this->pool($this->redis, rulesCache: false), 'item', ['tag1']);
-        $this->appendRule('tag2');
-
-        // a set read longer ago than the window, and a rule appended since
-        [$key, $entry, $last] = $this->electedEntry(2_000);
-        $medium->later[$key] = $entry;
-        $this->appendRule('tag1');
-
-        $flag = SharedRules::of($medium, self::RULES_KEY, $this->redis);
-        self::assertNotNull($flag);
-        self::assertTrue($flag->lead());
-
-        try {
-            $cold = $this->pool($this->other, rulesCache: $medium);
-
-            self::assertFalse($cold->getItem('item')->isHit(), 'the rule appended after that set was read is in');
-            self::assertSame([$last], $this->other->starts, 'fetched on its own, from where the set it took ends');
-        } finally {
-            $flag->release();
-        }
-    }
-
-    public function testAColdWorkerAdoptsASetStoredJustBeforeTheElectedWorkerLetGo(): void
-    {
-        // a medium whose entry the elected worker stores, and whose flag it
-        // lets go, right after a look of the waiting worker found nothing
-        $medium = new class extends ArrayAdapter {
-            /** @var array<string, mixed> */
-            public array $later = [];
-
-            public ?SharedRules $leader = null;
-
-            /** @var array<string, int> */
-            private array $looks = [];
-
-            public function getItem(mixed $key): CacheItem
-            {
-                $item = parent::getItem($key);
-
-                // the second look is the first while waiting: it finds
-                // nothing, and the next look comes after the flag is free
-                if (\array_key_exists($key, $this->later) && 2 === $this->looks[$key] = ($this->looks[$key] ?? 0) + 1) {
-                    $this->save(parent::getItem($key)->set($this->later[$key]));
-                    unset($this->later[$key]);
-                    $this->leader?->release();
-                }
-
-                return $item;
-            }
-        };
-
-        $this->write($this->pool($this->redis, rulesCache: false), 'item', ['tag1']);
-        $this->appendRule('tag1');
-        [$key, $entry] = $this->electedEntry();
-        $medium->later[$key] = $entry;
-
-        $flag = SharedRules::of($medium, self::RULES_KEY, $this->redis);
-        self::assertNotNull($flag);
-        self::assertTrue($flag->lead());
-        $medium->leader = $flag;
-
-        try {
-            $cold = $this->pool($this->other, rulesCache: $medium);
-            $began = microtime(true);
-
-            self::assertFalse($cold->getItem('item')->isHit(), 'the elected worker\'s set holds the rule');
-            self::assertLessThan(0.2, microtime(true) - $began, 'taken once the flag was free, not after the budget');
-            self::assertSame([], $this->other->starts, 'and nothing was fetched for it');
-            self::assertFalse($flag->isRefreshing(), 'the elected worker had let go before the last look');
-        } finally {
-            $flag->release();
-        }
-    }
-
-    public function testAColdWorkerWaitsForTheElectedLoaderThenLoadsOnItsOwn(): void
-    {
-        $first = $this->pool($this->redis);
-        $this->write($first, 'item', ['tag1']);
-        $first->invalidateTags(['tag2']);
-
-        // nothing shared, and the flag says a loader is at work
-        $flag = $this->sharedRules();
-        $flag->forget();
-        self::assertTrue($flag->lead());
-
-        try {
-            $second = $this->pool($this->other);
-            $began = microtime(true);
-            $hit = $second->getItem('item')->isHit();
-            $waited = microtime(true) - $began;
-        } finally {
-            $flag->release();
-        }
-
-        self::assertTrue($hit, 'loaded on its own, correctly');
-        self::assertSame(['-'], $this->other->starts, 'from the beginning, once');
-        self::assertGreaterThan(0.2, $waited, 'after waiting the budget out');
-    }
-
-    public function testExactReadsElectNobody(): void
-    {
-        $first = $this->pool($this->redis, 0);
-        $this->write($first, 'item', ['tag1']);
-        $first->invalidateTags(['tag2']);
-        self::assertTrue($first->getItem('item')->isHit());
-        $fetches = \count($this->redis->starts);
-
-        $flag = $this->sharedRules();
-        self::assertTrue($flag->lead());
-
-        try {
-            self::assertTrue($first->getItem('item')->isHit());
-        } finally {
-            $flag->release();
-        }
-
-        self::assertCount($fetches + 1, $this->redis->starts, 'an exact read fetches whatever the flag says');
     }
 
     public function testFalseKeepsTheSetPerPool(): void
@@ -613,6 +311,134 @@ final class SharedRulesTest extends TestCase
         }
 
         self::assertNull($default->load(self::NAMESPACE.':', 60_000), 'forgotten');
+    }
+
+    public function testTheFlagIsALeaseHeldByOneWorkerAtATimeInEitherMedium(): void
+    {
+        foreach ($this->media() as $medium => [$first, $second]) {
+            try {
+                self::assertNull($second->reloadStartedAt(), \sprintf('%s: free', $medium));
+
+                $before = microtime(true) * 1000;
+                self::assertTrue($first->lead(), \sprintf('%s: taken', $medium));
+                $after = microtime(true) * 1000;
+                self::assertTrue($first->lead(), \sprintf('%s: and held', $medium));
+                self::assertFalse($second->lead(), \sprintf('%s: by one worker at a time', $medium));
+
+                $startedAt = $second->reloadStartedAt();
+                self::assertNotNull($startedAt, \sprintf('%s: it says when the reload began', $medium));
+                self::assertGreaterThanOrEqual(floor($before), $startedAt);
+                self::assertLessThanOrEqual($after, $startedAt);
+
+                $first->release();
+                self::assertNull($second->reloadStartedAt(), \sprintf('%s: its owner let go', $medium));
+                self::assertTrue($second->lead(), \sprintf('%s: and another worker takes it', $medium));
+                $second->release();
+            } finally {
+                $first->forget();
+            }
+        }
+    }
+
+    public function testALapsedLeaseIsTakenOverAndItsOldOwnerCannotReleaseTheNewOne(): void
+    {
+        foreach ($this->media() as $medium => [$dead, $next]) {
+            $third = $this->sameAs($dead);
+
+            try {
+                self::assertTrue($dead->lead());
+
+                // its owner stopped long ago: the lease is older than its term
+                $this->ageLease($dead, SharedRules::LEASE_MS + 1_000);
+
+                self::assertNull($next->reloadStartedAt(), \sprintf('%s: a lapsed lease is no reload in flight', $medium));
+                self::assertTrue($next->lead(), \sprintf('%s: it is taken over', $medium));
+
+                $dead->release();
+
+                self::assertFalse($third->lead(), \sprintf('%s: the old owner let go of nothing', $medium));
+
+                $next->release();
+
+                self::assertTrue($third->lead(), \sprintf('%s: the new owner did', $medium));
+                $third->release();
+            } finally {
+                $dead->forget();
+            }
+        }
+    }
+
+    public function testAWorkerHoldingTheFlagIsNotKeptAliveForItsRelease(): void
+    {
+        $makers = ['a pool' => fn (): ?SharedRules => SharedRules::of($this->shared, self::RULES_KEY, $this->redis)];
+
+        if (SharedRules::apcuEnabled()) {
+            $makers['APCu'] = fn (): ?SharedRules => SharedRules::of(null, self::RULES_KEY, $this->plain);
+        }
+
+        foreach ($makers as $medium => $make) {
+            $holder = $make();
+            self::assertNotNull($holder);
+            self::assertTrue($holder->lead());
+            $instance = \WeakReference::create($holder);
+            unset($holder);
+            gc_collect_cycles();
+
+            self::assertNull($instance->get(), \sprintf('%s: gone once nothing else holds it', $medium));
+
+            $make()?->forget();
+        }
+    }
+
+    public function testAReloaderThatDiesOfAFatalErrorLetsGoOfTheFlag(): void
+    {
+        $directory = sys_get_temp_dir().\DIRECTORY_SEPARATOR.'artigo-dying-'.bin2hex(random_bytes(4));
+        $medium = new FilesystemAdapter('rules', 0, $directory);
+
+        try {
+            $process = proc_open([\PHP_BINARY, __DIR__.'/Fixtures/dying-reloader.php', self::RULES_KEY, $directory], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, ['REDIS_DSN' => Connection::dsn()] + getenv());
+            self::assertIsResource($process);
+            $output = (string) stream_get_contents($pipes[1]).(string) stream_get_contents($pipes[2]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            proc_close($process);
+
+            self::assertStringContainsString('took the flag', $output, $output);
+
+            // the worker's connection is a plain one, and so is the key it shares under
+            $flag = SharedRules::of($medium, self::RULES_KEY, $this->plain);
+            self::assertNotNull($flag);
+            self::assertNull($flag->reloadStartedAt(), 'the flag is free');
+        } finally {
+            $medium->clear();
+            @rmdir($directory.\DIRECTORY_SEPARATOR.'rules');
+            @rmdir($directory);
+        }
+    }
+
+    public function testTheLastAttemptIsRecordedInEitherMedium(): void
+    {
+        foreach ($this->media() as $medium => [$shared]) {
+            try {
+                self::assertSame([false, null, null], $shared->lastAttempt(), \sprintf('%s: none yet', $medium));
+
+                $shared->attemptEnded(1_000.0, false, 1_300.0);
+                self::assertSame([true, 1_300.0, null], $shared->lastAttempt(), \sprintf('%s: a failure starts an outage', $medium));
+
+                $shared->attemptEnded(2_000.0, true, 2_100.0);
+                self::assertSame([false, 2_100.0, 2_000.0], $shared->lastAttempt(), \sprintf('%s: a success ends it, and says when it began', $medium));
+
+                $shared->attemptEnded(1_500.0, false, 2_200.0);
+                self::assertSame([false, 2_100.0, 2_000.0], $shared->lastAttempt(), \sprintf('%s: the failure of a reload that began before the last success is ignored', $medium));
+
+                $shared->attemptEnded(2_050.0, false, 2_300.0);
+                self::assertSame([true, 2_300.0, 2_000.0], $shared->lastAttempt(), \sprintf('%s: one that began after it counts', $medium));
+            } finally {
+                $shared->forget();
+            }
+
+            self::assertSame([false, null, null], $shared->lastAttempt(), \sprintf('%s: forgotten with the set', $medium));
+        }
     }
 
     public function testAnApcuEntryOfAnotherFormatIsNotAdopted(): void
@@ -704,69 +530,57 @@ final class SharedRulesTest extends TestCase
     }
 
     /**
-     * A set this server shared $ageMs ago, holding this pool's own rule, and
-     * a rule another server appended since: what a worker adopting it lacks.
+     * Two SharedRules on each medium the test can reach - two workers of one
+     * server.
      *
-     * @return array{string, array{InvalidationRules, float}} the id the set ends at, and the entry as stored
+     * @return array<string, array{SharedRules, SharedRules}>
      */
-    private function shareASetAged(int $ageMs): array
+    private function media(): array
     {
-        $first = $this->pool($this->redis, 50);
-        $this->write($first, 'item1', ['tag1']);
-        $first->invalidateTags(['tag2']);
-        self::assertTrue($first->getItem('item1')->isHit());
-        $last = $this->streamHead();
+        $media = ['a pool' => [$this->sharedRules(), $this->sharedRules()]];
 
-        // the same set, stamped as read $ageMs ago
-        $shared = $this->sharedRules();
-        $stored = $shared->load(self::NAMESPACE.':', 60_000);
-        self::assertNotNull($stored);
-        self::assertSame($last, $stored[0]->last());
-        self::assertTrue($shared->store($stored[0], microtime(true) * 1000 - $ageMs));
+        if (SharedRules::apcuEnabled()) {
+            $apcu = SharedRules::of(null, self::RULES_KEY, $this->plain);
+            self::assertNotNull($apcu);
+            $media['APCu'] = [$apcu, $this->sameAs($apcu)];
+        }
 
-        $this->appendRule('tag1');
-
-        $aged = $shared->load(self::NAMESPACE.':', 60_000);
-        self::assertNotNull($aged);
-
-        return [$last, $aged];
+        return $media;
     }
 
     /**
-     * @param array{InvalidationRules, float} $entry
+     * Another worker on the medium $shared speaks to.
      */
-    private function assertSharedEntryIs(array $entry): void
+    private function sameAs(SharedRules $shared): SharedRules
     {
-        $shared = $this->sharedRules()->load(self::NAMESPACE.':', 60_000);
+        $same = $shared->isApcu() ? SharedRules::of(null, self::RULES_KEY, $this->plain) : $this->sharedRules();
+        self::assertNotNull($same);
+        self::assertSame($shared->getKey(), $same->getKey());
 
-        self::assertNotNull($shared);
-        self::assertSame([$entry[0]->last(), $entry[1]], [$shared[0]->last(), $shared[1]], 'the shared entry is left to the elected worker');
+        return $same;
     }
 
     /**
-     * The entry the elected worker stores - the stream as it is now, stamped
-     * as read $ageMs ago - the key it goes under, and the id the set ends at.
-     *
-     * @return array{string, mixed, string}
+     * Moves the start of the lease $holder holds $ms into the past, as the
+     * lease is stored: the start in milliseconds times a million, plus a
+     * nonce.
      */
-    private function electedEntry(int $ageMs = 0): array
+    private function ageLease(SharedRules $holder, int $ms): void
     {
-        $scratch = new ArrayAdapter();
-        $refreshed = SharedRules::of($scratch, self::RULES_KEY, $this->redis);
-        self::assertNotNull($refreshed);
-        $rules = new InvalidationRules(self::NAMESPACE.':', 2_592_000_000);
-        $rules->absorb((array) $this->plain->xRange(self::RULES_KEY, '-', '+'));
-        self::assertTrue($refreshed->store($rules, microtime(true) * 1000 - $ageMs));
+        $key = $holder->getKey().'_flag';
 
-        return [$refreshed->getKey(), $scratch->getItem($refreshed->getKey())->get(), $rules->last()];
-    }
+        if ($holder->isApcu()) {
+            $lease = apcu_fetch('artigo.versioned.'.$key);
+            self::assertIsInt($lease);
+            self::assertTrue(apcu_store('artigo.versioned.'.$key, $lease - $ms * 1_000_000));
 
-    private function graceMs(): int
-    {
-        $grace = (new \ReflectionClassConstant(VersionedRedisTagAwareAdapter::class, 'RULES_GRACE_MS'))->getValue();
-        self::assertIsInt($grace);
+            return;
+        }
 
-        return $grace;
+        $item = $this->shared->getItem($key);
+        $lease = $item->get();
+        self::assertIsInt($lease);
+        self::assertTrue($this->shared->save($item->set($lease - $ms * 1_000_000)));
     }
 
     private function pool(SpyRedis $redis, int $rulesCacheMs = 1_000, CacheItemPoolInterface|false|null $rulesCache = null): VersionedRedisTagAwareAdapter
