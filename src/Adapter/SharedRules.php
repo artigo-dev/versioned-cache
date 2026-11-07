@@ -15,63 +15,106 @@ use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Component\Cache\Adapter\ApcuAdapter;
 
 /**
- * The rule set, kept where it survives the request, and everything the
- * workers sharing it need to agree on.
+ * The copy of the invalidation rules that the workers of one server share,
+ * and the few things they must agree on while one of them reloads it.
  *
- * Under PHP-FPM every request is a fresh process and a fresh adapter, and an
- * adapter that holds no rules has to load the whole stream - every
- * invalidation of the retention window - before its first hit. Kept where the
- * workers of a server can all reach it, the compacted set is loaded once per
- * server and then only followed: the worker that reloads it fetches the rules
- * appended since the set's last id and stores the result for the others.
+ * The idea in three sentences. Invalidating a tag deletes no item: it adds a
+ * rule to a list in Redis, such as "items tagged product-42 written before
+ * 12:00:00 are outdated". Every worker checks each item it reads against a
+ * copy of that list kept in memory, without asking Redis. This class keeps
+ * one copy where every worker of the server can reach it, so that one worker
+ * reloads it from Redis about once a second (the adapter's $rulesCacheMs) and
+ * the others take over its result.
  *
- * The medium is APCu, spoken to directly, unless the caller hands in a PSR-6
- * pool of their own. Direct, because APCu keeps a PHP array as it is and
- * hands back a copy, where a pool serialises it on the way in and parses it on
- * the way out - and a fresh worker adopts the set on every request, so that
- * cost is paid per request, by the size of the set. A pool is for servers
- * without APCu, or for keeping the set where the application already keeps
- * such things. The processes that share one medium are one server: the reload
- * flag, the outage and the mark of the newest invalidation live beside the
- * set and speak for all of them.
+ * An example with two workers, A and B, on one server. The shared copy was
+ * read from Redis at 11:59:59.000. At 12:00:00.000 worker A reads an item
+ * and finds the copy a second old, so it takes the reload flag (lead()) and
+ * asks Redis for the rules added since the copy's last one. A millisecond
+ * later worker B reads an item. The flag is taken, the reload has run for
+ * less than a second, and B's copy is less than two seconds old
+ * ($rulesCacheMs plus a second), so B checks the item against its copy
+ * without waiting. At 12:00:00.002 A's fetch returns. A stores the new copy
+ * here (store()), records that the attempt succeeded (attemptEnded()) and
+ * releases the flag (release()). B's next read takes over the new copy
+ * (load()) and asks Redis for nothing.
  *
- * The flag is a lease: an owner token and the moment the reload began, taken
- * by one worker at a time and released by its owner only. It outlasts any
- * reload, and exists for a reloader that dies, not for one that hangs: a
- * lease older than LEASE_MS is free again. Beside it lies the record of the
- * last attempt: when it ended, whether the stream could be read, and when the
- * last fetch that could read it began.
+ * When something goes wrong:
  *
- * The entry is keyed by the rules key and an identity of the connection, so
- * two pools that share one server and one namespace but talk to different
- * Redis servers never read each other's rules. Freshness is judged by the
- * read-at stamp stored with the set; the TTL only reclaims entries nobody
- * reads any more.
+ * - If Redis does not answer, the reloader records an outage. Every worker
+ *   keeps using the copy it has, however old, and one worker tries Redis
+ *   again a second after the last attempt ended.
+ * - If another worker is already reloading, nobody waits for it. A reload
+ *   that runs longer than a second is treated as if Redis were down.
+ * - If two reloads race, the slower one does not overwrite the newer copy
+ *   that the faster one stored (see store()).
+ * - If an invalidation is made on this server while the others hold an older
+ *   copy, the local-invalidation note (below) keeps every worker from using a
+ *   copy that lacks its rule until that copy is reloaded.
+ * - If the store refuses to record the flag, the worker loads the rules on
+ *   its own and shares nothing, so the server is never left without anyone
+ *   to reload.
  *
- * Beside the set lies the mark of the newest invalidation a process of this
- * server made: when, and the rule id it got. A set read before that time and
- * holding no rule that new may lack it, so no worker here takes it for fresh,
- * whatever its stamp (see written()). The mark only moves forward.
+ * Read more in the README, under "The shared rule set while it reloads".
  *
- * The entry says which format wrote it. In APCu, which only this package's
+ * Why share at all. Under PHP-FPM every request is a fresh process with a
+ * fresh adapter. An adapter with no copy would have to load the whole
+ * stream, every invalidation of the retention window, before its first hit.
+ * Kept where every worker of the server can reach it, the copy is loaded from
+ * the start once per server. After that, the reloader only fetches the rules
+ * added since the copy's last id, and stores the result for the others.
+ *
+ * Where it is kept. The store is APCu, called directly, unless the caller
+ * hands in a PSR-6 pool. APCu is called directly because it keeps a PHP array
+ * as it is and hands back a copy. A pool serialises the array on the way in
+ * and parses it on the way out. A fresh worker takes over the copy on every
+ * request, so that cost would be paid on every request, and grow with the
+ * size of the copy. A pool is for servers without APCu, or for keeping the
+ * copy where the application already keeps such things. In these comments a
+ * "server" means the processes that share one store. The reload flag, the
+ * record of the last attempt and the local-invalidation note are kept in that
+ * store beside the copy, so they hold for all of those processes.
+ *
+ * The reload flag. Only the worker holding the flag reloads. The flag holds a
+ * random owner token and the moment the reload began. One worker at a time
+ * can take it, and only its owner releases it. It is there for a reloader
+ * that dies, not for one that hangs, so it lasts longer than any reload: a
+ * flag older than LEASE_MS counts as free again. Beside the flag lies the
+ * record of the last attempt to fetch the rules: when it ended, whether it
+ * failed (an outage), and when the last successful fetch began.
+ *
+ * The entry's key is made from the rules key and the connection's identity,
+ * so two pools on one server with the same namespace but different Redis
+ * servers never read each other's rules. How old a copy is comes from the
+ * read time stored with it: when the fetch that read it began. The entry's
+ * TTL only cleans up entries nobody reads any more.
+ *
+ * The local-invalidation note. Beside the copy lies a note of the newest
+ * invalidation any process of this server made: when it was made, and the id
+ * Redis gave its rule. A copy read before that time that holds no rule as new
+ * as that id may lack the rule. So no worker here treats such a copy as
+ * fresh, however recently it was read (see written()). The note only moves
+ * forward.
+ *
+ * The entry records which format wrote it. In APCu, which only this package's
  * processes write, an entry of the current format is taken as it is, without
- * checking each rule - that check costs more than the copy itself - and one of
- * another format is a miss, as an absent one is. In a pool handed in, others
- * may write too, and every rule is checked.
+ * checking each rule, because that check costs more than the copy itself. An
+ * entry of another format is ignored, as a missing one is. In a pool handed
+ * in, others may write too, so every rule is checked.
  *
  * @internal
  */
 final class SharedRules
 {
     /**
-     * How long an untouched entry stays. Freshness is decided by the stamp
-     * inside, not by this.
+     * How long an entry nobody touches stays in the store. How old the copy
+     * is comes from the read time stored inside it, not from this.
      */
     public const TTL_SECONDS = 86_400;
 
     /**
-     * How long a lease holds the flag, in milliseconds: longer than any reload
-     * whose read timeout is kept short, and as long as PHP-FPM's default
+     * In milliseconds: how long the reload flag stays taken before another
+     * worker may take it over. That is longer than any reload whose read
+     * timeout is kept short, and as long as PHP-FPM's default
      * max_execution_time.
      */
     public const LEASE_MS = 30_000;
@@ -79,13 +122,15 @@ final class SharedRules
     private const APCU_PREFIX = 'artigo.versioned.';
 
     /**
-     * The shape of the stored set: one integer per rule (InvalidationRules).
+     * The format of the stored copy: one integer per rule (see
+     * InvalidationRules).
      */
     private const FORMAT = 3;
 
     /**
-     * A lease is one integer, so APCu can take and release it atomically: the
-     * millisecond it began times this, plus a nonce below it.
+     * The flag is one integer, so APCu can take and release it in one atomic
+     * step: the millisecond the reload began, times this, plus a random number
+     * below it that tells owners apart.
      */
     private const LEASE_NONCE = 1_000_000;
 
@@ -102,8 +147,9 @@ final class SharedRules
     private const SUFFIX_MARK_ID = '_mark_id';
 
     /**
-     * A rule id in the mark is one integer, the milliseconds above this many
-     * bits of sequence (see packId()).
+     * The local-invalidation note stores a rule id as one integer: the id's
+     * milliseconds in the high bits, its sequence number in the lowest this
+     * many bits (see packId()).
      */
     private const MARK_SEQUENCE_BITS = 20;
     private const MARK_SEQUENCE_MAX = (1 << self::MARK_SEQUENCE_BITS) - 1;
@@ -111,20 +157,20 @@ final class SharedRules
     private const SUFFIX_ATTEMPT = '_attempt';
 
     /**
-     * The lease this instance holds, 0 for none.
+     * The flag value this instance holds, 0 when it holds none.
      */
     private int $lease = 0;
 
     /**
-     * The instances of this process holding a lease, let go of when it ends;
-     * weak, so that none is kept alive for it.
+     * The instances of this process that hold the flag, so it can be released
+     * when the process ends. A weak map, so it keeps no instance alive.
      *
      * @var \WeakMap<self, true>|null
      */
     private static ?\WeakMap $holders = null;
 
     /**
-     * @param CacheItemPoolInterface|null $pool the medium when it is not APCu
+     * @param CacheItemPoolInterface|null $pool the store when it is not APCu
      */
     private function __construct(
         private readonly ?CacheItemPoolInterface $pool,
@@ -134,8 +180,8 @@ final class SharedRules
     }
 
     /**
-     * The shared set for a pool, or null when there is not to be one: the
-     * caller said so with false, or said nothing and APCu is not there.
+     * The shared copy for a pool, or null when there is to be none: the
+     * caller passed false, or passed nothing and APCu is not available.
      */
     public static function of(CacheItemPoolInterface|false|null $pool, string $rulesKey, object $redis): ?self
     {
@@ -153,12 +199,11 @@ final class SharedRules
     }
 
     /**
-     * Whether APCu can be spoken to from this process: the extension is
-     * loaded and enabled, and - under the CLI, where it is off unless
-     * apc.enable_cli says otherwise - enabled for the CLI too. That last
-     * question ApcuAdapter::isSupported() does not ask, and a medium that
-     * answers false to every write would leave the other processes without
-     * the set and the flag.
+     * Whether this process can use APCu: the extension is loaded and enabled,
+     * and under the CLI apc.enable_cli is on too (APCu is off for the CLI
+     * otherwise). ApcuAdapter::isSupported() does not check that last part. A
+     * store that refuses every write would leave the other processes without
+     * the copy and the flag.
      */
     public static function apcuEnabled(): bool
     {
@@ -170,8 +215,8 @@ final class SharedRules
     }
 
     /**
-     * A PSR-6 key - no reserved characters - naming the rules stream and the
-     * server it lives on.
+     * A PSR-6 key (no reserved characters) that names the rules stream and
+     * the Redis server it lives on.
      */
     public static function keyFor(string $rulesKey, string $identity): string
     {
@@ -179,12 +224,12 @@ final class SharedRules
     }
 
     /**
-     * What tells this connection's Redis from another one reached from the
-     * same server: host, port and database where the client can say - an
-     * array's hosts and the database of each node - the masters of a
-     * cluster, the class alone when nothing else is offered -
-     * and a client-side key prefix, under which the same namespace names
-     * another stream.
+     * What tells this connection's Redis apart from another one reached from
+     * the same server. It is made of the host, port and database where the
+     * client tells them (for an array, its hosts and each node's database),
+     * the masters of a cluster, or only the client class when nothing else is
+     * available. A client-side key prefix is added too, because under another
+     * prefix the same namespace names a different stream.
      */
     public static function identityOf(object $redis): string
     {
@@ -198,11 +243,11 @@ final class SharedRules
             try {
                 $parts[] = $redis->{$method}();
             } catch (\Throwable) {
-                // a client that cannot say leaves the class to tell
+                // a client that cannot answer leaves the class to tell them apart
             }
         }
 
-        // an array has no getDbNum() of its own: each node says which
+        // an array has no getDbNum() of its own: each node is asked which
         // database it was switched to
         if ($redis instanceof \RedisArray) {
             $databases = [];
@@ -218,7 +263,7 @@ final class SharedRules
                     }
                 }
             } catch (\Throwable) {
-                // a node that cannot say leaves the hosts to tell
+                // a node that cannot answer leaves the hosts to tell them apart
             }
 
             $parts[] = ['databases' => $databases];
@@ -231,11 +276,12 @@ final class SharedRules
             $prefix = null;
         }
 
-        // without one, the identity is what it always was
+        // an array answers once per node, all with the same prefix
         if (\is_array($prefix)) {
             $prefix = reset($prefix);
         }
 
+        // no prefix adds nothing to the identity
         if (\is_string($prefix) && '' !== $prefix) {
             $parts[] = ['prefix' => $prefix];
         }
@@ -249,7 +295,8 @@ final class SharedRules
     }
 
     /**
-     * Is the set kept in APCu directly, or in a pool handed in?
+     * Is the copy kept in APCu directly (true), or in a pool handed in
+     * (false)?
      */
     public function isApcu(): bool
     {
@@ -257,8 +304,8 @@ final class SharedRules
     }
 
     /**
-     * The stored set and the time the fetch that read it began, or null when
-     * there is none (or one we cannot read).
+     * The stored copy and its read time (when the fetch that read it began),
+     * or null when there is none or it cannot be read.
      *
      * @return array{InvalidationRules, float}|null
      */
@@ -266,7 +313,8 @@ final class SharedRules
     {
         $entry = $this->read($this->key);
 
-        // an entry another version wrote is not ours to read: a miss
+        // an entry another version of this package wrote is ignored, as if
+        // there were none
         if (!\is_array($entry) || self::FORMAT !== ($entry[self::KEY_FORMAT] ?? null)) {
             return null;
         }
@@ -284,12 +332,14 @@ final class SharedRules
     }
 
     /**
-     * Stores the set for the next worker - unless another worker stored a
-     * newer one meanwhile: two refreshes can race, and the slower one must
-     * not roll the entry back behind the rules the faster one already fetched.
-     * A set that started over, the stream having lost what the stored one
-     * holds, replaces it whatever its ids ($replace). True when stored, false
-     * when a newer set is there, null when the store refused to write it.
+     * Stores the copy for the other workers, unless another worker stored a
+     * newer one meanwhile. Two reloads can race, and the slower one must not
+     * replace the entry with a copy that lacks rules the faster one already
+     * fetched. With $replace the copy replaces the stored one whatever its
+     * ids: it was rebuilt from the start because the stream lost what the
+     * stored copy holds, so its ids may look older. Returns true when stored,
+     * false when a newer copy is already there, and null when the store
+     * refused the write.
      */
     public function store(InvalidationRules $rules, float $readAtMs, bool $replace = false): ?bool
     {
@@ -316,17 +366,18 @@ final class SharedRules
     }
 
     /**
-     * Records that a process of this server appended rule $id at $atMs (its
-     * clock, after the append returned). A set read before then that holds
-     * nothing as new as $id may lack the rule. Time and id each only move
-     * forward, in one step each: two invalidations racing on one server leave
-     * the later one's, where a read and a write could leave the earlier's
-     * over it. In APCu each is an integer raised by compare-and-swap; in a
-     * pool, the read and the write are serialised by the host's lock.
+     * Writes the local-invalidation note: a process of this server appended
+     * rule $id, and the append had returned by $atMs (this server's clock). A
+     * copy read before then that holds no rule as new as $id may lack the
+     * rule. The time and the id each only move forward, each in one step. So
+     * when two invalidations race on one server, the later one's values stay;
+     * a separate read and write could put the earlier one's back over them. In
+     * APCu each value is an integer raised by compare-and-swap. In a pool, the
+     * read and the write happen under this host's file lock.
      */
     public function written(float $atMs, string $id): void
     {
-        // never earlier than the moment the append returned
+        // rounded up: never earlier than the moment the append returned
         $at = (int) ceil($atMs);
         $packed = self::packId($id);
 
@@ -348,8 +399,9 @@ final class SharedRules
     }
 
     /**
-     * The newest invalidation a process of this server made, as written()
-     * recorded it, or null when none is.
+     * The local-invalidation note as written() left it: the time and the rule
+     * id of the newest invalidation a process of this server made. Null when
+     * there is none.
      *
      * @return array{float, string}|null
      */
@@ -367,7 +419,8 @@ final class SharedRules
     }
 
     /**
-     * The mark as a pool keeps it: its time and its packed id.
+     * The note as a pool keeps it: its time, and its rule id packed into one
+     * integer.
      *
      * @return array{int, int}|null
      */
@@ -386,12 +439,14 @@ final class SharedRules
      */
     private static function raise(string $key, int $value): void
     {
-        // each failed swap means another worker raised it: a few rounds settle it
+        // a failed swap means another worker changed the value meanwhile, so
+        // try again: a few rounds settle it
         for ($round = 0; $round < 64; ++$round) {
             $held = apcu_fetch($key, $found);
 
             if (true !== $found) {
-                // added, or a store that refuses: nothing more to do
+                // nothing there yet: add it. Done when that worked, or when the
+                // store refuses writes (the add failed and still nothing is there)
                 if (apcu_add($key, $value, self::TTL_SECONDS) || !apcu_exists($key)) {
                     return;
                 }
@@ -399,12 +454,14 @@ final class SharedRules
                 continue;
             }
 
+            // not a value this version wrote: remove it and start again
             if (!\is_int($held)) {
                 apcu_delete($key);
 
                 continue;
             }
 
+            // done when it holds as much already, or the swap to ours worked
             if ($held >= $value || apcu_cas($key, $held, $value)) {
                 return;
             }
@@ -412,11 +469,12 @@ final class SharedRules
     }
 
     /**
-     * A rule id as one integer, ordered as the ids are: the milliseconds above
-     * MARK_SEQUENCE_BITS of sequence, which last until the year 2248. A
-     * sequence too large for its bits is stored as the next millisecond's id:
-     * later than the rule, never earlier, so it can only make a set look
-     * behind, never hide that it is.
+     * A rule id as one integer that sorts the way the ids do: the milliseconds
+     * in the high bits, the sequence number in the low MARK_SEQUENCE_BITS
+     * bits. That lasts until the year 2248. A sequence number too large for its
+     * bits is stored as the next millisecond's first id. That is later than
+     * the rule, never earlier, so it can only make a copy look as if it lacked
+     * the rule, never hide that it does.
      */
     private static function packId(string $id): int
     {
@@ -431,11 +489,11 @@ final class SharedRules
     }
 
     /**
-     * Takes the flag for this instance: true when it holds it now, false when
-     * another worker's lease does, null when the store refused to record it -
-     * a full APCu, a full or read-only disk.
+     * Takes the reload flag for this instance. Returns true when this instance
+     * holds it now, false when another worker holds it, and null when the
+     * store refused to record it (a full APCu, a full or read-only disk).
      *
-     * @phpstan-impure the flag is the server's
+     * @phpstan-impure any worker of the server may take the flag
      */
     public function lead(): ?bool
     {
@@ -452,8 +510,9 @@ final class SharedRules
 
         $this->lease = $mine;
 
-        // a reloader that dies of a fatal error lets go of it too: one
-        // shutdown function per process, whatever the number of instances
+        // so that a reloader that dies of a fatal error still releases the
+        // flag: one shutdown function per process releases it for every
+        // instance that holds it
         if (null === self::$holders) {
             self::$holders = new \WeakMap();
             register_shutdown_function(static function (): void {
@@ -475,8 +534,8 @@ final class SharedRules
     }
 
     /**
-     * Lets go of the flag, if this instance still holds it: a lease that ran
-     * out and was taken by another worker stays theirs.
+     * Releases the flag if this instance still holds it. If it was held too
+     * long and another worker took it over, it stays with that worker.
      */
     public function release(): void
     {
@@ -501,10 +560,10 @@ final class SharedRules
     }
 
     /**
-     * When the reload in flight began, on this server's clock, or null when
-     * the flag is free.
+     * When the reload in progress began, on this server's clock, or null when
+     * nobody holds the flag.
      *
-     * @phpstan-impure the flag is the server's
+     * @phpstan-impure any worker of the server may take the flag
      */
     public function reloadStartedAt(): ?float
     {
@@ -518,9 +577,9 @@ final class SharedRules
     }
 
     /**
-     * What the last attempt to fetch the stream left: whether the server is in
-     * an outage, when that attempt ended, and when the last fetch that read
-     * the stream began - each null where none is known.
+     * What the last attempt to fetch the rules from Redis left behind: whether
+     * it failed (the server is in an outage), when it ended, and when the last
+     * successful fetch began. A time is null when none is known.
      *
      * @return array{bool, float|null, float|null}
      *
@@ -545,18 +604,21 @@ final class SharedRules
     }
 
     /**
-     * Records an attempt to fetch the stream that ran from $startedAtMs to
-     * $endedAtMs. A success ends the outage; a failure starts one, unless the
-     * attempt began before the last success, which has read the stream since.
+     * Records an attempt to fetch the rules that ran from $startedAtMs to
+     * $endedAtMs. A success ends an outage. A failure starts one, unless the
+     * attempt began before the last success: that success read the stream
+     * more recently, so the failure is out of date.
      */
     public function attemptEnded(float $startedAtMs, bool $succeeded, float $endedAtMs): void
     {
         [, , $successAtMs] = $this->lastAttempt();
 
+        // a failure that began before the last success is ignored
         if (!$succeeded && null !== $successAtMs && $startedAtMs < $successAtMs) {
             return;
         }
 
+        // the time of the last successful fetch only moves forward
         $this->write($this->key.self::SUFFIX_ATTEMPT, [
             self::KEY_OUTAGE => !$succeeded,
             self::KEY_ENDED_AT_MS => $endedAtMs,
@@ -572,8 +634,9 @@ final class SharedRules
     }
 
     /**
-     * APCu adds the lease where there is none, and swaps it for a free or
-     * lapsed one in one step. An add that fails with no key there is a refusal.
+     * Takes the flag in APCu: adds it where there is none, or swaps out a free
+     * or expired one in one atomic step. An add that fails while nothing is
+     * there means the store refuses writes (null).
      */
     private function leadInApcu(int $mine): ?bool
     {
@@ -586,8 +649,8 @@ final class SharedRules
         $held = apcu_fetch($key, $found);
 
         if (true !== $found || !\is_int($held)) {
-            // none there, or not a lease this version wrote: replaced, then
-            // raced for
+            // nothing there, or a value this version did not write: remove it,
+            // and race the other workers to add ours
             if (true === $found) {
                 apcu_delete($key);
             }
@@ -596,16 +659,19 @@ final class SharedRules
                 return true;
             }
 
+            // another worker added its flag first, or the store refuses
             return apcu_exists($key) ? false : null;
         }
 
+        // free (0) or expired: swap ours in, unless another worker changed it first
         return (0 === $held || self::expired($held)) && apcu_cas($key, $held, $mine);
     }
 
     /**
-     * A pool has no atomic write: the look and the write are serialised
-     * between the processes of this host by a short lock on a file. A write
-     * that fails is a refusal.
+     * Takes the flag in a pool. A pool has no atomic compare-and-set, so the
+     * read and the write happen under a short file lock shared by the
+     * processes of this host. A write that fails means the store refuses
+     * (null).
      */
     private function leadInPool(int $mine): ?bool
     {
@@ -626,8 +692,9 @@ final class SharedRules
     }
 
     /**
-     * Runs $critical while holding the host's lock for this entry, or without
-     * it where no file can be opened: the pool's own writes then decide.
+     * Runs $critical while holding this host's file lock for the entry. Where
+     * the lock file cannot be opened, it runs without the lock, and the last
+     * write to the pool wins.
      *
      * @template T
      *
@@ -695,7 +762,7 @@ final class SharedRules
         try {
             $this->pool->deleteItem($key);
         } catch (\Exception) {
-            // nothing to forget, or nowhere to forget it
+            // nothing to delete, or the pool cannot be reached: nothing more to do
         }
     }
 
