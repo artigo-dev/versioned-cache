@@ -34,16 +34,20 @@ use Symfony\Component\Cache\Marshaller\MarshallerInterface;
  * inner marshaller still deflated, which refuses it: a miss, never a wrong
  * value, so moving a pool from one to the other is a cold cache.
  *
- * A value that begins with the magic number is read as exactly one frame, the
- * way this marshaller writes it, and refused, so the adapter reads a miss,
- * where it is anything else: where the header sets the reserved bit; where it
- * states no content size, a size of 0 or one above $maxLength
- * (zstd_uncompress() allocates what the header states before it inflates
- * anything); where the frame's blocks do not end exactly where the value
- * does, as with a frame cut short, a second frame, a skippable frame or any
- * other bytes after it; and where the frame does not inflate to the size it
- * states. A frame carries no checksum: bytes damaged inside it can inflate to
- * a different value of the right size.
+ * A value that begins with the magic number must be exactly one frame, as
+ * this marshaller writes it. Anything else is refused, and the adapter reads
+ * a miss. That covers:
+ *
+ * - a header that sets the reserved bit;
+ * - a header that states no content size, a size of 0, or a size above
+ *   $maxLength (zstd_uncompress() allocates what the header states before it
+ *   inflates anything);
+ * - blocks that do not end exactly where the value does: a frame cut short,
+ *   or a second frame, a skippable frame or any other bytes after it;
+ * - a frame that does not inflate to the size it states.
+ *
+ * A frame carries no checksum, so bytes damaged inside it can inflate to a
+ * different value of the right size.
  */
 final class ZstdMarshaller implements MarshallerInterface
 {

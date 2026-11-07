@@ -15,46 +15,49 @@ namespace Artigo\Cache\Adapter;
  * The invalidation rules one process knows about, kept in the shape a read
  * needs rather than the shape the stream has.
  *
- * A rule invalidates an item when it is newer than the item's watermark and
- * names one of the item's tags, or a prefix of its id. Only the newest rule
- * per tag can decide that: if it is not newer than the watermark, no older
- * rule for the same tag is either. So that is all that is kept, and a read
- * costs the item's tag count whatever the length of the log.
+ * A rule makes an item outdated when it is newer than the item's watermark
+ * and names one of the item's tags, or a prefix of its id. Only the newest
+ * rule per tag can decide that: if it is not newer than the watermark, no
+ * older rule for the same tag is either. So that is all that is kept, and a
+ * read costs the item's tag count, whatever the length of the log.
  *
- * The set follows the server's stream incrementally. Each refresh asks for
- * the entries from the last id it holds, inclusively. If that id comes back
- * first, everything after it is new. If it does not, the server no longer
- * holds it - the stream was trimmed past it, cleared to a newer rule, or
- * deleted - and what came back is the whole current stream, which replaces
- * what was held. Either way one round trip, sized by what changed.
+ * The set follows the server's stream step by step. Each refresh asks for
+ * the entries from the last id it holds, that id included. If that id comes
+ * back first, everything after it is new. If it does not, the server no
+ * longer holds it (the stream was trimmed past it, cleared to a newer rule,
+ * or deleted), and what came back is the whole current stream, which
+ * replaces what was held. Either way it is one round trip, sized by what
+ * changed.
  *
  * It also notices when the stream has lost rules. Every entry says whether it
- * opened the stream (the adapter's script records it). An item stamped with a
- * real id has seen the stream hold at least that entry, so if nothing is held
- * now, or the oldest entry held opened the stream and is newer than the
- * stamp, whatever stood between is gone - evicted, deleted, or lost with a
- * slot - and may have invalidated the item. The item is stale then, whatever
- * its tags: the one verdict that cannot serve a value past its invalidation.
- * An item stamped 0-0 saw no rule and is exempt.
+ * started the stream (the adapter's script records that). An item whose
+ * watermark is a real id has seen the stream hold at least that entry. So if
+ * nothing is held now, or the oldest entry held started the stream and is
+ * newer than the watermark, whatever stood between is gone (evicted, deleted,
+ * or lost with a slot) and may have invalidated the item. The item is then
+ * outdated, whatever its tags: the one answer that cannot serve a value past
+ * its invalidation. An item whose watermark is 0-0 saw no rule and is exempt.
  *
- * The set is bounded. Past $maxTags rules, tags and prefixes together, it
+ * The set has a limit. Past $maxTags rules, tags and prefixes together, it
  * keeps its newest 90 % and puts a floor in place of the rest: a rule for the
  * whole pool at the newest id it dropped. Every dropped rule is at or below
- * the floor, so whatever one of them invalidated, the floor invalidates too:
- * an item stamped before it reads as a miss, never as a stale hit, and one
- * stamped at or after it keeps its verdicts. The 10 % of headroom keeps a set
- * at its bound from being cut again by every rule that follows.
+ * the floor, so whatever one of them invalidated, the floor invalidates too.
+ * An item with a watermark before the floor reads as a miss, never as an
+ * outdated hit, and one at or after it is checked against the other rules as
+ * before. The 10 % of headroom keeps a set at its limit from being cut again
+ * by every rule that follows.
  *
  * A tag rule may be hard. Beside the newest rule per tag, the set keeps the
- * newest hard one, so that invalidatedAt() can tell a value a soft rule
- * reached - which a reader may keep for a grace - from one a hard rule, a
+ * newest hard one, so that invalidatedAt() can tell an item a soft rule
+ * reached, which a reader may keep for a grace, from one that a hard rule, a
  * clear, a floor or a lost stream reached, which it may not.
  *
- * Rule ids are held as one integer each, the milliseconds above 20 bits of
- * sequence, so a verdict is an integer comparison and the set crosses a
- * request as a flat array. 20 bits leave 43 for the milliseconds, enough until
- * the year 2248. A sequence too large for them can only invalidate: a rule's
- * is clamped up, an item's watermark down (see rule() and mark()).
+ * Rule ids are held as one integer each: the milliseconds above 20 bits of
+ * sequence number. So checking an item is an integer comparison, and the set
+ * crosses a request as a flat array. 20 bits leave 43 for the milliseconds,
+ * enough until the year 2248. A sequence number too large for its bits can
+ * only make an item outdated, never fresh: such a rule looks newer than it
+ * is, and such a watermark older (see rule() and mark()).
  *
  * @internal
  */
@@ -62,7 +65,7 @@ final class InvalidationRules
 {
     /**
      * The id of a stream that has no entries yet. Every real id sorts above
-     * it, so an item stamped with it has seen nothing.
+     * it, so an item with it as its watermark has seen no rule.
      */
     public const NONE = '0-0';
 
@@ -101,9 +104,9 @@ final class InvalidationRules
     private string $last = self::NONE;
 
     /**
-     * The oldest id received from the server, and whether that entry opened
-     * the stream - null when it did not say, having been written before the
-     * adapter recorded it.
+     * The oldest id received from the server, and whether that entry started
+     * the stream. Null when the entry does not say, because it was written
+     * without that field.
      */
     private string $first = self::NONE;
     private ?bool $firstOpened = null;
@@ -111,7 +114,7 @@ final class InvalidationRules
     /**
      * @param string $poolNamespace the prefix every id in the pool carries; a prefix rule equal to it covers the whole pool
      * @param int    $retentionMs   how long a rule can matter, being the longest an item may live
-     * @param int    $maxTags       how many rules the set holds before a floor takes the place of its oldest; 0 for no bound
+     * @param int    $maxTags       how many rules the set holds before one floor rule replaces the oldest; 0 for no limit
      */
     public function __construct(
         private readonly string $poolNamespace,
@@ -149,7 +152,7 @@ final class InvalidationRules
 
     /**
      * Rebuilds a set from toArray(), checking every rule; null when the shape
-     * is not one we wrote. For a medium others can write to.
+     * is not one we wrote. For a store others can write to.
      */
     public static function fromArray(mixed $state, string $poolNamespace, int $retentionMs, int $maxTags = 0): ?self
     {
@@ -193,7 +196,7 @@ final class InvalidationRules
                 return null;
             }
 
-            // a numeric tag came back as an int key, as PHP has it
+            // PHP turns a numeric tag into an int key
             $packed[(string) $tag] = $rule;
         }
 
@@ -219,7 +222,7 @@ final class InvalidationRules
 
         $firstOpened = $state['first_opened'] ?? null;
 
-        /** @var array<string, int> $tags the format vouches for the rules */
+        /** @var array<string, int> $tags the checked format guarantees each rule's shape */
         $tags = $state['tags'];
         /** @var array<string, int> $hard */
         $hard = $state['hard'];
@@ -238,8 +241,10 @@ final class InvalidationRules
     }
 
     /**
-     * A rule's id as one integer, ordered as the ids are. A sequence too large
-     * for its bits is clamped up: the rule can only look newer than it is.
+     * A rule's id as one integer that sorts the way the ids do. A sequence
+     * number too large for its bits is cut to the largest that fits, which
+     * mark() places above every watermark of that millisecond: the rule can
+     * only look newer than it is.
      */
     public static function rule(string $id): int
     {
@@ -249,10 +254,11 @@ final class InvalidationRules
     }
 
     /**
-     * An item's watermark as one integer. A sequence too large for its bits
-     * is clamped down, and so is the largest that fits, which an overflowing
-     * rule of the same millisecond clamps up to: the item can only look older
-     * than it is, so an overflow invalidates and never serves stale.
+     * An item's watermark as one integer. A sequence number too large for its
+     * bits becomes 0, and so does the largest that fits, which is where rule()
+     * puts an overflowing rule of the same millisecond. The item can only look
+     * older than it is, so an overflow can make it outdated, but never serves
+     * an outdated value.
      */
     public static function mark(string $id): int
     {
@@ -274,8 +280,8 @@ final class InvalidationRules
 
     /**
      * Does an XRANGE that started at last() carry on from what is held? It
-     * does when it comes back starting with that id, or when nothing was held;
-     * otherwise absorbing it starts the set over.
+     * does when it comes back starting with that id, or when nothing was held.
+     * Otherwise absorbing it rebuilds the set from this answer alone.
      *
      * @param array<array-key, mixed> $entries id => fields, oldest first
      */
@@ -291,8 +297,8 @@ final class InvalidationRules
     }
 
     /**
-     * Merges the entries of an XRANGE that started at last(), inclusively -
-     * or at the beginning, when nothing was held yet.
+     * Merges the entries of an XRANGE that started at last(), that id
+     * included, or at the beginning when nothing was held yet.
      *
      * @param array<array-key, mixed> $entries id => fields, oldest first, as the client hands them back
      */
@@ -304,8 +310,8 @@ final class InvalidationRules
             if (null !== $start && $this->continuedBy($entries)) {
                 unset($entries[$start]);
             } else {
-                // the stream moved from under us: whatever it holds now is
-                // the whole truth, and what we held is not part of it
+                // the stream no longer holds our last id: what came back is the
+                // whole current stream, and what we held is dropped
                 $this->tags = [];
                 $this->hard = [];
                 $this->prefixes = [];
@@ -324,9 +330,9 @@ final class InvalidationRules
 
     /**
      * Adds the rule the adapter just appended, from the id the server answered,
-     * without reading the stream: only right for a rule appended directly after
-     * last(), which the caller has checked. Unlike absorb(), it never starts
-     * the set over.
+     * without reading the stream. That is only right for a rule appended
+     * directly after last(), which the caller has checked. Unlike absorb(), it
+     * never rebuilds the set.
      *
      * @param array{t?: list<string>, p?: string, h?: int} $rule
      * @param bool                                         $opened whether the rule opened the stream
@@ -335,11 +341,11 @@ final class InvalidationRules
     {
         $this->addRule($id, $rule, $opened);
 
-        // trimming walks every rule, too much to do per invalidation. A tag
-        // rule only moves the retention floor by the time since the last one,
-        // and a rule past the retention matches no live item, so that waits
-        // for the next absorb(); a clear of the whole pool, or a set past its
-        // bound, is trimmed now
+        // trimming walks every rule, too much work for every invalidation. A
+        // tag rule only moves the retention cut-off by the time since the last
+        // rule, and a rule past the retention matches no living item anyway,
+        // so that trim waits for the next absorb(). A clear of the whole pool,
+        // or a set past its limit, is trimmed now
         if (($rule['p'] ?? null) === $this->poolNamespace || ($this->maxTags > 0 && \count($this->tags) + \count($this->prefixes) > $this->maxTags)) {
             $this->trim();
         }
@@ -374,13 +380,14 @@ final class InvalidationRules
     }
 
     /**
-     * When the rules that invalidate the item fell, if all of them were soft:
-     * the milliseconds of the newest rule it has not seen that names one of
-     * its tags. Null when one is not soft - a hard rule it has not seen names
-     * one of its tags, a prefix rule (a clear, the bound's floor) reaches it,
-     * or the stream lost what it saw - and when nothing invalidates it. The
-     * newest rule per tag is all that is kept, so a soft rule after a hard one
-     * leaves the hard one standing.
+     * When the rules that make the item outdated were added, if all of them
+     * are soft: the milliseconds of the newest rule it has not seen that names
+     * one of its tags. Null when one of them is not soft (a hard rule it has
+     * not seen names one of its tags, a prefix rule such as a clear or the
+     * floor reaches it, or the stream lost rules it saw), and null when
+     * nothing makes it outdated. The newest hard rule per tag is kept beside
+     * the newest rule, so a soft rule after a hard one leaves the hard one
+     * standing.
      *
      * @param list<string> $tags
      */
@@ -418,20 +425,22 @@ final class InvalidationRules
     /**
      * Has the stream lost rules the item has seen?
      *
-     * An item stamped with a real id has seen the stream hold at least that
-     * entry. If nothing is held now, or the oldest entry held opened the
-     * stream and is newer than the stamp, whatever stood between is gone and
-     * may have invalidated the item. An item stamped 0-0 saw no rule, so
-     * nothing lost can concern it - and the first rule a pool ever gets opens
-     * the stream without being a rebuild, which is why the exemption is exact.
+     * An item whose watermark is a real id has seen the stream hold at least
+     * that entry. If nothing is held now, or the oldest entry held started the
+     * stream and is newer than the watermark, whatever stood between is gone
+     * and may have invalidated the item. An item whose watermark is 0-0 saw no
+     * rule, so nothing lost can concern it. And the first rule a pool ever
+     * gets starts the stream without being a rebuild, which is why the
+     * exemption is exact.
      *
-     * The comparison is an ordering, so it cannot see a rebuild that opened
-     * on an id the item already carries: ids come from the server clock, and
-     * a stream lost and reborn inside the millisecond its items were stamped
-     * in starts again at that same id. An item stamped on the opening rule of
-     * a stream that still holds it is the common case and must stay fresh, so
-     * equality cannot be read as loss. Telling the two apart needs identity
-     * rather than order - a token on the opening rule, carried by the stamp.
+     * The comparison is an ordering, so it cannot see a rebuild that started
+     * on an id the item already carries. Ids come from the server's clock, and
+     * a stream lost and created again within the millisecond of the item's
+     * watermark starts again at that same id. An item whose watermark is the
+     * first rule of a stream that still holds it is the common case, and must
+     * stay fresh, so equal ids cannot be read as a loss. Telling the two apart
+     * would need identity rather than order: a token on the first rule,
+     * carried in the item's watermark.
      */
     private function lostSince(string $mark): bool
     {
@@ -536,11 +545,13 @@ final class InvalidationRules
     }
 
     /**
-     * Drops what can no longer decide anything: rules older than the longest
-     * possible item lifetime, having nothing left alive to match, and rules
-     * older than one covering the whole pool, which says everything they
-     * could say - and, past the bound, the oldest rules, a floor taking their
-     * place (see cap()).
+     * Drops the rules that can no longer change any answer.
+     *
+     * Rules older than the longest possible item lifetime go, because no
+     * living item can match them. Rules older than one covering the whole
+     * pool go, because that rule already says everything they could say. And
+     * past the limit, the oldest rules go, with a floor in their place (see
+     * cap()).
      */
     private function trim(): void
     {
@@ -565,8 +576,8 @@ final class InvalidationRules
             }
         }
 
-        // a hard rule at or below the floor is spoken for by it, the floor
-        // being hard itself
+        // a hard rule at or below the cut-off is not needed either: past the
+        // retention it matches nothing, and a whole-pool rule is hard itself
         foreach ($this->hard as $tag => $rule) {
             if ($rule <= $floor) {
                 unset($this->hard[$tag]);
@@ -576,7 +587,8 @@ final class InvalidationRules
         $kept = [];
 
         foreach ($this->prefixes as $rule) {
-            // the rule that set the floor stays: it is the one still matching
+            // the whole-pool rule that set the cut-off stays: it is the one
+            // that still matches
             if ($rule[0] >= $floor) {
                 $kept[] = $rule;
             }
@@ -586,9 +598,9 @@ final class InvalidationRules
     }
 
     /**
-     * Past the bound, a rule for the whole pool at the newest id beyond the
-     * newest 90 % of the rules: the floor, below which the rest of trim()
-     * drops everything it covers.
+     * Past the limit, adds a rule for the whole pool at the newest id outside
+     * the newest 90 % of the rules: the floor. The rest of trim() then drops
+     * every rule the floor covers.
      */
     private function cap(): void
     {

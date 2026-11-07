@@ -12,38 +12,41 @@ declare(strict_types=1);
 namespace Artigo\Cache\Adapter;
 
 /**
- * What a pool remembers of the reads that will be followed by a write: per
- * id, the rule id the read was judged against (its mark), the epoch the item
- * carried (empty when there was none) and when the read was taken. The write
- * that follows lands only where the epoch is still the same, and carries the
- * read's mark rather than the stream's head, so a rule appended meanwhile
- * still judges it.
+ * What a pool remembers of the reads that a write may follow. Per id: the
+ * watermark the write will carry (the last rule id of the copy of the rules
+ * the read used), the epoch the item carried (empty when it had none), and
+ * when the read was made. The write that follows is stored only if the
+ * item's epoch is still the same. It carries the read's watermark rather
+ * than the newest id in the stream, so a rule appended meanwhile still makes
+ * it outdated.
  *
- * Insertion order is age: the oldest record goes first once there are more
- * than CAP besides the largest single read, so a process that reads and never
- * writes holds a bounded map, and a batch is never cut short before its write.
+ * The map is kept in the order the reads were made. Once it holds more than
+ * CAP records besides the largest single fetch, the oldest go first. So a
+ * process that reads and never writes holds a map of limited size, and the
+ * reads of one batch are never forgotten before its write.
  *
  * @internal
  */
 final class MissRecords
 {
     /**
-     * How many reads a pool remembers besides its largest single read; the
-     * oldest are forgotten first, and a write with no record is a plain one.
+     * How many reads a pool remembers besides its largest single fetch. The
+     * oldest are forgotten first, and a write with no remembered read is a
+     * plain write.
      */
     public const CAP = 1_000;
 
     /**
-     * @var array<string, array{string, string, float}> id => [mark, epoch, taken at in milliseconds]
+     * @var array<string, array{string, string, float}> id => [watermark, epoch, read at in milliseconds]
      */
     private array $records = [];
 
     private int $cap = self::CAP;
 
     /**
-     * Makes room for a read of $count ids at once on top of CAP, until
-     * clear(): what the caller fetched in one call is held in its memory
-     * anyway, and every one of those reads may be followed by a write.
+     * Makes room for a fetch of $count ids at once, on top of CAP, until
+     * clear(). The caller holds what it fetched in one call in memory anyway,
+     * and every one of those reads may be followed by a write.
      */
     public function reserve(int $count): void
     {
@@ -65,7 +68,7 @@ final class MissRecords
     }
 
     /**
-     * @return array{string, string, float}|null [mark, epoch, taken at in milliseconds]
+     * @return array{string, string, float}|null [watermark, epoch, read at in milliseconds]
      */
     public function of(string $id): ?array
     {
@@ -86,12 +89,13 @@ final class MissRecords
     }
 
     /**
-     * Moves the marks of the reads that had seen the stream up to $previous
-     * on to $id, the rule this pool appended right after it: the write that
-     * follows was computed by the pool that made the rule, and must not be
-     * judged stale by it. A read whose mark is older did not see what stands
-     * between, and keeps its mark. The epochs stay as they are, so a delete
-     * from elsewhere still refuses the write.
+     * Gives the reads whose watermark is $previous the watermark $id instead:
+     * $id is the rule this pool appended right after $previous. The write that
+     * follows such a read was computed by the pool that made the rule, so
+     * that rule must not make it outdated. A read with an older watermark did
+     * not see the rules in between, which may come from elsewhere, so it keeps
+     * its watermark. The epochs stay as they are, so a delete from elsewhere
+     * still refuses the write.
      */
     public function restamp(string $previous, string $id): void
     {
