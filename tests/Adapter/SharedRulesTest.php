@@ -16,6 +16,7 @@ use Artigo\Cache\Adapter\SharedRules;
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
 use Artigo\Cache\Tests\Connection;
 use PHPUnit\Framework\TestCase;
+use Psr\Cache\CacheItemInterface;
 use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
 use Symfony\Component\Cache\Adapter\FilesystemAdapter;
@@ -416,6 +417,118 @@ final class SharedRulesTest extends TestCase
         }
     }
 
+    public function testTheMarkOnlyMovesForwardInEitherMedium(): void
+    {
+        foreach ($this->media() as $medium => [$shared]) {
+            try {
+                $shared->forget();
+                $shared->written(2_000.0, '2000-5');
+                $shared->written(1_000.0, '1000-0');
+                self::assertSame([2_000.0, '2000-5'], $shared->writtenMark(), \sprintf('%s: an older mark changes nothing', $medium));
+
+                $shared->written(3_000.4, '1500-0');
+                self::assertSame([3_001.0, '2000-5'], $shared->writtenMark(), \sprintf('%s: time and id each keep their newest', $medium));
+
+                // the largest sequence its bits hold, and one too large for them
+                $shared->written(3_000.0, '4000-1048575');
+                self::assertSame([3_001.0, '4000-1048575'], $shared->writtenMark(), \sprintf('%s: kept as it is', $medium));
+
+                $shared->written(3_000.0, '4000-5000000');
+                self::assertSame([3_001.0, '4001-0'], $shared->writtenMark(), \sprintf('%s: stored as the next millisecond, later than the rule', $medium));
+
+                $shared->written(1.0, '4000-1048575');
+                self::assertSame([3_001.0, '4001-0'], $shared->writtenMark(), \sprintf('%s: an older write lowers nothing', $medium));
+
+                $shared->forget();
+                $shared->written(10.0, InvalidationRules::NONE);
+                self::assertSame([10.0, InvalidationRules::NONE], $shared->writtenMark(), \sprintf('%s: the id of an empty stream', $medium));
+            } finally {
+                $shared->forget();
+            }
+
+            self::assertNull($shared->writtenMark(), \sprintf('%s: forgotten with the set', $medium));
+        }
+    }
+
+    public function testTwoInvalidationsRacingLeaveTheLaterMarkInAPool(): void
+    {
+        [$idA, $atA, $idB, $atB, $readAt] = $this->twoRules();
+        $directory = sys_get_temp_dir().\DIRECTORY_SEPARATOR.'artigo-race-'.bin2hex(random_bytes(4));
+
+        // the pool the other process shares, where B's mark is on its way
+        // between A's look at the mark and A's write: a FilesystemAdapter, not
+        // a class of its own, whose files would carry another name
+        $medium = new HookedPool(new FilesystemAdapter('rules', 0, $directory));
+
+        try {
+            $a = SharedRules::of($medium, self::RULES_KEY, $this->redis);
+            self::assertNotNull($a);
+            self::assertTrue($a->store($this->rulesUpTo($idA), $readAt, true));
+
+            $process = null;
+            $pipes = [];
+            $medium->beforeSave = static function (CacheItemInterface $item) use (&$process, &$pipes, $directory, $atB, $idB): bool {
+                if (!str_ends_with($item->getKey(), '_mark')) {
+                    return false;
+                }
+
+                $process = proc_open([\PHP_BINARY, __DIR__.'/Fixtures/mark-writer.php', $directory, self::RULES_KEY, \sprintf('%.3F', $atB), $idB], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, ['REDIS_DSN' => Connection::dsn()] + getenv());
+
+                // long enough for its write to land, were nothing holding it off
+                usleep(700_000);
+
+                return true;
+            };
+
+            $a->written($atA, $idA);
+
+            self::assertIsResource($process);
+            self::assertIsResource($pipes[1] ?? null);
+            self::assertIsResource($pipes[2] ?? null);
+            $output = (string) stream_get_contents($pipes[1]).(string) stream_get_contents($pipes[2]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            proc_close($process);
+            self::assertStringContainsString('written', $output, $output);
+
+            self::assertSame([ceil($atB), $idB], $a->writtenMark(), 'the later mark stays');
+
+            // a worker whose set was read between the two rules
+            $third = new VersionedRedisTagAwareAdapter($this->other, self::NAMESPACE, rulesCacheMs: 60_000, rulesCache: $medium);
+
+            self::assertFalse($third->getItem('itemB')->isHit(), 'its set lacks the later rule: behind, it reloads');
+            self::assertCount(1, $this->other->starts);
+        } finally {
+            $medium->clear();
+            @rmdir($directory.\DIRECTORY_SEPARATOR.'rules');
+            @rmdir($directory);
+        }
+    }
+
+    public function testTwoInvalidationsRacingLeaveTheLaterMarkInApcu(): void
+    {
+        if (!\function_exists('apcu_add')) {
+            self::markTestSkipped('APCu is not loaded.');
+        }
+
+        [$idA, $atA, $idB, $atB, $readAt] = $this->twoRules();
+
+        $process = proc_open([\PHP_BINARY, '-d', 'apc.enable_cli=1', __DIR__.'/Fixtures/racing-apcu-marks.php', self::NAMESPACE, $idA, \sprintf('%.3F', $atA), $idB, \sprintf('%.3F', $atB), \sprintf('%.3F', $readAt)], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, ['REDIS_DSN' => Connection::dsn()] + getenv());
+        self::assertIsResource($process);
+        $output = (string) stream_get_contents($pipes[1]);
+        $errors = (string) stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_close($process);
+
+        $report = json_decode(trim($output), true);
+        self::assertIsArray($report, $output.$errors);
+
+        self::assertEquals([ceil($atB), $idB], $report['mark'] ?? null, 'the later mark stays');
+        self::assertFalse($report['hit'] ?? null, 'a worker whose set lacks the later rule is behind');
+        self::assertSame(1, $report['attempts'] ?? null, 'and reloads');
+    }
+
     public function testTheLastAttemptIsRecordedInEitherMedium(): void
     {
         foreach ($this->media() as $medium => [$shared]) {
@@ -530,6 +643,42 @@ final class SharedRulesTest extends TestCase
     }
 
     /**
+     * Two rules appended elsewhere, A and then B, and itemB, tagged with B's
+     * tag, written before them: the ids and the times of A and B, and a moment
+     * between them.
+     *
+     * @return array{string, float, string, float, float}
+     */
+    private function twoRules(): array
+    {
+        $this->appendRule('first');
+        $this->write(new VersionedRedisTagAwareAdapter($this->plain, self::NAMESPACE, rulesCache: false), 'itemB', ['tagB']);
+
+        $idA = $this->plain->xAdd(self::RULES_KEY, '*', ['t' => json_encode(['t' => ['tagA']], \JSON_THROW_ON_ERROR), 'first' => '0']);
+        $atA = microtime(true) * 1000;
+        usleep(5_000);
+        $between = microtime(true) * 1000;
+        usleep(5_000);
+        $idB = $this->plain->xAdd(self::RULES_KEY, '*', ['t' => json_encode(['t' => ['tagB']], \JSON_THROW_ON_ERROR), 'first' => '0']);
+        $atB = microtime(true) * 1000;
+        self::assertIsString($idA);
+        self::assertIsString($idB);
+
+        return [$idA, $atA, $idB, $atB, $between];
+    }
+
+    /**
+     * The stream up to $id, as a set.
+     */
+    private function rulesUpTo(string $id): InvalidationRules
+    {
+        $rules = new InvalidationRules(self::NAMESPACE.':', 2_592_000_000);
+        $rules->absorb((array) $this->plain->xRange(self::RULES_KEY, '-', $id));
+
+        return $rules;
+    }
+
+    /**
      * Two SharedRules on each medium the test can reach - two workers of one
      * server.
      *
@@ -627,5 +776,81 @@ final class SharedRulesTest extends TestCase
         self::assertIsString($head);
 
         return $head;
+    }
+}
+
+/**
+ * A PSR-6 pool in front of another, running $beforeSave before a save until it
+ * answers true.
+ */
+final class HookedPool implements CacheItemPoolInterface
+{
+    /** @var (\Closure(CacheItemInterface): bool)|null */
+    public ?\Closure $beforeSave = null;
+
+    public function __construct(
+        private readonly CacheItemPoolInterface $inner,
+    ) {
+    }
+
+    public function getItem(string $key): CacheItemInterface
+    {
+        return $this->inner->getItem($key);
+    }
+
+    /**
+     * @param array<string> $keys
+     *
+     * @return iterable<string, CacheItemInterface>
+     */
+    public function getItems(array $keys = []): iterable
+    {
+        foreach ($keys as $key) {
+            yield $key => $this->inner->getItem($key);
+        }
+    }
+
+    public function hasItem(string $key): bool
+    {
+        return $this->inner->hasItem($key);
+    }
+
+    public function clear(): bool
+    {
+        return $this->inner->clear();
+    }
+
+    public function deleteItem(string $key): bool
+    {
+        return $this->inner->deleteItem($key);
+    }
+
+    /**
+     * @param array<string> $keys
+     */
+    public function deleteItems(array $keys): bool
+    {
+        return $this->inner->deleteItems($keys);
+    }
+
+    public function save(CacheItemInterface $item): bool
+    {
+        if (null !== $before = $this->beforeSave) {
+            if ($before($item)) {
+                $this->beforeSave = null;
+            }
+        }
+
+        return $this->inner->save($item);
+    }
+
+    public function saveDeferred(CacheItemInterface $item): bool
+    {
+        return $this->inner->saveDeferred($item);
+    }
+
+    public function commit(): bool
+    {
+        return $this->inner->commit();
     }
 }

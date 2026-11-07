@@ -422,7 +422,7 @@ final class RuleSetReloadTest extends TestCase
             {
                 $saved = parent::save($item);
 
-                if (str_ends_with($item->getKey(), '_written') && null !== $then = $this->afterMark) {
+                if (str_ends_with($item->getKey(), '_mark') && null !== $then = $this->afterMark) {
                     $this->afterMark = null;
                     $then();
                 }
@@ -437,13 +437,19 @@ final class RuleSetReloadTest extends TestCase
         $worker = $this->pool($this->other, 60_000, $medium);
         self::assertTrue($worker->getItem('kept')->isHit());
 
-        $seen = null;
-        $medium->afterMark = function () use ($worker, &$seen): void {
-            $seen = [$worker->getItem('gone')->isHit(), \count($this->other->starts)];
+        // what the store holds as the mark lands, read from the store: the
+        // mark is written under the pool's lock, which a reloading worker
+        // takes too, so a worker reading here would wait on this very call
+        $sharedThen = null;
+        $medium->afterMark = function () use ($medium, &$sharedThen): void {
+            $sharedThen = $this->sharedLast($medium);
         };
 
         self::assertTrue($invalidator->invalidateTags(['gone']));
-        self::assertSame([false, 0], $seen, 'the set that holds the rule is shared before the mark: a miss, and no fetch');
+        self::assertSame($this->streamHead(), $sharedThen, 'the set that holds the rule is shared before the mark');
+
+        self::assertFalse($worker->getItem('gone')->isHit(), 'a worker that sees the mark adopts it');
+        self::assertSame([], $this->other->starts, 'and fetches nothing');
     }
 
     public function testAfterARuleFromElsewhereLandsInBetweenNothingIsSharedAndTheWorkerReloads(): void
@@ -551,6 +557,46 @@ final class RuleSetReloadTest extends TestCase
 
         self::assertFalse($next->getItem('second')->isHit());
         self::assertSame([], $this->other->starts, 'the next request adopts it, and fetches nothing');
+    }
+
+    public function testASetSharedAtOnceIsAsFreshAsTheInvalidationCall(): void
+    {
+        $this->writeKeptAndGone();
+
+        // the stream as it is, read five seconds ago
+        $this->copyInto($this->shared, 5_000);
+        $invalidator = $this->pool($this->redis, 60_000);
+        self::assertTrue($invalidator->getItem('kept')->isHit());
+        self::assertSame([], $this->redis->starts, 'judged by the set read five seconds ago');
+
+        self::assertTrue($invalidator->invalidateTags(['gone']));
+
+        // a worker with a window of a second
+        $worker = $this->pool($this->other, 1_000);
+
+        self::assertTrue($worker->getItem('kept')->isHit());
+        self::assertFalse($worker->getItem('gone')->isHit());
+        self::assertSame([], $this->other->starts, 'the set shared is as fresh as the call: adopted, not fetched');
+    }
+
+    public function testTheMarkIsTakenAfterTheReply(): void
+    {
+        $this->writeKeptAndGone();
+
+        // it holds no set: only the mark tells the others
+        $invalidator = $this->pool($this->redis, 60_000);
+        $worker = $this->pool($this->other, 60_000);
+
+        // the worker's set is read while the invalidation is on its way
+        $this->redis->beforeScript = static function () use ($worker): void {
+            $worker->getItem('kept');
+        };
+
+        self::assertTrue($invalidator->invalidateTags(['gone']));
+        self::assertCount(1, $this->other->starts);
+
+        self::assertFalse($worker->getItem('gone')->isHit(), 'its set may lack the rule: behind, it reloads');
+        self::assertCount(2, $this->other->starts);
     }
 
     public function testACopyBehindAnInvalidationMadeHereReloadsThroughTheFlag(): void

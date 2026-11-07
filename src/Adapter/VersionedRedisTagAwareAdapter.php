@@ -83,11 +83,9 @@ use Symfony\Contracts\Cache\ItemInterface;
  * other workers to adopt - at once by the first invalidation of a request,
  * when the request ends (reset(), or the pool going away) for the later ones;
  * otherwise the set is behind, and a mark beside the shared set keeps every
- * worker of the server from judging by it until it is reloaded. Two
- * invalidations racing on one server may leave the mark of the earlier one
- * (see SharedRules::written()); the later is then seen as one made on another
- * server is. Without a shared set, another instance sees the rule as one made
- * elsewhere.
+ * worker of the server from judging by it until it is reloaded. The mark only
+ * moves forward (see SharedRules::written()). Without a shared set, another
+ * instance sees the rule as one made elsewhere.
  *
  * A write that follows a read is guarded (see get() and MissRecords): every
  * write gives the item a fresh epoch, a delete leaves a tombstone holding a
@@ -1526,6 +1524,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             $subsumes ? '1' : '0',
         ];
 
+        // before the call: whatever was appended before then is at or before
+        // the id the rule follows
+        $beforeMs = microtime(true) * 1000;
+
         try {
             $result = $this->rulesNode()->eval(self::SCRIPT_INVALIDATE, $arguments, 1);
         } catch (\Exception $e) {
@@ -1541,6 +1543,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         }
 
         $previous = $result[1] ?? null;
+        // after the reply: a fetch that begins later holds the rule
         $atMs = microtime(true) * 1000;
 
         // the set held ends where the rule was appended: it holds the stream up
@@ -1555,6 +1558,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         // is reloaded.
         if (null !== $this->rules && \is_string($previous) && $previous === $this->rules->last()) {
             $this->rules->append($id, $rule, '1' === ($result[2] ?? null));
+
+            // the reply proves it holds the stream up to the rule: as fresh as
+            // a fetch begun before the call, for this worker and the others
+            $this->rulesReadAt = max($this->rulesReadAt ?? $beforeMs, $beforeMs);
 
             if ($this->sharedInRequest) {
                 $this->unshared = true;
@@ -1981,6 +1988,14 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * rule, the read being stamped before it began; one that ends at or after
      * the rule holds it, the rule having been added from the reply. Holding no
      * set is not behind: there is nothing to judge by.
+     *
+     * The mark holds the largest time and the largest id of the rules made
+     * here, perhaps of two different rules. That misses no set lacking one of
+     * them: it ends before that rule's id, so before the largest, and its fetch
+     * began before that rule's time, taken after the reply, so before the
+     * largest. And it flags none that lacks nothing: ending before the largest
+     * id, the set lacks that rule. A mark read half raised flags fewer sets,
+     * as one not yet written does.
      */
     private function behindLocalInvalidation(): bool
     {
