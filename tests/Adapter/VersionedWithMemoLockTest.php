@@ -158,15 +158,16 @@ final class VersionedWithMemoLockTest extends TestCase
         $this->redis->set('memolock:lock:'.self::tagFor('waited'), 'a-holders-token', ['PX' => 1_300]);
 
         // the waiter's first read saw the tombstone; the read it makes after
-        // waiting sees it gone, and its write must compare with that one
-        $began = microtime(true);
+        // waiting sees it gone, and its write must compare with that one.
+        // Timed on the server's clock, which expires the lock and the tombstone
+        $began = $this->serverTime();
         $value = $this->pool()->get('waited', static function (ItemInterface $item): string {
             $item->expiresAfter(60);
 
             return 'computed after the wait';
         });
 
-        self::assertGreaterThan(1.0, microtime(true) - $began, 'it waited past the tombstone');
+        self::assertGreaterThan(1.0, $this->serverTime() - $began, 'it waited past the tombstone');
         self::assertSame('computed after the wait', $value);
         self::assertSame('computed after the wait', $this->pool()->getItem('waited')->get(), 'it landed');
     }
@@ -212,14 +213,14 @@ final class VersionedWithMemoLockTest extends TestCase
 
         // INF: computed after the wait whatever is there, and compared with
         // the read the lock made after it, not with the one before it
-        $began = microtime(true);
+        $began = $this->serverTime();
         $value = $this->pool()->get('forced', static function (ItemInterface $item): string {
             $item->expiresAfter(60);
 
             return 'forced after the wait';
         }, \INF);
 
-        self::assertGreaterThan(1.0, microtime(true) - $began, 'it waited past the tombstone');
+        self::assertGreaterThan(1.0, $this->serverTime() - $began, 'it waited past the tombstone');
         self::assertSame('forced after the wait', $value);
         self::assertSame('forced after the wait', $this->pool()->getItem('forced')->get(), 'it landed');
     }
@@ -298,6 +299,18 @@ final class VersionedWithMemoLockTest extends TestCase
         $pool->setCallbackWrapper(new MemoLock($this->redis, lockTtlMs: 5_000, waitTimeoutMs: 200, pollIntervalMs: 10));
 
         return $pool;
+    }
+
+    /**
+     * The server's clock, in seconds: what expires a lock and a tombstone,
+     * where a container's clock may run apart from ours.
+     */
+    private function serverTime(): float
+    {
+        $time = $this->redis->time();
+        $time = \is_array($time) ? array_values($time) : [];
+
+        return (is_numeric($time[0] ?? null) ? (int) $time[0] : 0) + (is_numeric($time[1] ?? null) ? (int) $time[1] : 0) / 1e6;
     }
 
     private function clean(): void

@@ -29,9 +29,9 @@ final class MissRecordsTest extends TestCase
         }
 
         self::assertSame(MissRecords::CAP, $records->count());
-        self::assertNull($records->of('k0'), 'the oldest went');
-        self::assertSame(['1-0', ''], $records->of('k1'));
-        self::assertSame(['1-0', ''], $records->of('k'.MissRecords::CAP));
+        self::assertNull(self::seen($records->of('k0')), 'the oldest went');
+        self::assertSame(['1-0', ''], self::seen($records->of('k1')));
+        self::assertSame(['1-0', ''], self::seen($records->of('k'.MissRecords::CAP)));
     }
 
     public function testAReadTakenAgainIsTheNewest(): void
@@ -46,8 +46,8 @@ final class MissRecordsTest extends TestCase
         $records->take('again', '2-0', 'b');
         $records->take('one-more', '2-0', '');
 
-        self::assertSame(['2-0', 'b'], $records->of('again'), 'replaced, and kept as the newest');
-        self::assertNull($records->of('k1'), 'the oldest went instead');
+        self::assertSame(['2-0', 'b'], self::seen($records->of('again')), 'replaced, and kept as the newest');
+        self::assertNull(self::seen($records->of('k1')), 'the oldest went instead');
     }
 
     public function testABatchIsRememberedWholeUntilTheRecordsAreCleared(): void
@@ -60,7 +60,7 @@ final class MissRecordsTest extends TestCase
         }
 
         self::assertSame(2_500, $records->count(), 'the floor, and room for the batch on top');
-        self::assertNotNull($records->of('k0'));
+        self::assertNotNull(self::seen($records->of('k0')));
 
         $records->clear();
 
@@ -79,7 +79,36 @@ final class MissRecordsTest extends TestCase
 
         $records->restamp('5-0', '6-0');
 
-        self::assertSame(['6-0', 'a'], $records->of('up-to-it'));
-        self::assertSame(['4-0', 'b'], $records->of('behind-it'), 'a rule stands between it and ours');
+        self::assertSame(['6-0', 'a'], self::seen($records->of('up-to-it')));
+        self::assertSame(['4-0', 'b'], self::seen($records->of('behind-it')), 'a rule stands between it and ours');
+    }
+
+    public function testARecordKeepsTheTimeOfItsRead(): void
+    {
+        $records = new MissRecords();
+        $before = microtime(true) * 1000;
+        $records->take('k', '1-0', 'a');
+        $after = microtime(true) * 1000;
+
+        $taken = $records->of('k')[2] ?? null;
+        self::assertIsFloat($taken);
+        self::assertGreaterThanOrEqual($before, $taken);
+        self::assertLessThanOrEqual($after, $taken);
+
+        $records->restamp('1-0', '2-0');
+
+        self::assertSame($taken, $records->of('k')[2] ?? null, 'a restamp keeps it');
+    }
+
+    /**
+     * The mark and the epoch of a record, without the time of its read.
+     *
+     * @param array{string, string, float}|null $record
+     *
+     * @return array{string, string}|null
+     */
+    private static function seen(?array $record): ?array
+    {
+        return null === $record ? null : [$record[0], $record[1]];
     }
 }

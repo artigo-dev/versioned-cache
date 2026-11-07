@@ -13,12 +13,15 @@ namespace Artigo\Cache\Adapter;
 
 use Artigo\Cache\Exception\InvalidArgumentException;
 use Psr\Cache\CacheItemPoolInterface;
+use Psr\Log\LoggerInterface;
 use Symfony\Component\Cache\Adapter\AbstractTagAwareAdapter;
 use Symfony\Component\Cache\CacheItem;
 use Symfony\Component\Cache\Exception\CacheException;
 use Symfony\Component\Cache\Marshaller\DefaultMarshaller;
 use Symfony\Component\Cache\Marshaller\MarshallerInterface;
 use Symfony\Component\Cache\PruneableInterface;
+use Symfony\Contracts\Cache\CacheInterface;
+use Symfony\Contracts\Cache\ItemInterface;
 
 /**
  * Tag invalidation that costs the same whether three items match or three
@@ -58,12 +61,13 @@ use Symfony\Component\Cache\PruneableInterface;
  * remembers is a miss, never a stale hit - at the price of recomputing the
  * pool once.
  *
- * A write that follows no read of this pool is stamped with the stream's head
- * at write time. One that follows a read is stamped with the position that
- * read was judged at, so a rule appended elsewhere while the value was
- * computed still judges it stale; this pool's own rules move that position
- * on, so an item committed after its own invalidation is fresh, as Symfony's
- * tag semantics require (TagAwareTestTrait pins it).
+ * A write that follows no read of this pool takes the rule set the way a read
+ * does, and is stamped with the last rule id of that set; the stream's head is
+ * never read for a write. One that follows a read is stamped with the
+ * position that read was judged at, so a rule appended elsewhere while the
+ * value was computed still judges it stale; this pool's own rules move that
+ * position on, so an item committed after its own invalidation is fresh, as
+ * Symfony's tag semantics require (TagAwareTestTrait pins it).
  *
  * The rule set is compacted - the newest rule per tag - and, given a cache
  * pool, shared by the workers of a server, so a fresh process (every request,
@@ -73,15 +77,17 @@ use Symfony\Component\Cache\PruneableInterface;
  * $rulesMaxTags: past it, a floor takes the place of the oldest rules, and an
  * item older than the floor reads as a miss (see InvalidationRules).
  *
- * An invalidation made here is seen at once by this process and, where the
- * set is shared, by every worker of this server: the rule is added to the
- * held set from the id the server answered, and a mark beside the shared set
- * keeps every worker from taking an older set for fresh. Two invalidations
- * racing on one server may leave the mark of the earlier one (see
- * SharedRules::written()); the later is then seen as one made on another
- * server is: within $rulesCacheMs, or within $rulesCacheMs plus one second
- * while another worker is refreshing the set (see RULES_GRACE_MS). Without a
- * shared set, another instance sees the rule within $rulesCacheMs.
+ * An invalidation made here is never served stale on this server while the
+ * stream can be read: where the set held ends at the id the rule was appended
+ * after, the rule is added to it from the reply and the set is shared for the
+ * other workers to adopt - at once by the first invalidation of a request,
+ * when the request ends (reset(), or the pool going away) for the later ones;
+ * otherwise the set is behind, and a mark beside the shared set keeps every
+ * worker of the server from judging by it until it is reloaded. Two
+ * invalidations racing on one server may leave the mark of the earlier one
+ * (see SharedRules::written()); the later is then seen as one made on another
+ * server is. Without a shared set, another instance sees the rule as one made
+ * elsewhere.
  *
  * A write that follows a read is guarded (see get() and MissRecords): every
  * write gives the item a fresh epoch, a delete leaves a tombstone holding a
@@ -89,8 +95,12 @@ use Symfony\Component\Cache\PruneableInterface;
  * only where the epoch is still the one the miss saw - one script, the only
  * one on the write path. A write refused that way answers false, so a value
  * computed from data that was deleted or invalidated while it was computed is
- * never stored as fresh. A read that could not reach the rules is guarded
- * too, as having seen none. $guardWindowSeconds = 0 switches the guard off.
+ * never stored as fresh. A value computed with no rule set held, or after a
+ * read of the item that failed, is returned and not stored: nothing could say
+ * which rules it has seen. get() computing after its own miss leaves the key
+ * as it is; any other write - a plain one, a forced recomputation, a save
+ * after a read - deletes it, so the value it was to replace is not served.
+ * $guardWindowSeconds = 0 switches the guard off.
  *
  * A tag invalidation is soft unless invalidateTags() is told it is hard.
  * With $softGraceSeconds, a read that finds an item only soft rules reached,
@@ -115,13 +125,14 @@ use Symfony\Component\Cache\PruneableInterface;
  *   read drops it or its TTL runs out. Reading a fully invalidated set is
  *   roughly twice the cost of reading a live one, and prune() is what takes
  *   back the items nobody reads again.
- * - **Invalidation made elsewhere becomes visible within `rulesCacheMs`**,
- *   because a rule set is reused for that long, or within `rulesCacheMs`
- *   plus one second while another worker of the server is refreshing it:
- *   meanwhile the others serve the set they hold, and past that they fetch
- *   on their own. While the stream cannot be read at all, the last set read
- *   stays in use. Pass 0 for exact reads, at the price of loading the rules
- *   on every one.
+ * - **Invalidation made elsewhere becomes visible within `rulesCacheMs` plus
+ *   a second**, because a rule set is reused for that long, and for up to a
+ *   second more while another worker reloads it; a read that cannot promise
+ *   that is a miss. While the stream cannot be read, or a reload has run for
+ *   more than a second, every worker serves the set it holds, whatever its
+ *   age, and one worker of the server tries the stream again a second after
+ *   the last attempt ended. Pass 0 for exact reads, at the price of a reload
+ *   for every read that can take the flag.
  * - **`$rulesRetentionSeconds` is the maximum item lifetime**, not only the
  *   default. An item must never outlive the rule that made it stale, or it
  *   would come back from the dead once that rule is trimmed away, so a longer
@@ -150,28 +161,41 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     private const FIELD_EPOCH = 'e';
 
     /**
-     * How long a worker that holds no rule set waits for the one elected to
-     * load it before loading it on its own: the cold start of a server whose
-     * shared pool was just emptied, where every request would otherwise load
-     * the whole stream at once. A worker holding a set never waits (see
-     * RULES_GRACE_MS). In milliseconds.
+     * The epoch a read records when it could not learn the item's: the
+     * server never holds it, so the write that follows does not land, and
+     * drops the stored value instead (see doSave()).
      */
-    private const COLD_WAIT_MS = 250;
+    private const EPOCH_UNKNOWN = '?';
 
     /**
-     * How often that worker looks whether the load has landed, in
-     * milliseconds.
+     * The mark a read records when no rule set was held: the write that
+     * follows is refused, since nothing can say which rules the value
+     * computed after it has seen. A get() computing after its miss leaves the
+     * item as it is; any other write deletes it (see doSave()).
      */
-    private const COLD_POLL_MS = 2;
+    private const MARK_UNJUDGED = 'unjudged';
 
     /**
-     * How long past $rulesCacheMs a worker keeps serving the set it holds
-     * while another worker is refreshing it: no wait and no fetch. Past
-     * that, it fetches what it lacks on its own. So an invalidation made
-     * elsewhere is seen within $rulesCacheMs, or within $rulesCacheMs plus
-     * this while the set is being refreshed. In milliseconds.
+     * How long another worker's reload may run before every other worker of
+     * the server takes it for an outage, and how far past $rulesCacheMs a set
+     * still judges reads while it runs. In milliseconds.
      */
-    private const RULES_GRACE_MS = 1_000;
+    private const SLOW_RELOAD_MS = 1_000;
+
+    /**
+     * During an outage, how long after the last attempt ended one worker of
+     * the server tries the stream again. In milliseconds.
+     */
+    private const RETRY_MS = 1_000;
+
+    /**
+     * What a get() in progress has learnt of its key: its read was a miss that
+     * computes without the lock (GET_UNLOCKED, see rules()); its callback
+     * computed after its own miss, so the write that follows is the pool's own
+     * computation (GET_OWN).
+     */
+    private const GET_UNLOCKED = 1;
+    private const GET_OWN = 2;
 
     /**
      * How many keys a prune names, reads and judges at a time.
@@ -291,11 +315,34 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     private string $writtenId = InvalidationRules::NONE;
 
     /**
+     * This request - the pool since its last reset() - has shared a set its
+     * own rule went into, in the invalidation call.
+     */
+    private bool $sharedInRequest = false;
+
+    /**
      * The set held has rules of this process's own that the shared set lacks:
-     * it is shared on the next read, so that invalidating many tags in a row
-     * copies the set once rather than once per rule.
+     * shared when the request ends, so a loop of invalidations copies the set
+     * twice rather than once per call.
      */
     private bool $unshared = false;
+
+    /**
+     * Where no shared set speaks for the server: whether the last attempt to
+     * fetch the stream failed, and when it ended.
+     */
+    private bool $outage = false;
+    private ?float $attemptEndedAtMs = null;
+
+    /**
+     * The shared store refused to record the flag the last time this worker
+     * took it: it reloads on its own, as a server of one, until it can.
+     */
+    private bool $alone = false;
+
+    private bool $aloneWarned = false;
+
+    private bool $storeWarned = false;
 
     /**
      * Whether the connection may answer reads from a replica; null until it is
@@ -323,6 +370,14 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * @var array<string, string|null>
      */
     private array $armed = [];
+
+    /**
+     * The ids of the get() calls in progress, each with what it has learnt
+     * (GET_UNLOCKED, GET_OWN).
+     *
+     * @var array<string, int>
+     */
+    private array $gets = [];
 
     private static ?string $guardedWriteSha = null;
 
@@ -424,31 +479,91 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * the call ends, by return or by throw, its record goes. A recursive get()
      * of the key it is already computing neither arms nor disarms it.
      *
+     * The write that follows the callback is marked as the pool's own
+     * computation after its miss, which a refusal leaves the key alone for
+     * (see doSave()). And a read that misses because another worker is
+     * reloading the rules, or because no set is held during an outage,
+     * computes without the lock: a waiter's own read would miss as well, and
+     * with no set held nothing computed is stored for it to read.
+     *
      * @param array<mixed>|null $metadata
      */
     public function get(string $key, callable $callback, ?float $beta = null, ?array &$metadata = null): mixed
     {
-        if (0 === $this->guardWindowMs || \array_key_exists($key, $this->armed)) {
+        $id = ($this->idOf)($key);
+
+        if (isset($this->gets[$id])) {
             return parent::get($key, $callback, $beta, $metadata);
         }
 
+        $this->gets[$id] = 0;
+        $armed = 0 < $this->guardWindowMs;
         $pending = $this->pendingArm;
-        $this->pendingArm = $key;
-        $this->armed[$key] = null;
+
+        if ($armed) {
+            $this->pendingArm = $key;
+            $this->armed[$key] = null;
+        }
+
+        $computed = function (ItemInterface $item, bool &$save) use ($callback, $beta, $id): mixed {
+            $value = $callback($item, $save);
+
+            if (\INF !== $beta && !$item->isHit() && isset($this->gets[$id])) {
+                $this->gets[$id] |= self::GET_OWN;
+            }
+
+            return $value;
+        };
+
+        // whether the read misses without the lock is only known once it is
+        // made: a young set may turn out behind, or give way to an adopted one
+        $lock = $this->setCallbackWrapper(null);
+        $this->setCallbackWrapper($this->unlockedWhileReloading($lock));
 
         try {
-            return parent::get($key, $callback, $beta, $metadata);
+            return parent::get($key, $computed, $beta, $metadata);
         } finally {
-            if (null !== $id = $this->armedId($key)) {
-                $this->records->drop($id);
-            }
+            $this->setCallbackWrapper($lock);
 
-            unset($this->armed[$key]);
+            unset($this->gets[$id]);
 
-            if ($key === $this->pendingArm) {
-                $this->pendingArm = $pending;
+            if ($armed) {
+                if (null !== $armedId = $this->armedId($key)) {
+                    $this->records->drop($armedId);
+                }
+
+                unset($this->armed[$key]);
+
+                if ($key === $this->pendingArm) {
+                    $this->pendingArm = $pending;
+                }
             }
         }
+    }
+
+    /**
+     * The callback wrapper of a get() that may read while another worker
+     * reloads the rules: a key whose read missed for that reason is computed
+     * at once, any other goes through $lock.
+     */
+    private function unlockedWhileReloading(callable $lock): \Closure
+    {
+        return function (callable $callback, ItemInterface $item, bool &$save, CacheInterface $pool, ?\Closure $setMetadata = null, ?LoggerInterface $logger = null, ?float $beta = null) use ($lock): mixed {
+            if (0 !== (self::GET_UNLOCKED & ($this->gets[($this->idOf)($item->getKey())] ?? 0))) {
+                return $callback($item, $save);
+            }
+
+            return $lock($callback, $item, $save, $pool, $setMetadata, $logger, $beta);
+        };
+    }
+
+    /**
+     * Is the write of $id the pool's own computation after its miss: a get()
+     * of it whose callback ran on a miss, not told to recompute?
+     */
+    private function ownComputation(string $id): bool
+    {
+        return 0 !== (self::GET_OWN & ($this->gets[$id] ?? 0));
     }
 
     /**
@@ -464,9 +579,25 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         // the reads a write may follow belong to the instance that read
         $this->records = new MissRecords();
         $this->armed = [];
+        $this->gets = [];
         $this->pendingArm = null;
         $this->aged = [];
         $this->idOf = $this->bindIdOf();
+
+        // a set left to share is the original's to share
+        $this->unshared = false;
+        $this->sharedInRequest = false;
+    }
+
+    /**
+     * Shares the set this request's later invalidations went into, then
+     * commits what was deferred.
+     */
+    public function __destruct()
+    {
+        $this->shareUnshared();
+
+        parent::__destruct();
     }
 
     /**
@@ -535,13 +666,14 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     {
         parent::reset();
 
-        // the rule set is shared truth with a bounded staleness, not request
-        // state: keep it and let the next read fetch what is new
-        $this->rulesReadAt = null;
-
-        // the reads of a request end with it
+        // the rule set and its stamp are shared truth with a bounded
+        // staleness, not request state: kept, and shared if this request's
+        // later invalidations went into it. The reads of a request end with it
+        $this->shareUnshared();
+        $this->sharedInRequest = false;
         $this->records->clear();
         $this->armed = [];
+        $this->gets = [];
         $this->pendingArm = null;
         $this->aged = [];
     }
@@ -584,9 +716,11 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     public function prune(): bool
     {
-        // no rules, no verdict: a read treats every item as a miss and drops
-        // nothing, and so does this
-        if (null === $rules = $this->rules()) {
+        // no rules to judge by, no verdict: a read treats every item as a miss
+        // and drops nothing, and so does this
+        [$rules, $unlocked] = $this->rules();
+
+        if (null === $rules || $unlocked) {
             return false;
         }
 
@@ -655,7 +789,11 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         $calls = [];
         $first = [];
         $guarded = [];
+        $dropped = [];
+        $unlink = [];
         $mark = null;
+        $markRead = false;
+        $nowMs = microtime(true) * 1000;
 
         foreach ($marshalled as $id => $value) {
             $id = (string) $id;
@@ -668,21 +806,80 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
             $encodedTags = json_encode($tags[$id], \JSON_THROW_ON_ERROR);
 
-            // the write that follows a read of this pool: compared with what
-            // the read saw, and stamped with the read's mark
-            if (0 < $this->guardWindowMs && null !== $record = $this->records->of($id)) {
+            $record = 0 < $this->guardWindowMs ? $this->records->of($id) : null;
+
+            // a read that reached no verdict, or did not learn the epoch,
+            // refuses the write that follows it; past the window it does so
+            // once and is forgotten, so the write after that is a normal one
+            $lapsed = null !== $record && (self::MARK_UNJUDGED === $record[0] || self::EPOCH_UNKNOWN === $record[1]) && $nowMs - $record[2] > $this->guardWindowMs;
+
+            $refusal = null;
+
+            if (null !== $record) {
                 [$recordMark, $seen] = $record;
+
+                if (self::EPOCH_UNKNOWN === $seen) {
+                    $refusal = 'the read before it could not learn the stored epoch';
+                } elseif (self::MARK_UNJUDGED === $recordMark) {
+                    $refusal = 'no invalidation rules were held for the read before it';
+                } else {
+                    // the write that follows a read of this pool: compared
+                    // with what the read saw, and stamped with the read's mark
+                    $first[$id] = \count($calls);
+                    $guarded[$id] = [$id, $value, $encodedTags, $recordMark, $seen, self::epoch(), (string) $ttl, (string) $this->guardWindowMs];
+                    $calls[] = ['evalSha', self::guardedWriteSha(), $guarded[$id], 1];
+
+                    continue;
+                }
+            } else {
+                // a write no read of this pool stands for: the rule set is
+                // taken the way a read takes it, once for the whole batch, and
+                // its last id is the stamp - older than the stream's head
+                // whenever the set is, which only makes the item stricter
+                if (!$markRead) {
+                    $mark = $this->rules()[0]?->last();
+                    $markRead = true;
+                }
+
+                if (null === $mark) {
+                    $refusal = 'no invalidation rules are held';
+                }
+            }
+
+            if (null !== $refusal) {
+                if ($lapsed) {
+                    $this->records->drop($id);
+                }
+
+                // the pool's own computation after its miss leaves the key,
+                // which may hold a valid value; any other write was to replace
+                // it, so the stored value goes rather than be served
+                if ($this->ownComputation($id)) {
+                    $failed[] = $id;
+                    $this->logger?->info('Refused to save "{key}": {reason}.', ['key' => $id, 'reason' => $refusal, 'cache-adapter' => get_debug_type($this)]);
+
+                    continue;
+                }
+
+                if (0 === $this->guardWindowMs) {
+                    // no window for a tombstone to live in
+                    $failed[] = $id;
+                    $unlink[] = $id;
+                    $this->logger?->info('Refused to save "{key}": {reason}, so the stored value was dropped instead.', ['key' => $id, 'reason' => $refusal, 'cache-adapter' => get_debug_type($this)]);
+
+                    continue;
+                }
+
                 $first[$id] = \count($calls);
-                $guarded[$id] = [$id, $value, $encodedTags, $recordMark, $seen, self::epoch(), (string) $ttl, (string) $this->guardWindowMs];
-                $calls[] = ['evalSha', self::guardedWriteSha(), $guarded[$id], 1];
+                $dropped[$id] = $refusal;
+
+                foreach ($this->tombstone($id) as $call) {
+                    $calls[] = $call;
+                }
 
                 continue;
             }
 
-            // read once for the whole batch, and only for a plain write: a rule
-            // appended between this and the writes below simply looks newer
-            // than the items, which invalidates them - the safe direction
-            $mark ??= $this->watermark();
             $first[$id] = \count($calls);
 
             foreach ($this->plainWrite($id, $value, $encodedTags, $mark, $ttl) as $call) {
@@ -722,6 +919,19 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         foreach ($first as $id => $index) {
             $result = $results[$index] ?? null;
 
+            // refused, its record kept so that a retry is refused again
+            if (isset($dropped[$id])) {
+                $failed[] = $id;
+                $this->logger?->info('Refused to save "{key}": {reason}, so the stored value was dropped instead.', ['key' => $id, 'reason' => $dropped[$id], 'cache-adapter' => get_debug_type($this)]);
+
+                // a value of another type refuses the tombstone
+                if (1 !== $result) {
+                    $this->unlink([$id]);
+                }
+
+                continue;
+            }
+
             if (!isset($guarded[$id])) {
                 if (1 !== $result) {
                     $failed[] = $id;
@@ -743,6 +953,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             if (0 === $result) {
                 $this->logger?->info('Refused to save "{key}": it was invalidated while it was computed.', ['key' => $id, 'cache-adapter' => get_debug_type($this)]);
             }
+        }
+
+        if ([] !== $unlink) {
+            $this->unlink($unlink);
         }
 
         return InvalidationRules::strings($failed ?? []);
@@ -779,28 +993,64 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             $this->records->reserve(\count($ids));
         }
 
+        [$rules, $unlocked] = $this->rules();
+
+        // a get() of one of these keys computes without the lock where its
+        // read misses that way (see get())
+        if ([] !== $this->gets) {
+            foreach ($ids as $id) {
+                if (isset($this->gets[$id])) {
+                    $this->gets[$id] = $unlocked ? $this->gets[$id] | self::GET_UNLOCKED : $this->gets[$id] & ~self::GET_UNLOCKED;
+                }
+            }
+        }
+
         // without the rules, fresh cannot be told from stale: every item is a
         // miss for now, and nothing is dropped on a verdict we cannot reach
-        if (null === $rules = $this->rules()) {
+        if (null === $rules) {
             $this->rememberUnjudged($ids);
 
             return;
         }
 
-        $fields = [self::FIELD_VALUE, self::FIELD_TAGS, self::FIELD_MARK, self::FIELD_EPOCH];
+        // while another worker reloads a set this one may not judge by, every
+        // item is a miss: only its epoch is read, for the write that follows
+        $fields = $unlocked ? [self::FIELD_EPOCH] : [self::FIELD_VALUE, self::FIELD_TAGS, self::FIELD_MARK, self::FIELD_EPOCH];
         $calls = [];
 
         foreach ($ids as $id) {
             $calls[] = ['hMGet', $id, $fields];
         }
 
-        $rows = $this->pipeline($calls);
         $held = $rules->last();
+
+        try {
+            $rows = $this->pipeline($calls);
+        } catch (\Exception $e) {
+            // a read that throws - a timeout, which phpredis raises from the
+            // pipeline - learned no epoch: the write after it must not land
+            foreach ($ids as $id) {
+                $this->remember($id, $held, self::EPOCH_UNKNOWN);
+            }
+
+            throw $e;
+        }
+
+        if ($unlocked) {
+            // what is computed is stamped with the last id of the set held,
+            // which every rule since judges
+            foreach ($ids as $index => $id) {
+                $this->remember($id, $held, self::epochOf($rows[$index] ?? null));
+            }
+
+            return;
+        }
+
         $stale = [];
 
         foreach ($ids as $index => $id) {
             $row = $rows[$index] ?? null;
-            $epoch = \is_array($row) && \is_string($row[self::FIELD_EPOCH] ?? null) ? $row[self::FIELD_EPOCH] : '';
+            $epoch = self::epochOf($row);
 
             // nothing, or a tombstone: what follows is a computation to guard
             if (!\is_array($row) || !\is_string($row[self::FIELD_VALUE] ?? null) || !\is_string($row[self::FIELD_TAGS] ?? null)) {
@@ -873,7 +1123,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         // a read of the key: what an earlier one kept is not vouched for
         $this->forgetAged([$id]);
 
-        if (null === $rules = $this->rules()) {
+        [$rules, $unlocked] = $this->rules();
+
+        if (null === $rules || $unlocked) {
             return false;
         }
 
@@ -928,22 +1180,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             return $this->unlink($ids);
         }
 
-        $typed = $this->writesTyped();
-        $window = (string) $this->guardWindowMs;
         $calls = [];
 
         foreach ($ids as $id) {
-            if ($typed) {
-                $calls[] = ['hSetEx', $id, [self::FIELD_EPOCH => self::epoch()], ['EX' => intdiv($this->guardWindowMs, 1000)]];
-                $calls[] = ['hDel', $id, self::FIELD_VALUE, self::FIELD_TAGS, self::FIELD_MARK];
-                $calls[] = ['expire', $id, intdiv($this->guardWindowMs, 1000), 'GT'];
-
-                continue;
+            foreach ($this->tombstone($id) as $call) {
+                $calls[] = $call;
             }
-
-            $calls[] = $this->command('HSETEX', $id, 'PX', $window, 'FIELDS', '1', self::FIELD_EPOCH, self::epoch());
-            $calls[] = $this->command('HDEL', $id, self::FIELD_VALUE, self::FIELD_TAGS, self::FIELD_MARK);
-            $calls[] = $this->command('PEXPIRE', $id, $window, 'GT');
         }
 
         try {
@@ -963,6 +1205,31 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         }
 
         return [] === $raw || $this->unlink($raw);
+    }
+
+    /**
+     * The three commands of a tombstone at $id (see doDelete()); the first
+     * answers 1 when the epoch was set.
+     *
+     * @return list<array{0: string, ...}>
+     */
+    private function tombstone(string $id): array
+    {
+        if ($this->writesTyped()) {
+            return [
+                ['hSetEx', $id, [self::FIELD_EPOCH => self::epoch()], ['EX' => intdiv($this->guardWindowMs, 1000)]],
+                ['hDel', $id, self::FIELD_VALUE, self::FIELD_TAGS, self::FIELD_MARK],
+                ['expire', $id, intdiv($this->guardWindowMs, 1000), 'GT'],
+            ];
+        }
+
+        $window = (string) $this->guardWindowMs;
+
+        return [
+            $this->command('HSETEX', $id, 'PX', $window, 'FIELDS', '1', self::FIELD_EPOCH, self::epoch()),
+            $this->command('HDEL', $id, self::FIELD_VALUE, self::FIELD_TAGS, self::FIELD_MARK),
+            $this->command('PEXPIRE', $id, $window, 'GT'),
+        ];
     }
 
     /**
@@ -1279,11 +1546,22 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         // the set held ends where the rule was appended: it holds the stream up
         // to the rule once the rule is added, so the rule comes from the reply
         // rather than from a read, which a lagging replica could answer
-        // without it. Ending anywhere else, the set would skip what was
-        // appended in between; the mark below makes the next read fetch it.
+        // without it. The first time in a request it is shared before the mark
+        // below, so a worker that sees the mark finds a set that holds the
+        // rule; later, when the request ends, as a copy per call would make a
+        // loop of invalidations pay for the whole set each time. Ending
+        // anywhere else, the set would skip what was appended in between; the
+        // mark keeps every worker of this server from judging by it until it
+        // is reloaded.
         if (null !== $this->rules && \is_string($previous) && $previous === $this->rules->last()) {
             $this->rules->append($id, $rule, '1' === ($result[2] ?? null));
-            $this->unshared = true;
+
+            if ($this->sharedInRequest) {
+                $this->unshared = true;
+            } else {
+                $this->sharedInRequest = true;
+                $this->shareHeldRules();
+            }
         }
 
         // every set read before now that does not hold the rule is behind it,
@@ -1302,125 +1580,149 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
-     * The rules stream's last entry id, or "0-0" when it has none.
+     * The rule set a read takes, and whether every item is a miss computed
+     * without the lock: [set, unlocked]. The set is null when none is held. A
+     * set taken with unlocked false judges the read; otherwise every item is
+     * a miss, and what is computed after it is stamped with the set's last id
+     * - or, with no set held, not stored, so a lock would only queue the
+     * workers computing it.
      *
-     * A rule set fetched within the cache window already knows it, at no
-     * round trip: a rule appended since makes the stamp older than the
-     * stream's head, which invalidates the item - the safe direction.
+     * The set is shared with the other workers of this server where a pool
+     * allows (see SharedRules), and the first of these that applies decides:
+     *
+     * - A set read less than $rulesCacheMs ago and not behind an invalidation
+     *   made on this server judges the read, at no round trip - never with
+     *   exact reads ($rulesCacheMs = 0).
+     * - During an outage, or while another worker's reload has run for more
+     *   than SLOW_RELOAD_MS, the set held judges the read whatever its age;
+     *   with none, every item is a miss computed without the lock. One
+     *   worker tries the stream again when the flag is free and RETRY_MS has
+     *   passed since the last attempt ended.
+     * - With the flag free, this worker takes it and reloads the set (see
+     *   reload()); a fetch that fails puts the server in an outage.
+     * - While another worker's reload has run for no longer, a set read no
+     *   more than $rulesCacheMs plus SLOW_RELOAD_MS ago and not behind judges
+     *   the read, exact reads included; otherwise every item is a miss
+     *   computed without the lock until the reload lands.
+     *
+     * Nobody but the worker holding the flag fetches the rules, or one whose
+     * store refuses to record it (see reload()). Reporting "no rules" while a
+     * set is held would let an invalidated item read as fresh, which is the
+     * one answer this must never give.
+     *
+     * @return array{InvalidationRules|null, bool}
      */
-    private function watermark(): string
+    private function rules(): array
     {
-        if ($this->rulesCacheMs > 0 && null !== ($rules = $this->rules()) && $this->rulesAreFresh()) {
-            return $rules->last();
+        if (null !== $this->rules && $this->rulesAreFresh()) {
+            return [$this->rules, false];
         }
 
-        try {
-            $last = $this->rulesNode()->xRevRange($this->rulesKey, '+', '-', 1);
-        } catch (\Exception $e) {
-            // an item stamped 0-0 has seen no rules, so every rule applies to
-            // it: we lose the item, never serve it past its invalidation
-            CacheItem::log($this->logger, 'Failed to read the invalidation watermark: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
-
-            return InvalidationRules::NONE;
+        if (null !== $this->sharedRules && $this->adoptSharedRules($this->sharedRules) && $this->rulesAreFresh()) {
+            return [$this->rules, false];
         }
 
-        if (!\is_array($last) || [] === $last) {
-            return InvalidationRules::NONE;
+        [$outage, $endedAtMs] = $this->lastAttempt();
+        $startedAtMs = $this->sharedRules?->reloadStartedAt();
+        $nowMs = microtime(true) * 1000;
+
+        if ($outage || (null !== $startedAtMs && $nowMs - $startedAtMs > self::SLOW_RELOAD_MS)) {
+            if (null === $startedAtMs && $this->retryDue($endedAtMs)) {
+                $this->reload();
+            }
+
+            return [$this->rules, null === $this->rules];
         }
 
-        $id = array_key_first($last);
+        // a reload that failed leaves the server in an outage, with or
+        // without a set to judge by
+        if (null === $startedAtMs && $this->reload()) {
+            return [$this->rules, null === $this->rules];
+        }
 
-        return \is_string($id) ? $id : InvalidationRules::NONE;
+        return [$this->rules, !$this->judgesWhileReloading()];
     }
 
     /**
-     * The rule set, refreshed at most every $rulesCacheMs - incrementally,
-     * from the last id it holds, and shared with the other workers of this
-     * server where a pool allows (see SharedRules).
-     *
-     * In order: the held set while it is fresh; the shared set, adopted
-     * unless what is held is newer, and final when it is fresh - no round
-     * trip; otherwise a refresh: XRANGE from the last id held, a batch at a
-     * time, absorbed, stamped and stored for the next worker. Where several
-     * workers cross the window together, one is elected to refresh. The
-     * others serve the set they hold for a bounded grace (RULES_GRACE_MS)
-     * past the window; past that, each fetches what it lacks from the last
-     * id it holds, without waiting, and leaves the sharing to the leader. A
-     * worker holding no set has nothing to serve: it waits for the leader's
-     * set for a bounded time (COLD_WAIT_MS), then loads the whole stream on
-     * its own. Exact reads ($rulesCacheMs = 0) elect nobody: every read
-     * refreshes, and so does a read behind an invalidation made on this
-     * server, whose rule the leader's refresh may have started without.
-     *
-     * When it cannot be refreshed the last known set is reused: reporting "no
-     * rules" would let an invalidated item read as fresh, which is the one
-     * answer this must never give. With nothing to fall back on it answers
-     * null, and the read path treats every item as a miss until the rules are
-     * back - without dropping anything on a verdict it could not reach.
+     * Takes the flag and reloads the set: XRANGE from the last id held, a
+     * batch at a time, absorbed, stamped with the moment the fetch began and
+     * stored for the other workers - in place of what they hold where the
+     * stream started over. A store that refuses to record the flag makes this
+     * worker a server of one: it fetches, and shares and records nothing.
+     * False when another worker holds the flag; true when
+     * what is held now is what the read takes: the set reloaded, one another
+     * worker landed meanwhile, or, after a failed attempt, the one held
+     * before.
      */
-    private function rules(): ?InvalidationRules
+    private function reload(): bool
     {
-        if (null !== $this->rules && $this->rulesAreFresh()) {
-            if ($this->unshared) {
-                $this->shareHeldRules();
-            }
+        $shared = $this->sharedRules;
+        $taken = null !== $shared ? $shared->lead() : true;
 
-            return $this->rules;
+        if (false === $taken) {
+            return false;
         }
 
-        $shared = $this->sharedRules;
-        $leader = null;
-        $publish = true;
+        // a store that cannot record the flag would leave the server with no
+        // reloader at all: this worker loads the rules itself and shares none
+        $this->alone = null === $taken;
 
-        if (null !== $shared) {
-            if ($this->adoptSharedRules($shared) && $this->rulesAreFresh()) {
-                return $this->rules;
-            }
+        if ($this->alone) {
+            $shared = null;
 
-            if ($this->rulesCacheMs > 0 && !$this->behindLocalInvalidation()) {
-                $leader = $shared->lead() ? $shared : null;
-
-                if (null === $leader) {
-                    // another worker is refreshing right now: a held set is
-                    // served for the grace, and with none we wait for its set
-                    if (null !== $this->rules ? $this->rulesWithinGrace() : $this->awaitSharedRules($shared)) {
-                        return $this->rules;
-                    }
-
-                    // past the grace, or it did not come in time: fetch what
-                    // we lack ourselves, and leave sharing it to the leader
-                    $publish = false;
-                }
+            if (!$this->aloneWarned) {
+                $this->aloneWarned = true;
+                $this->logger?->warning('The rule set store refused the reload flag: this worker loads the invalidation rules on its own and shares nothing until the store can be written.', ['cache-adapter' => get_debug_type($this)]);
             }
         }
 
         try {
+            // another worker may have reloaded, or tried, between the look
+            // and the flag
+            if (null !== $shared) {
+                if ($this->adoptSharedRules($shared) && $this->rulesAreFresh()) {
+                    return true;
+                }
+
+                [$outage, $endedAtMs] = $shared->lastAttempt();
+
+                if ($outage && !$this->retryDue($endedAtMs)) {
+                    return true;
+                }
+            }
+
             $rules = $this->rules ?? new InvalidationRules($this->poolNamespace, $this->rulesRetentionSeconds * 1000, $this->rulesMaxTags);
             // stamped before the read: a set read after a mark was set holds
             // the rule the mark stands for
-            $readAtMs = microtime(true) * 1000;
+            $startedAtMs = microtime(true) * 1000;
+            $startedOver = false;
+            $succeeded = $this->fetchRules($rules, $startedOver);
 
-            if (!$this->fetchRules($rules)) {
-                return $this->rules;
-            }
+            $this->attemptEnded($startedAtMs, $succeeded);
 
-            $this->rules = $rules;
-            $this->rulesReadAt = $readAtMs;
+            if ($succeeded) {
+                $this->rules = $rules;
+                $this->rulesReadAt = $startedAtMs;
 
-            if ($publish) {
-                $this->sharedRules?->store($rules, $readAtMs);
+                if (null !== $shared) {
+                    $this->stored($shared->store($rules, $startedAtMs, $startedOver));
+                }
+
+                // fetched after this process's own rules: it holds them
                 $this->unshared = false;
             }
 
-            return $rules;
+            return true;
         } finally {
-            $leader?->release();
+            $shared?->release();
         }
     }
 
     /**
      * Brings a set up to the stream: XRANGE from the last id held, inclusively,
-     * a batch at a time, until a batch comes back short.
+     * a batch at a time, until a batch comes back short. $startedOver says
+     * whether the stream no longer held the set's last id, so that the set was
+     * built again from what it holds now.
      *
      * On a connection that may read from a replica, an answer that would start
      * the set over - the id held is not there, or nothing is - or that ends
@@ -1429,7 +1731,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * lost stream says, and only the primary's answer may drop what is held.
      * One more round trip, in a case that is rare.
      */
-    private function fetchRules(InvalidationRules $rules): bool
+    private function fetchRules(InvalidationRules $rules, bool &$startedOver): bool
     {
         do {
             $from = $rules->last();
@@ -1448,10 +1750,15 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
                 return false;
             }
 
+            // an error reply (BUSY, LOADING) as much as a broken connection
             if (!\is_array($entries)) {
                 CacheItem::log($this->logger, 'Failed to load the invalidation rules.', ['cache-adapter' => get_debug_type($this)]);
 
                 return false;
+            }
+
+            if (!$rules->continuedBy($entries)) {
+                $startedOver = true;
             }
 
             $rules->absorb($entries);
@@ -1534,9 +1841,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
-     * Takes over the set another worker shared, unless what is held is newer.
-     * True when a set was adopted - fresh or not - false when there was
-     * nothing to adopt.
+     * Takes over the set another worker shared where it holds a rule newer
+     * than the set held, or was read later - which a set that started over
+     * is, holding older ids. True when a set was adopted, fresh or not.
      */
     private function adoptSharedRules(SharedRules $shared): bool
     {
@@ -1546,7 +1853,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
         [$rules, $readAtMs] = $loaded;
 
-        if (null !== $this->rules && InvalidationRules::isNewerId($this->rules->last(), $rules->last())) {
+        if (null !== $this->rules
+            && !InvalidationRules::isNewerId($rules->last(), $this->rules->last())
+            && $readAtMs <= ($this->rulesReadAt ?? -\INF)
+        ) {
             return false;
         }
 
@@ -1559,51 +1869,90 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
-     * Stores the set this process added its own rules to, for the other
-     * workers of this server to adopt; until then the mark sends them to fetch
-     * the rules themselves.
+     * Stores the set this process added its own rule to, for the other workers
+     * of this server to adopt rather than reload. Its stamp stays the moment
+     * its fetch began: the rule says nothing of what was appended elsewhere.
      */
     private function shareHeldRules(): void
     {
-        if (null !== $this->rules && null !== $this->rulesReadAt) {
-            $this->sharedRules?->store($this->rules, $this->rulesReadAt);
+        // a server of one shares nothing
+        if (null !== $this->rules && null !== $this->rulesReadAt && null !== $this->sharedRules && !$this->alone) {
+            $this->stored($this->sharedRules->store($this->rules, $this->rulesReadAt));
         }
 
         $this->unshared = false;
     }
 
     /**
-     * Waits, briefly, for the worker elected to load the stream to share its
-     * set, where this worker holds none: looks every COLD_POLL_MS for at most
-     * COLD_WAIT_MS, and gives up early when the leader has gone. True when a
-     * fresh set was adopted; one read longer than $rulesCacheMs ago, or behind
-     * an invalidation made on this server, is not, and this read fetches on
-     * its own.
+     * Shares the set this request's later invalidations went into, if any. A
+     * newer set already there stays (see SharedRules::store()).
      */
-    private function awaitSharedRules(SharedRules $shared): bool
+    private function shareUnshared(): void
     {
-        $deadline = microtime(true) + self::COLD_WAIT_MS / 1000;
+        if (!$this->unshared) {
+            return;
+        }
 
-        do {
-            usleep(self::COLD_POLL_MS * 1000);
-
-            if ($this->adoptSharedRules($shared) && $this->rulesAreFresh()) {
-                return true;
-            }
-        } while ($shared->isRefreshing() && microtime(true) < $deadline);
-
-        // the leader may have stored its set between the last look and letting go
-        return $this->adoptSharedRules($shared) && $this->rulesAreFresh();
+        try {
+            $this->shareHeldRules();
+        } catch (\Exception $e) {
+            CacheItem::log($this->logger, 'Failed to share the invalidation rules: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+        }
     }
 
     /**
-     * Is the set held no older than $rulesCacheMs plus the grace? Then it is
-     * served while another worker refreshes it.
+     * Warns, once per pool instance, when the store refused the set: the other
+     * workers go on judging by the older one there, which nothing else shows.
+     * A newer set already there is no refusal.
      */
-    private function rulesWithinGrace(): bool
+    private function stored(?bool $stored): void
     {
-        return null !== $this->rulesReadAt
-            && microtime(true) * 1000 - $this->rulesReadAt <= $this->rulesCacheMs + self::RULES_GRACE_MS;
+        if (null !== $stored || $this->storeWarned) {
+            return;
+        }
+
+        $this->storeWarned = true;
+        $this->logger?->warning('The rule set store refused the rule set: the other workers of this server keep judging by the older one until it can be written.', ['cache-adapter' => get_debug_type($this)]);
+    }
+
+    /**
+     * Whether the server is in an outage, and when the last attempt to fetch
+     * the stream ended - by any worker of this server where the set is shared.
+     *
+     * @return array{bool, float|null}
+     */
+    private function lastAttempt(): array
+    {
+        if (null === $this->sharedRules || $this->alone) {
+            return [$this->outage, $this->attemptEndedAtMs];
+        }
+
+        [$outage, $endedAtMs] = $this->sharedRules->lastAttempt();
+
+        return [$outage, $endedAtMs];
+    }
+
+    /**
+     * During an outage, may the stream be tried again: has RETRY_MS passed
+     * since the last attempt ended?
+     */
+    private function retryDue(?float $endedAtMs): bool
+    {
+        return null === $endedAtMs || microtime(true) * 1000 - $endedAtMs >= self::RETRY_MS;
+    }
+
+    private function attemptEnded(float $startedAtMs, bool $succeeded): void
+    {
+        $endedAtMs = microtime(true) * 1000;
+
+        if (null !== $this->sharedRules && !$this->alone) {
+            $this->sharedRules->attemptEnded($startedAtMs, $succeeded, $endedAtMs);
+
+            return;
+        }
+
+        $this->outage = !$succeeded;
+        $this->attemptEndedAtMs = $endedAtMs;
     }
 
     private function rulesAreFresh(): bool
@@ -1614,22 +1963,36 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
+     * May the set held judge a read while another worker's reload runs: read
+     * no more than $rulesCacheMs plus SLOW_RELOAD_MS ago, and not behind?
+     */
+    private function judgesWhileReloading(): bool
+    {
+        return null !== $this->rules
+            && null !== $this->rulesReadAt
+            && microtime(true) * 1000 - $this->rulesReadAt <= $this->rulesCacheMs + self::SLOW_RELOAD_MS
+            && !$this->behindLocalInvalidation();
+    }
+
+    /**
      * Was the set held read before the newest invalidation a process of this
      * server made, and does it end before that rule? Then it may lack it, and
-     * is never fresh. A set read after the mark holds the rule, the read being
-     * stamped before it began; one that ends at or after the rule holds it,
-     * the rule having been added from the reply. Holding no set is not
-     * behind: there is nothing to serve from.
+     * judges no read until it is reloaded. A set read after the mark holds the
+     * rule, the read being stamped before it began; one that ends at or after
+     * the rule holds it, the rule having been added from the reply. Holding no
+     * set is not behind: there is nothing to judge by.
      */
     private function behindLocalInvalidation(): bool
     {
-        if (null === $this->rules || null === $this->rulesReadAt) {
+        if (null === $this->rules) {
             return false;
         }
 
         [$atMs, $id] = $this->newestWritten();
 
-        return null !== $atMs && $this->rulesReadAt <= $atMs && InvalidationRules::isNewerId($id, $this->rules->last());
+        return null !== $atMs
+            && (null === $this->rulesReadAt || $this->rulesReadAt <= $atMs)
+            && InvalidationRules::isNewerId($id, $this->rules->last());
     }
 
     /**
@@ -1756,39 +2119,32 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
     /**
      * Remembers a read that could not reach the rules: the write that follows
-     * is compared with the epoch each item has now, and stamped as having seen
-     * no rule, so a delete during the computation refuses it and every rule
-     * judges it. An epoch that cannot be read counts as none, which refuses
-     * the write wherever the item has one.
+     * is refused (see doSave()). Nothing can say which rules a value computed
+     * after it has seen, and an item stored anyway would either be served
+     * past a rule or, judged by every rule, take the place of one that may
+     * still be valid - which a get() computing after its miss therefore
+     * leaves as it is, and a write meant to replace it drops.
      *
      * @param list<string> $ids
      */
     private function rememberUnjudged(array $ids): void
     {
-        if (0 === $this->guardWindowMs) {
-            return;
-        }
-
-        $calls = [];
-
         foreach ($ids as $id) {
-            $calls[] = ['hMGet', $id, [self::FIELD_EPOCH]];
+            $this->remember($id, self::MARK_UNJUDGED, '');
+        }
+    }
+
+    /**
+     * The epoch a read found: the item's, empty for none, EPOCH_UNKNOWN where
+     * the read of the item failed.
+     */
+    private static function epochOf(mixed $row): string
+    {
+        if (!\is_array($row)) {
+            return self::EPOCH_UNKNOWN;
         }
 
-        try {
-            $rows = $this->pipeline($calls);
-        } catch (\Exception $e) {
-            CacheItem::log($this->logger, 'Failed to read the epochs: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
-
-            $rows = [];
-        }
-
-        foreach ($ids as $index => $id) {
-            $row = $rows[$index] ?? null;
-            $epoch = \is_array($row) && \is_string($row[self::FIELD_EPOCH] ?? null) ? $row[self::FIELD_EPOCH] : '';
-
-            $this->remember($id, InvalidationRules::NONE, $epoch);
-        }
+        return \is_string($row[self::FIELD_EPOCH] ?? null) ? $row[self::FIELD_EPOCH] : '';
     }
 
     /**

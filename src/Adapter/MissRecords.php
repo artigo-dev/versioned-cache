@@ -13,10 +13,11 @@ namespace Artigo\Cache\Adapter;
 
 /**
  * What a pool remembers of the reads that will be followed by a write: per
- * id, the rule id the read was judged against (its mark) and the epoch the
- * item carried (empty when there was none). The write that follows lands only
- * where the epoch is still the same, and carries the read's mark rather than
- * the stream's head, so a rule appended meanwhile still judges it.
+ * id, the rule id the read was judged against (its mark), the epoch the item
+ * carried (empty when there was none) and when the read was taken. The write
+ * that follows lands only where the epoch is still the same, and carries the
+ * read's mark rather than the stream's head, so a rule appended meanwhile
+ * still judges it.
  *
  * Insertion order is age: the oldest record goes first once there are more
  * than CAP besides the largest single read, so a process that reads and never
@@ -33,7 +34,7 @@ final class MissRecords
     public const CAP = 1_000;
 
     /**
-     * @var array<string, array{string, string}> id => [mark, epoch]
+     * @var array<string, array{string, string, float}> id => [mark, epoch, taken at in milliseconds]
      */
     private array $records = [];
 
@@ -56,7 +57,7 @@ final class MissRecords
     public function take(string $id, string $mark, string $epoch): void
     {
         unset($this->records[$id]);
-        $this->records[$id] = [$mark, $epoch];
+        $this->records[$id] = [$mark, $epoch, microtime(true) * 1000];
 
         if ($this->cap < \count($this->records)) {
             unset($this->records[array_key_first($this->records)]);
@@ -64,7 +65,7 @@ final class MissRecords
     }
 
     /**
-     * @return array{string, string}|null [mark, epoch]
+     * @return array{string, string, float}|null [mark, epoch, taken at in milliseconds]
      */
     public function of(string $id): ?array
     {
@@ -94,9 +95,9 @@ final class MissRecords
      */
     public function restamp(string $previous, string $id): void
     {
-        foreach ($this->records as $recordId => [$mark, $epoch]) {
+        foreach ($this->records as $recordId => [$mark, $epoch, $atMs]) {
             if ($mark === $previous) {
-                $this->records[$recordId] = [$id, $epoch];
+                $this->records[$recordId] = [$id, $epoch, $atMs];
             }
         }
     }

@@ -15,15 +15,15 @@ use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Component\Cache\Adapter\ApcuAdapter;
 
 /**
- * The rule set, kept where it survives the request.
+ * The rule set, kept where it survives the request, and everything the
+ * workers sharing it need to agree on.
  *
  * Under PHP-FPM every request is a fresh process and a fresh adapter, and an
  * adapter that holds no rules has to load the whole stream - every
  * invalidation of the retention window - before its first hit. Kept where the
  * workers of a server can all reach it, the compacted set is loaded once per
- * server and then only followed: a worker whose window has passed fetches the
- * rules appended since the set's last id and stores the result for the next
- * one.
+ * server and then only followed: the worker that reloads it fetches the rules
+ * appended since the set's last id and stores the result for the others.
  *
  * The medium is APCu, spoken to directly, unless the caller hands in a PSR-6
  * pool of their own. Direct, because APCu keeps a PHP array as it is and
@@ -31,14 +31,16 @@ use Symfony\Component\Cache\Adapter\ApcuAdapter;
  * the way out - and a fresh worker adopts the set on every request, so that
  * cost is paid per request, by the size of the set. A pool is for servers
  * without APCu, or for keeping the set where the application already keeps
- * such things.
+ * such things. The processes that share one medium are one server: the reload
+ * flag, the outage and the mark of the newest invalidation live beside the
+ * set and speak for all of them.
  *
- * Where several workers cross the window together, one is elected to refresh
- * - a non-blocking flock() on a file under the temp dir, per host, released
- * by the OS if the leader dies, the primitive LockRegistry itself uses. The
- * others serve the set they hold for a bounded grace, then fetch on their own
- * without storing what they fetched; one that holds none waits for the
- * leader's set, briefly, before it loads the stream itself.
+ * The flag is a lease: an owner token and the moment the reload began, taken
+ * by one worker at a time and released by its owner only. It outlasts any
+ * reload, and exists for a reloader that dies, not for one that hangs: a
+ * lease older than LEASE_MS is free again. Beside it lies the record of the
+ * last attempt: when it ended, whether the stream could be read, and when the
+ * last fetch that could read it began.
  *
  * The entry is keyed by the rules key and an identity of the connection, so
  * two pools that share one server and one namespace but talk to different
@@ -67,6 +69,13 @@ final class SharedRules
      */
     public const TTL_SECONDS = 86_400;
 
+    /**
+     * How long a lease holds the flag, in milliseconds: longer than any reload
+     * whose read timeout is kept short, and as long as PHP-FPM's default
+     * max_execution_time.
+     */
+    public const LEASE_MS = 30_000;
+
     private const APCU_PREFIX = 'artigo.versioned.';
 
     /**
@@ -74,19 +83,36 @@ final class SharedRules
      */
     private const FORMAT = 3;
 
+    /**
+     * A lease is one integer, so APCu can take and release it atomically: the
+     * millisecond it began times this, plus a nonce below it.
+     */
+    private const LEASE_NONCE = 1_000_000;
+
     private const KEY_FORMAT = 'format';
     private const KEY_RULES = 'rules';
     private const KEY_READ_AT_MS = 'read_at_ms';
     private const KEY_WRITTEN_AT_MS = 'written_at_ms';
     private const KEY_WRITTEN_ID = 'written_id';
+    private const KEY_OUTAGE = 'outage';
+    private const KEY_ENDED_AT_MS = 'ended_at_ms';
+    private const KEY_SUCCESS_AT_MS = 'success_at_ms';
     private const SUFFIX_WRITTEN = '_written';
+    private const SUFFIX_FLAG = '_flag';
+    private const SUFFIX_ATTEMPT = '_attempt';
 
     /**
-     * The election flag while this worker holds it.
-     *
-     * @var resource|null
+     * The lease this instance holds, 0 for none.
      */
-    private mixed $flag = null;
+    private int $lease = 0;
+
+    /**
+     * The instances of this process holding a lease, let go of when it ends;
+     * weak, so that none is kept alive for it.
+     *
+     * @var \WeakMap<self, true>|null
+     */
+    private static ?\WeakMap $holders = null;
 
     /**
      * @param CacheItemPoolInterface|null $pool the medium when it is not APCu
@@ -94,7 +120,7 @@ final class SharedRules
     private function __construct(
         private readonly ?CacheItemPoolInterface $pool,
         private readonly string $key,
-        private readonly string $flagFile,
+        private readonly string $mutexFile,
     ) {
     }
 
@@ -122,8 +148,8 @@ final class SharedRules
      * loaded and enabled, and - under the CLI, where it is off unless
      * apc.enable_cli says otherwise - enabled for the CLI too. That last
      * question ApcuAdapter::isSupported() does not ask, and a medium that
-     * answers false to every write would leave the other processes waiting
-     * for a set that never comes.
+     * answers false to every write would leave the other processes without
+     * the set and the flag.
      */
     public static function apcuEnabled(): bool
     {
@@ -222,7 +248,7 @@ final class SharedRules
     }
 
     /**
-     * The stored set and the time it was read from the server, or null when
+     * The stored set and the time the fetch that read it began, or null when
      * there is none (or one we cannot read).
      *
      * @return array{InvalidationRules, float}|null
@@ -252,10 +278,13 @@ final class SharedRules
      * Stores the set for the next worker - unless another worker stored a
      * newer one meanwhile: two refreshes can race, and the slower one must
      * not roll the entry back behind the rules the faster one already fetched.
+     * A set that started over, the stream having lost what the stored one
+     * holds, replaces it whatever its ids ($replace). True when stored, false
+     * when a newer set is there, null when the store refused to write it.
      */
-    public function store(InvalidationRules $rules, float $readAtMs): bool
+    public function store(InvalidationRules $rules, float $readAtMs, bool $replace = false): ?bool
     {
-        $held = $this->read($this->key);
+        $held = $replace ? null : $this->read($this->key);
 
         // an entry of another format is overwritten, whatever it holds
         if (\is_array($held) && self::FORMAT === ($held[self::KEY_FORMAT] ?? null)) {
@@ -268,11 +297,13 @@ final class SharedRules
             }
         }
 
-        return $this->write($this->key, [
+        $stored = $this->write($this->key, [
             self::KEY_FORMAT => self::FORMAT,
             self::KEY_RULES => $rules->toArray(),
             self::KEY_READ_AT_MS => $readAtMs,
         ]);
+
+        return $stored ?: null;
     }
 
     /**
@@ -317,90 +348,238 @@ final class SharedRules
         return [(float) $atMs, $id];
     }
 
-    public function forget(): void
+    /**
+     * Takes the flag for this instance: true when it holds it now, false when
+     * another worker's lease does, null when the store refused to record it -
+     * a full APCu, a full or read-only disk.
+     *
+     * @phpstan-impure the flag is the server's
+     */
+    public function lead(): ?bool
     {
-        foreach ([$this->key, $this->key.self::SUFFIX_WRITTEN] as $key) {
-            if (null === $this->pool) {
-                apcu_delete(self::APCU_PREFIX.$key);
-
-                continue;
-            }
-
-            try {
-                $this->pool->deleteItem($key);
-            } catch (\Exception) {
-                // nothing to forget, or nowhere to forget it
-            }
+        if (0 !== $this->lease) {
+            return true;
         }
+
+        $mine = (int) (microtime(true) * 1000) * self::LEASE_NONCE + random_int(1, self::LEASE_NONCE - 1);
+        $taken = null === $this->pool ? $this->leadInApcu($mine) : $this->leadInPool($mine);
+
+        if (true !== $taken) {
+            return $taken;
+        }
+
+        $this->lease = $mine;
+
+        // a reloader that dies of a fatal error lets go of it too: one
+        // shutdown function per process, whatever the number of instances
+        if (null === self::$holders) {
+            self::$holders = new \WeakMap();
+            register_shutdown_function(static function (): void {
+                $holders = [];
+
+                foreach (self::$holders ?? [] as $holder => $held) {
+                    $holders[] = $holder;
+                }
+
+                foreach ($holders as $holder) {
+                    $holder->release();
+                }
+            });
+        }
+
+        self::$holders[$this] = true;
+
+        return true;
     }
 
     /**
-     * Elects this worker to refresh the set. True when it should fetch,
-     * false when another worker holds the flag and is fetching right now.
-     *
-     * A flag that cannot be had at all - no writable temp dir - elects
-     * nobody, so the caller refreshes on its own rather than trust a set
-     * nobody refreshes. Whoever was elected calls release() when the refresh
-     * has landed, or failed; a leader that dies has the OS release for it.
+     * Lets go of the flag, if this instance still holds it: a lease that ran
+     * out and was taken by another worker stays theirs.
      */
-    public function lead(): bool
-    {
-        if (null !== $this->flag) {
-            return true;
-        }
-
-        $handle = $this->openFlag();
-
-        if (null === $handle) {
-            return true;
-        }
-
-        if (flock($handle, \LOCK_EX | \LOCK_NB)) {
-            $this->flag = $handle;
-
-            return true;
-        }
-
-        fclose($handle);
-
-        return false;
-    }
-
     public function release(): void
     {
-        if (null === $this->flag) {
+        if (0 === $mine = $this->lease) {
             return;
         }
 
-        flock($this->flag, \LOCK_UN);
-        fclose($this->flag);
-        $this->flag = null;
+        $this->lease = 0;
+        unset(self::$holders[$this]);
+
+        if (null === $this->pool) {
+            apcu_cas(self::APCU_PREFIX.$this->key.self::SUFFIX_FLAG, $mine, 0);
+
+            return;
+        }
+
+        $this->underMutex(function () use ($mine): void {
+            if ($mine === $this->read($this->key.self::SUFFIX_FLAG)) {
+                $this->write($this->key.self::SUFFIX_FLAG, 0);
+            }
+        });
     }
 
     /**
-     * Is a worker elected and refreshing right now?
+     * When the reload in flight began, on this server's clock, or null when
+     * the flag is free.
+     *
+     * @phpstan-impure the flag is the server's
      */
-    public function isRefreshing(): bool
+    public function reloadStartedAt(): ?float
     {
-        if (null !== $this->flag) {
+        $held = $this->read($this->key.self::SUFFIX_FLAG);
+
+        if (!\is_int($held) || 0 === $held || self::expired($held)) {
+            return null;
+        }
+
+        return (float) intdiv($held, self::LEASE_NONCE);
+    }
+
+    /**
+     * What the last attempt to fetch the stream left: whether the server is in
+     * an outage, when that attempt ended, and when the last fetch that read
+     * the stream began - each null where none is known.
+     *
+     * @return array{bool, float|null, float|null}
+     *
+     * @phpstan-impure any worker of the server records it
+     */
+    public function lastAttempt(): array
+    {
+        $entry = $this->read($this->key.self::SUFFIX_ATTEMPT);
+
+        if (!\is_array($entry)) {
+            return [false, null, null];
+        }
+
+        $endedAtMs = $entry[self::KEY_ENDED_AT_MS] ?? null;
+        $successAtMs = $entry[self::KEY_SUCCESS_AT_MS] ?? null;
+
+        return [
+            true === ($entry[self::KEY_OUTAGE] ?? null),
+            \is_float($endedAtMs) || \is_int($endedAtMs) ? (float) $endedAtMs : null,
+            \is_float($successAtMs) || \is_int($successAtMs) ? (float) $successAtMs : null,
+        ];
+    }
+
+    /**
+     * Records an attempt to fetch the stream that ran from $startedAtMs to
+     * $endedAtMs. A success ends the outage; a failure starts one, unless the
+     * attempt began before the last success, which has read the stream since.
+     */
+    public function attemptEnded(float $startedAtMs, bool $succeeded, float $endedAtMs): void
+    {
+        [, , $successAtMs] = $this->lastAttempt();
+
+        if (!$succeeded && null !== $successAtMs && $startedAtMs < $successAtMs) {
+            return;
+        }
+
+        $this->write($this->key.self::SUFFIX_ATTEMPT, [
+            self::KEY_OUTAGE => !$succeeded,
+            self::KEY_ENDED_AT_MS => $endedAtMs,
+            self::KEY_SUCCESS_AT_MS => $succeeded ? max($successAtMs ?? $startedAtMs, $startedAtMs) : $successAtMs,
+        ]);
+    }
+
+    public function forget(): void
+    {
+        foreach ([$this->key, $this->key.self::SUFFIX_WRITTEN, $this->key.self::SUFFIX_FLAG, $this->key.self::SUFFIX_ATTEMPT] as $key) {
+            $this->delete($key);
+        }
+    }
+
+    /**
+     * APCu adds the lease where there is none, and swaps it for a free or
+     * lapsed one in one step. An add that fails with no key there is a refusal.
+     */
+    private function leadInApcu(int $mine): ?bool
+    {
+        $key = self::APCU_PREFIX.$this->key.self::SUFFIX_FLAG;
+
+        if (apcu_add($key, $mine, self::TTL_SECONDS)) {
             return true;
         }
 
-        $handle = $this->openFlag();
+        $held = apcu_fetch($key, $found);
 
-        if (null === $handle) {
-            return false;
+        if (true !== $found || !\is_int($held)) {
+            // none there, or not a lease this version wrote: replaced, then
+            // raced for
+            if (true === $found) {
+                apcu_delete($key);
+            }
+
+            if (apcu_add($key, $mine, self::TTL_SECONDS)) {
+                return true;
+            }
+
+            return apcu_exists($key) ? false : null;
         }
 
-        $free = flock($handle, \LOCK_EX | \LOCK_NB);
+        return (0 === $held || self::expired($held)) && apcu_cas($key, $held, $mine);
+    }
 
-        if ($free) {
-            flock($handle, \LOCK_UN);
+    /**
+     * A pool has no atomic write: the look and the write are serialised
+     * between the processes of this host by a short lock on a file. A write
+     * that fails is a refusal.
+     */
+    private function leadInPool(int $mine): ?bool
+    {
+        return $this->underMutex(function () use ($mine): ?bool {
+            $held = $this->read($this->key.self::SUFFIX_FLAG);
+
+            if (\is_int($held) && 0 !== $held && !self::expired($held)) {
+                return false;
+            }
+
+            return $this->write($this->key.self::SUFFIX_FLAG, $mine) ? true : null;
+        });
+    }
+
+    private static function expired(int $lease): bool
+    {
+        return microtime(true) * 1000 - intdiv($lease, self::LEASE_NONCE) >= self::LEASE_MS;
+    }
+
+    /**
+     * Runs $critical while holding the host's lock for this entry, or without
+     * it where no file can be opened: the pool's own writes then decide.
+     *
+     * @template T
+     *
+     * @param \Closure(): T $critical
+     *
+     * @return T
+     */
+    private function underMutex(\Closure $critical): mixed
+    {
+        set_error_handler(static fn (): bool => true);
+
+        try {
+            $handle = fopen($this->mutexFile, 'c');
+        } finally {
+            restore_error_handler();
         }
 
-        fclose($handle);
+        if (!\is_resource($handle)) {
+            return $critical();
+        }
 
-        return !$free;
+        try {
+            $locked = flock($handle, \LOCK_EX);
+
+            try {
+                return $critical();
+            } finally {
+                if ($locked) {
+                    flock($handle, \LOCK_UN);
+                }
+            }
+        } finally {
+            fclose($handle);
+        }
     }
 
     /**
@@ -423,10 +602,25 @@ final class SharedRules
         return $item->isHit() ? $item->get() : null;
     }
 
+    private function delete(string $key): void
+    {
+        if (null === $this->pool) {
+            apcu_delete(self::APCU_PREFIX.$key);
+
+            return;
+        }
+
+        try {
+            $this->pool->deleteItem($key);
+        } catch (\Exception) {
+            // nothing to forget, or nowhere to forget it
+        }
+    }
+
     /**
-     * @param array<string, mixed> $entry
+     * @param array<string, mixed>|int $entry
      */
-    private function write(string $key, array $entry): bool
+    private function write(string $key, array|int $entry): bool
     {
         if (null === $this->pool) {
             return true === apcu_store(self::APCU_PREFIX.$key, $entry, self::TTL_SECONDS);
@@ -442,21 +636,5 @@ final class SharedRules
         $item->expiresAfter(self::TTL_SECONDS);
 
         return $this->pool->save($item);
-    }
-
-    /**
-     * @return resource|null
-     */
-    private function openFlag()
-    {
-        set_error_handler(static fn (): bool => true);
-
-        try {
-            $handle = fopen($this->flagFile, 'c');
-        } finally {
-            restore_error_handler();
-        }
-
-        return \is_resource($handle) ? $handle : null;
     }
 }

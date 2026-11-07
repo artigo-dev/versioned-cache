@@ -17,8 +17,8 @@ use PHPUnit\Framework\TestCase;
 
 /**
  * How the adapter talks to the rules stream: what a read costs once the rules
- * are held, what a write costs once they are fresh, and which watermark an
- * item computed after a miss is stamped with.
+ * are held, which watermark an item computed after a miss is stamped with,
+ * and what a lost stream leaves behind.
  *
  * Two pools stand for two processes: what one appends, the other has to
  * notice - and notice cheaply.
@@ -65,36 +65,12 @@ final class RulesStreamTest extends TestCase
         self::assertSame([$held], $this->redis->starts, 'the range started at the id already held, not at the beginning');
     }
 
-    public function testAWriteAfterAFreshReadCostsNoWatermarkRoundTrip(): void
-    {
-        // the watermark of a plain write; a write that follows a read of the
-        // pool carries the read's mark and never asks (InvalidationGuardTest)
-        $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 1_000, rulesCache: false, guardWindowSeconds: 0);
-
-        $item = $pool->getItem('k');
-        $this->redis->watermarks = 0;
-
-        $item->set('v');
-        $pool->save($item);
-
-        self::assertSame(0, $this->redis->watermarks, 'the rule set read for the miss already knows the stream\'s head');
-
-        $exact = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false, guardWindowSeconds: 0);
-        $item = $exact->getItem('k2');
-        $this->redis->watermarks = 0;
-
-        $item->set('v');
-        $exact->save($item);
-
-        self::assertSame(1, $this->redis->watermarks, 'with no cache window there is nothing fresh to read it from');
-    }
-
     public function testWithTheGuardOffAnItemCommittedAfterAnInvalidationIsFresh(): void
     {
-        // without the guard, the watermark is the stream's head at write time,
-        // whatever happened between computing the value and writing it; with
-        // it, a rule from elsewhere in between makes the write stale
-        // (InvalidationGuardTest)
+        // without the guard, the watermark is the last id of the rule set the
+        // write takes - exact reads reload it - whatever happened between
+        // computing the value and writing it; with it, a rule from elsewhere
+        // in between makes the write stale (InvalidationGuardTest)
         $pool = new VersionedRedisTagAwareAdapter($this->redis, 'stream', rulesCacheMs: 0, rulesCache: false, guardWindowSeconds: 0);
         $elsewhere = new VersionedRedisTagAwareAdapter($this->other, 'stream', rulesCache: false);
 
