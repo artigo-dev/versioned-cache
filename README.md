@@ -1450,7 +1450,7 @@ Not our tests: `AdapterTestCase` and `TagAwareTestTrait`, the suite
 |---|---|
 | PSR-6 conformance, with `TagAwareTestTrait` | **154 tests**, one skip |
 | PSR-16 conformance | **212 tests** |
-| whole suite, on a single node | **605 tests**, five skips |
+| whole suite, on a single node | **606 tests**, five skips |
 
 The skip is `testPrune`, which sleeps its way through four expiry deadlines to
 watch a pool collect what has expired. Redis does that by itself, which is why

@@ -137,13 +137,13 @@ final class SharedRules
     private const KEY_FORMAT = 'format';
     private const KEY_RULES = 'rules';
     private const KEY_READ_AT_MS = 'read_at_ms';
-    private const KEY_MARK_AT_MS = 'at_ms';
+    private const KEY_MARK_AT_US = 'at_us';
     private const KEY_MARK_ID = 'id';
     private const KEY_OUTAGE = 'outage';
     private const KEY_ENDED_AT_MS = 'ended_at_ms';
     private const KEY_SUCCESS_AT_MS = 'success_at_ms';
     private const SUFFIX_MARK = '_mark';
-    private const SUFFIX_MARK_AT_MS = '_mark_at_ms';
+    private const SUFFIX_MARK_AT_US = '_mark_at_us';
     private const SUFFIX_MARK_ID = '_mark_id';
 
     /**
@@ -377,13 +377,15 @@ final class SharedRules
      */
     public function written(float $atMs, string $id): void
     {
-        // rounded up: never earlier than the moment the append returned
-        $at = (int) ceil($atMs);
+        // in microseconds, rounded up: never earlier than the moment the append
+        // returned. A whole millisecond would count a copy whose fetch began
+        // later in that millisecond as one read before it
+        $at = (int) ceil($atMs * 1000);
         $packed = self::packId($id);
 
         if (null === $this->pool) {
             self::raise(self::APCU_PREFIX.$this->key.self::SUFFIX_MARK_ID, $packed);
-            self::raise(self::APCU_PREFIX.$this->key.self::SUFFIX_MARK_AT_MS, $at);
+            self::raise(self::APCU_PREFIX.$this->key.self::SUFFIX_MARK_AT_US, $at);
 
             return;
         }
@@ -392,30 +394,30 @@ final class SharedRules
             [$heldAt, $heldId] = $this->poolMark() ?? [0, 0];
 
             $this->write($this->key.self::SUFFIX_MARK, [
-                self::KEY_MARK_AT_MS => max($heldAt, $at),
+                self::KEY_MARK_AT_US => max($heldAt, $at),
                 self::KEY_MARK_ID => max($heldId, $packed),
             ]);
         });
     }
 
     /**
-     * The local-invalidation note as written() left it: the time and the rule
-     * id of the newest invalidation a process of this server made. Null when
-     * there is none.
+     * The local-invalidation note as written() left it: the time, in
+     * milliseconds to the microsecond, and the rule id of the newest
+     * invalidation a process of this server made. Null when there is none.
      *
      * @return array{float, string}|null
      */
     public function writtenMark(): ?array
     {
         if (null === $this->pool) {
-            $at = $this->read($this->key.self::SUFFIX_MARK_AT_MS);
+            $at = $this->read($this->key.self::SUFFIX_MARK_AT_US);
             $packed = $this->read($this->key.self::SUFFIX_MARK_ID);
             $mark = \is_int($at) && \is_int($packed) ? [$at, $packed] : null;
         } else {
             $mark = $this->poolMark();
         }
 
-        return null === $mark ? null : [(float) $mark[0], self::unpackId($mark[1])];
+        return null === $mark ? null : [(float) $mark[0] / 1000, self::unpackId($mark[1])];
     }
 
     /**
@@ -427,7 +429,7 @@ final class SharedRules
     private function poolMark(): ?array
     {
         $entry = $this->read($this->key.self::SUFFIX_MARK);
-        $at = \is_array($entry) ? $entry[self::KEY_MARK_AT_MS] ?? null : null;
+        $at = \is_array($entry) ? $entry[self::KEY_MARK_AT_US] ?? null : null;
         $packed = \is_array($entry) ? $entry[self::KEY_MARK_ID] ?? null : null;
 
         return \is_int($at) && \is_int($packed) ? [$at, $packed] : null;
@@ -628,7 +630,7 @@ final class SharedRules
 
     public function forget(): void
     {
-        foreach ([$this->key, $this->key.self::SUFFIX_MARK, $this->key.self::SUFFIX_MARK_AT_MS, $this->key.self::SUFFIX_MARK_ID, $this->key.self::SUFFIX_FLAG, $this->key.self::SUFFIX_ATTEMPT] as $key) {
+        foreach ([$this->key, $this->key.self::SUFFIX_MARK, $this->key.self::SUFFIX_MARK_AT_US, $this->key.self::SUFFIX_MARK_ID, $this->key.self::SUFFIX_FLAG, $this->key.self::SUFFIX_ATTEMPT] as $key) {
             $this->delete($key);
         }
     }
