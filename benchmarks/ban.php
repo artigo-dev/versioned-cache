@@ -24,8 +24,11 @@ declare(strict_types=1);
  *   php benchmarks/ban.php tags=1000 entries=1000
  *   php benchmarks/ban.php tags=5000 entries=200
  *   php benchmarks/ban.php dsn="redis:?host[127.0.0.1:7110]&host[127.0.0.1:7111]&host[127.0.0.1:7112]&redis_cluster=1" tags=1000 entries=200
+ *   php benchmarks/ban.php dsn="redis:?host[127.0.0.1:7110]&host[127.0.0.1:7111]&host[127.0.0.1:7112]&redis_cluster=1" tags=1000 entries=200 stores=tagaware,tagaware-slot
  *
- * Options: dsn=, tags=, entries=, chunk= (50), stores= (versioned,symfony,tagaware),
+ * Options: dsn=, tags=, entries=, chunk= (50), stores= (versioned,symfony,tagaware;
+ *          tagaware-slot is TagAwareAdapter with every tag version in one
+ *          cluster slot, see slotted()),
  *          bytes= (value size, 100), force=1 (flush a non-empty database)
  *
  * Every primary is flushed before and after each store, so point it at a
@@ -103,7 +106,8 @@ foreach ($stores as $name) {
         'versioned' => new VersionedRedisTagAwareAdapter($connection, 'ban', rulesCache: false),
         'symfony' => new RedisTagAwareAdapter($connection, 'ban'),
         'tagaware' => new TagAwareAdapter(new RedisAdapter($connection, 'ban')),
-        default => throw new RuntimeException(sprintf('Unknown store "%s"; pick from versioned, symfony, tagaware.', $name)),
+        'tagaware-slot' => new TagAwareAdapter(new RedisAdapter($connection, 'ban'), new RedisAdapter(slotted($dsn), 'ban')),
+        default => throw new RuntimeException(sprintf('Unknown store "%s"; pick from versioned, symfony, tagaware, tagaware-slot.', $name)),
     };
 
     $began = microtime(true);
@@ -136,6 +140,7 @@ foreach ($rows as $name => $row) {
         match ($name) {
             'versioned' => '`VersionedRedisTagAwareAdapter`',
             'symfony' => '`RedisTagAwareAdapter`',
+            'tagaware-slot' => '`TagAwareAdapter`, every tag version in one slot',
             default => '`TagAwareAdapter`',
         },
         duration($row['seconds']),
@@ -439,4 +444,19 @@ function duration(float $seconds): string
 function megabytes(int $bytes): string
 {
     return sprintf('%.1f MB', $bytes / 1048576);
+}
+
+/**
+ * A connection of its own for TagAwareAdapter's tag versions, putting the
+ * hash tag {tags} in front of every key: a cluster hashes only what is inside
+ * the braces, so every version lands in one slot, and invalidating a chunk of
+ * tags is one UNLINK instead of one per slot. Cache keys may not hold braces,
+ * so the client's prefix is the only way to put them there.
+ */
+function slotted(string $dsn): object
+{
+    $connection = RedisAdapter::createConnection($dsn, ['lazy' => false]);
+    $connection->setOption(Redis::OPT_PREFIX, '{tags}');
+
+    return $connection;
 }

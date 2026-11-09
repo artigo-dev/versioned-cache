@@ -29,7 +29,7 @@ namespace Artigo\Cache\Benchmarks;
 const INVALIDATION = [
     'labels' => ['1 000', '2 000', '20 000'],
     'series' => [
-        ['name' => 'versioned', 'colour' => '#3ddc97', 'values' => [4, 4, 4]],
+        ['name' => 'VersionedRedisTagAwareAdapter', 'colour' => '#3ddc97', 'values' => [4, 4, 4]],
         ['name' => 'RedisTagAwareAdapter', 'colour' => '#ff6b6b', 'values' => [1006, 2006, 20012]],
         ['name' => 'TagAwareAdapter', 'colour' => '#ffd166', 'values' => [1, 1, 1]],
     ],
@@ -45,7 +45,7 @@ const INVALIDATION = [
 const READS = [
     'labels' => ['shared tags only', 'one tag of its own'],
     'series' => [
-        ['name' => 'versioned', 'colour' => '#3ddc97', 'values' => [20003, 20002]],
+        ['name' => 'VersionedRedisTagAwareAdapter', 'colour' => '#3ddc97', 'values' => [20003, 20002]],
         ['name' => 'RedisTagAwareAdapter', 'colour' => '#ff6b6b', 'values' => [20000, 20000]],
         ['name' => 'TagAwareAdapter', 'colour' => '#ffd166', 'values' => [21774, 40000]],
     ],

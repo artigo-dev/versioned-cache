@@ -747,11 +747,15 @@ function reads(string $dsn, array $client, int $count, array $stores, ?Marshalle
     // and the reads counted are the round trips; a namespace per store, so
     // that one store's clear() leaves the others alone
     $value = 'v';
+    // TagAwareAdapter with every tag version in one cluster slot, only when
+    // asked for (stores=tagaware-slot): it needs a connection of its own
+    $slotted = in_array('tagaware-slot', $stores, true) ? slotted($dsn) : null;
     $makers = [
         'versioned' => static fn (): AdapterInterface => new VersionedRedisTagAwareAdapter($connection, 'rv', marshaller: $marshaller),
         'symfony' => static fn (): AdapterInterface => new RedisTagAwareAdapter($connection, 'rs', 0, $marshaller),
         'tagaware' => static fn (): AdapterInterface => new TagAwareAdapter(new RedisAdapter($connection, 'rt', 0, $marshaller)),
         'redis' => static fn (): AdapterInterface => new RedisAdapter($connection, 'rr', 0, $marshaller),
+        'tagaware-slot' => static fn (): AdapterInterface => new TagAwareAdapter(new RedisAdapter($connection, 'rq', 0, $marshaller), new RedisAdapter($slotted ?? slotted($dsn), 'rq', 0, $marshaller)),
     ];
 
     $strategies = [
@@ -798,7 +802,7 @@ function reads(string $dsn, array $client, int $count, array $stores, ?Marshalle
     echo '| strategy | warm | cold |'.\PHP_EOL.'|---|---:|---:|'.\PHP_EOL;
 
     foreach ($strategies as $strategy => $request) {
-        foreach ($stores === ['versioned', 'symfony', 'tagaware'] ? array_keys($makers) : $stores as $store) {
+        foreach ($stores === ['versioned', 'symfony', 'tagaware'] ? ['versioned', 'symfony', 'tagaware', 'redis'] : $stores as $store) {
             $make = $makers[$store] ?? throw new RuntimeException(sprintf('Unknown store "%s".', $store));
 
             // a rule in the stream, so the versioned pools have a set to share
@@ -953,4 +957,17 @@ function table(array $results): void
     }
 
     echo \PHP_EOL;
+}
+
+/**
+ * A connection of its own for TagAwareAdapter's tag versions, putting the
+ * hash tag {tags} in front of every key, so that every version lands in one
+ * cluster slot (see ban.php).
+ */
+function slotted(string $dsn): object
+{
+    $connection = RedisAdapter::createConnection($dsn, ['lazy' => false]);
+    $connection->setOption(Redis::OPT_PREFIX, '{tags}');
+
+    return $connection;
 }

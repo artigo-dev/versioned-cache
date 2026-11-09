@@ -74,7 +74,7 @@ $item = $pool->getItem('article-1');
 $item->set($article)->tag(['articles', 'front-page']);
 $pool->save($item);
 
-$pool->invalidateTags(['articles']);   // four commands, whatever matched
+$pool->invalidateTags(['articles']);   // four commands, for 3 articles or a million
 $pool->prune();                        // and the memory back, at your leisure
 ```
 
@@ -1107,7 +1107,7 @@ against symfony/cache 8.1.11, the middle of three runs for each cell, the
 benchmark in a container on the Redis container's network (see the end of this
 section):
 
-| Scenario | **`versioned`** | `RedisTagAwareAdapter` | `TagAwareAdapter` |
+| Scenario | `VersionedRedisTagAwareAdapter` | `RedisTagAwareAdapter` | `TagAwareAdapter` |
 |---|---|---|---|
 | fill (commands · round trips) | 100 102 · 20 783 | 71 671 · 21 231 | 61 595 · **40 996** |
 | overwrite (commands · round trips) | 60 003 · 20 768 | 87 195 · 21 281 | **40 053** · 21 024 |
@@ -1153,7 +1153,10 @@ fresh pool, and it grows with the set (see
 is the one where `RedisTagAwareAdapter` is faster in time.
 `TagAwareAdapter` has no set to lose, but a fresh pool has no known versions
 either, so every read costs two round trips; `RedisTagAwareAdapter` holds
-nothing between requests and pays nothing for a fresh one.
+nothing between requests and pays nothing for a fresh one. All of that is
+with a round trip of under a tenth of a millisecond: over a real link the
+second round trip of every read weighs more than the copy (see
+[what a request pays in time](#what-a-request-pays-in-time)).
 
 ```bash
 docker compose up -d
@@ -1176,7 +1179,7 @@ A cache is mostly written to and only sometimes read back, so what the server
 is still holding afterwards matters as much as what an invalidation cost. The
 same 20 000 items, with nobody reading them again:
 
-| | **`versioned`** | `RedisTagAwareAdapter` | `TagAwareAdapter` |
+| | `VersionedRedisTagAwareAdapter` | `RedisTagAwareAdapter` | `TagAwareAdapter` |
 |---|---|---|---|
 | after every item expired | 20 000 epochs until the guard window ends, then **nothing** | 1 574 sets holding 360 000 members | 1 574 tag version keys |
 | after invalidating everything | 20 000 hashes, 1 stream | 1 573 sets holding 340 000 members | 20 000 items, 1 573 tag version keys |
@@ -1209,7 +1212,7 @@ The tags applications really use include one per entity — `article-42` — whi
 no other item shares and no per-tag cache can have warmed. The same run with
 one of the 18 tags being the item's own (`unique=1`, one run):
 
-| Scenario | **`versioned`** | `RedisTagAwareAdapter` | `TagAwareAdapter` |
+| Scenario | `VersionedRedisTagAwareAdapter` | `RedisTagAwareAdapter` | `TagAwareAdapter` |
 |---|---|---|---|
 | fill (commands · round trips) | 100 102 · 20 790 | 89 606 · 21 280 | 81 498 · **41 096** |
 | overwrite (commands · round trips) | 60 003 · 20 767 | 112 416 · 21 337 | 60 021 · **41 013** |
@@ -1242,7 +1245,7 @@ cell:
 
 | stack | ban duration | commands on the server | `PING` p50 / p99 / max during the 1 000 × 1 000 ban | memory before → after the 1 000 × 1 000 ban |
 |---|---:|---|---:|---|
-| **`VersionedRedisTagAwareAdapter`** | **3 ms / 15 ms** | 81 / 401 (one script per chunk: `XREVRANGE`, `XADD`, `PERSIST`) | **0.09 / 0.17 / 0.17 ms** | 503 MB → 503 MB (kept) |
+| `VersionedRedisTagAwareAdapter` | 3 ms / 15 ms | 81 / 401 (one script per chunk: `XREVRANGE`, `XADD`, `PERSIST`) | 0.09 / 0.17 / 0.17 ms | 503 MB → 503 MB (kept) |
 | `RedisTagAwareAdapter` | 1.4 s / 1.7 s | 1 006 000 / 1 030 000 (`DEL` inside Lua, `SSCAN`) | 14.8 / 61.2 / 61.2 ms | 249 MB → 2.3 MB (freed) |
 | `TagAwareAdapter` | 3 ms / 16 ms | 20 / 100 `UNLINK` (tag keys only) | 0.10 / 0.17 / 0.17 ms | 250 MB → 250 MB (kept) |
 
@@ -1252,13 +1255,31 @@ Cluster, three masters with a replica each, 1 000 tags × 200 entries, then
 
 | stack | ban duration | commands on the primaries | `PING` max |
 |---|---:|---|---:|
-| **`VersionedRedisTagAwareAdapter`** | **4 ms / 16 ms** | 81 / 401 (one script per chunk) | **0.33 ms / 0.23 ms** |
+| `VersionedRedisTagAwareAdapter` | 4 ms / 16 ms | 81 / 401 (one script per chunk) | 0.33 ms / 0.23 ms |
 | `RedisTagAwareAdapter` | 16.8 s / 17.2 s | ~133k `UNLINK` sent by PHP + ~68k / ~72k `DEL` inside Lua | 1.45 ms / 19.8 ms |
 | `TagAwareAdapter` | 110 ms / 570 ms | 1 000 / 5 000 `UNLINK` | 0.33 ms / 0.50 ms |
+| `TagAwareAdapter`, every tag version in one slot | 4 ms / 17 ms | 20 / 100 `UNLINK` | 0.18 ms / 0.20 ms |
 
 On the cluster every row's `PING` p99 is 0.15–0.33 ms; the maximum during
 `RedisTagAwareAdapter`'s walks of 17 seconds moves from run to run, 1.0 to
-23 ms.
+23 ms. The last row was measured with 2.0.3, the versioned and
+`TagAwareAdapter` rows run again beside it (4 / 16–17 ms and 111–114 /
+542–570 ms, as above).
+
+Read against `TagAwareAdapter`, the tables show no gain in the ban itself.
+Both invalidate by writing rather than deleting, so on one server both take
+3 ms and the server keeps answering; `TagAwareAdapter` sends fewer commands
+(one `UNLINK` per chunk of 50 tags, against one script of four) and, at these
+100-byte values, holds half the memory (see below). Its 110 ms on a cluster
+come from where its keys land: its tag versions are spread over the slots,
+and phpredis splits a multi-key `UNLINK` by slot, so a chunk of 50 tags is 50
+commands, a round trip each. Give its tags pool a connection of its own whose
+key prefix is the hash tag `{tags}` (`stores=tagaware-slot`), and every
+version lands in one slot: a chunk is one `UNLINK` again, and the ban takes
+this adapter's time. The price is that every version read and write goes to
+that one node. The ban is what this adapter gains on `RedisTagAwareAdapter`;
+what it gains on `TagAwareAdapter` is on the read side
+([what a request pays in time](#what-a-request-pays-in-time)).
 
 Two things to read off it. The ban costs the same handful of commands whether
 it names a thousand entries or a million, and the server never stops answering
@@ -1280,6 +1301,7 @@ php benchmarks/ban.php tags=1000 entries=1000
 php benchmarks/ban.php tags=5000 entries=200
 php benchmarks/ban.php dsn="redis:?host[127.0.0.1:7110]&host[127.0.0.1:7111]&host[127.0.0.1:7112]&redis_cluster=1" tags=1000 entries=200
 php benchmarks/ban.php dsn="redis:?host[127.0.0.1:7110]&host[127.0.0.1:7111]&host[127.0.0.1:7112]&redis_cluster=1" tags=5000 entries=40
+php benchmarks/ban.php dsn="redis:?host[127.0.0.1:7110]&host[127.0.0.1:7111]&host[127.0.0.1:7112]&redis_cluster=1" tags=1000 entries=200 stores=versioned,tagaware,tagaware-slot
 ```
 
 ### Round trips per request
@@ -1324,6 +1346,81 @@ php -d apc.enable_cli=1 benchmarks/bench.php reads=100
 php -d apc.enable_cli=1 benchmarks/bench.php reads=100 dsn="redis:?host[127.0.0.1:7110]&host[127.0.0.1:7111]&host[127.0.0.1:7112]&redis_cluster=1"
 ```
 
+### What a request pays in time
+
+A round trip saved is worth what the network charges for it, and a fresh
+versioned pool pays for one thing the others do not: its copy of the rules, one
+per invalidation made before (up to the bound). `benchmarks/request.php`
+measures both. A request is a fresh pool reading 10 keys that are all there,
+one by one through `get()` or in one `getItems()`; each item has a tag of its
+own and a tag it shares with nine others. Before the requests, 2 000 or 10 000
+invalidations of other tags are made through each adapter. The network is
+simulated: Redis on the benchmark machine (a round trip of 0.09 ms), then
+behind a toxiproxy (0.25 ms, about a network inside a data centre), then behind
+that proxy with 1 ms added to every reply (1.36 ms, a slow link).
+
+The outcome, by how a request reads:
+
+| reading 10 keys per request | fastest | second | slowest |
+|---|---|---|---|
+| one by one, over a network | `RedisTagAwareAdapter` | `VersionedRedisTagAwareAdapter`, 0.4–1.8 ms behind it | `TagAwareAdapter`, 1.3 to 1.9 times this adapter's time |
+| one by one, on the same machine | `RedisTagAwareAdapter` | `VersionedRedisTagAwareAdapter` after 2 000 invalidations; `TagAwareAdapter` after 10 000 | `TagAwareAdapter` after 2 000 invalidations; `VersionedRedisTagAwareAdapter` after 10 000 |
+| in one batch, same machine or data centre | `RedisTagAwareAdapter` | `TagAwareAdapter` (a tie with this adapter after 2 000 invalidations, in the data centre) | `VersionedRedisTagAwareAdapter`, up to 5.8 times `TagAwareAdapter`'s time |
+| in one batch, slow link | `RedisTagAwareAdapter` | `VersionedRedisTagAwareAdapter` after 2 000 invalidations (a tie after 10 000) | `TagAwareAdapter` |
+
+So on reads this adapter is never the fastest: it makes
+`RedisTagAwareAdapter`'s round trips and adds the copy of its rules. Against
+`TagAwareAdapter` it wins when code reads one item at a time over a network,
+and loses on batches unless the link is slow. What it gains over
+`RedisTagAwareAdapter` is not on reads but in invalidating (the ban tables).
+
+Why, in what each adapter pays on top of the reads themselves:
+
+| adapter | extra per request of 10 reads | grows with |
+|---|---|---|
+| `TagAwareAdapter` | a second round trip for the tag versions: 10 more when the keys are read one by one, 1 more in one batch | the network |
+| `VersionedRedisTagAwareAdapter` | its copy of the rules, and checking each item against them: 0.2–0.7 ms after 2 000 invalidations, 1.3–1.9 ms after 10 000 | the invalidations made before (bounded) |
+| `RedisTagAwareAdapter` | nothing: the invalidations before left nothing for a read to fetch | — |
+
+The measurements (this package 2.0.3, symfony/cache 8.1.11, Redis 8.10.1, PHP
+8.5.12): time per request, the mean of 300 requests and the middle of three
+runs; in brackets, this adapter against `TagAwareAdapter`. After 2 000
+invalidations:
+
+| 10 reads | `TagAwareAdapter` | `VersionedRedisTagAwareAdapter` | `RedisTagAwareAdapter` |
+|---|---:|---:|---:|
+| one by one, same machine (0.09 ms a round trip) | 2.0 ms | 1.4 ms (−30 %) | 1.0 ms |
+| one by one, data centre (0.25 ms) | 5.2 ms | 3.2 ms (−39 %) | 2.5 ms |
+| one by one, slow link (1.36 ms) | 27.8 ms | 14.3 ms (−48 %) | 13.9 ms |
+| one batch, same machine | 0.25 ms | 0.32 ms (+28 %) | 0.12 ms |
+| one batch, data centre | 0.58 ms | 0.57 ms (tie) | 0.29 ms |
+| one batch, slow link | 2.81 ms | 1.70 ms (−40 %) | 1.39 ms |
+
+After 10 000 invalidations:
+
+| 10 reads | `TagAwareAdapter` | `VersionedRedisTagAwareAdapter` | `RedisTagAwareAdapter` |
+|---|---:|---:|---:|
+| one by one, same machine (0.09 ms a round trip) | 2.0 ms | 2.4 ms (+21 %) | 1.0 ms |
+| one by one, data centre (0.25 ms) | 5.3 ms | 4.1 ms (−23 %) | 2.5 ms |
+| one by one, slow link (1.36 ms) | 27.7 ms | 15.4 ms (−44 %) | 13.6 ms |
+| one batch, same machine | 0.24 ms | 1.38 ms (×5.8) | 0.13 ms |
+| one batch, data centre | 0.60 ms | 1.60 ms (×2.7) | 0.29 ms |
+| one batch, slow link | 2.82 ms | 2.78 ms (tie) | 1.40 ms |
+
+Two more runs after 2 000 invalidations: a hundred reads one by one in the data
+centre take 28.9 ms with this adapter against 53.0 ms with `TagAwareAdapter`;
+and with 18 list tags on every item, `TagAwareAdapter`'s ten reads there take
+5.6 ms while this adapter's stay at 3.2 ms, because it fetches the version of
+every tag an item carries.
+
+```bash
+php -d apc.enable_cli=1 benchmarks/request.php
+php -d apc.enable_cli=1 benchmarks/request.php pattern=batch behind=10000
+docker compose -f compose.tests.yaml --profile flaky up -d --wait
+php -d apc.enable_cli=1 benchmarks/request.php dsn=redis://127.0.0.1:6397 latency=0
+php -d apc.enable_cli=1 benchmarks/request.php dsn=redis://127.0.0.1:6397 latency=1
+```
+
 ### The rule set a fresh process adopts
 
 What a request pays for holding the rules: a fresh pool adopting the set the
@@ -1351,7 +1448,7 @@ three runs, taken back to back with 2.0.0's.
 Behind **100 000** distinct entity tags (`unique=1 behind=100000`), the FPM rows
 read differently, and the hit count says why:
 
-| Scenario | **`versioned`** | `RedisTagAwareAdapter` | `TagAwareAdapter` |
+| Scenario | `VersionedRedisTagAwareAdapter` | `RedisTagAwareAdapter` | `TagAwareAdapter` |
 |---|---|---|---|
 | 100 000 invalidations matching nothing, one tag per call | 400 000 · 13.3 s | 500 000 · 10.9 s | **100 000** · 8.3 s |
 | read, fresh pool every 10 reads | 20 005 · 5.5 s | 20 000 · 1.9 s | 40 000 · 4.6 s |
@@ -1420,7 +1517,15 @@ Every cache trades something, and two rows of that table are the price.
   holds 3 025 MB (see [the hash encoding](#the-hash-encoding-memory-per-item)).
 - **A fresh process copies the rule set**, about 0.1 ms per thousand rules,
   which on a fast network is more than the round trips it saves; the bound
-  keeps it near a millisecond.
+  keeps it near a millisecond. `RedisTagAwareAdapter` holds nothing to copy,
+  and reads fastest everywhere
+  ([what a request pays in time](#what-a-request-pays-in-time)).
+- **Against `TagAwareAdapter`, batches and clusters even out.** A request
+  that reads its keys in one `getItems()` pays `TagAwareAdapter` a single
+  extra round trip, which the copy of the rule set matches or outweighs except
+  on a slow link; and a `TagAwareAdapter` whose tag versions share one cluster
+  slot bans as fast as this adapter
+  ([banning thousands of tags](#banning-thousands-of-tags)).
 - **An invalidation made elsewhere becomes visible within `rulesCacheMs`
   plus a second**, two seconds by default, while Redis is healthy and a
   reload lands within a second; a read that cannot promise that is a miss, so
@@ -1578,6 +1683,7 @@ can re-run rather than take on trust:
 |---|---|
 | `benchmarks/bench.php` | what does invalidating a tag cost as the match count grows, what does a read cost after it, what does a fresh process pay, and what is the server left holding afterwards — against both of Symfony's tag adapters? |
 | `benchmarks/bench.php reads=100` | how many round trips does a request reading a hundred keys make, warm and cold, standalone and on a cluster? |
+| `benchmarks/request.php` | what does a request pay in time for its reads, item by item or in one batch, as the round trip grows? (through toxiproxy for a slower link) |
 | `benchmarks/bench.php adopt=…` | what does a fresh process pay to adopt the shared rule set, and what does the set take in APCu, with the bound and without? |
 | `benchmarks/ban.php` | what does banning thousands of tags cost the server, and everybody else on it while it happens? |
 | `benchmarks/race.php` | does a value computed before an invalidation survive it, and how many writes would one epoch per pool refuse? |
@@ -1593,7 +1699,10 @@ behind the fill (10 000); `payload=model` writes a ~2.5 KB entity instead of
 256 repeated bytes, and `marshaller=deflate` or `marshaller=zstd` wraps the
 default marshaller in Symfony's `DeflateMarshaller` or in `ZstdMarshaller`;
 `stores=` picks from `versioned`, `symfony`
-(`RedisTagAwareAdapter`) and `tagaware` (`TagAwareAdapter` over a `RedisAdapter`).
+(`RedisTagAwareAdapter`) and `tagaware` (`TagAwareAdapter` over a `RedisAdapter`);
+`ban.php` and `reads=` also take `tagaware-slot`, a `TagAwareAdapter` whose tag
+versions all sit in one cluster slot, and `request.php` takes `redis` (a plain
+`RedisAdapter`, the floor) and `shared=N`, the list tags per item.
 
 The stampede benchmark is maintained in
 [`artigo/cache-stampede`](https://github.com/artigo-dev/cache-stampede) with

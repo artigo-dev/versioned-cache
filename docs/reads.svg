@@ -29,7 +29,7 @@
 <text x="108.0" y="208.0" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">20,003</text>
 <circle cx="480.0" cy="189.0" r="4.5" fill="#3ddc97"/>
 <text x="480.0" y="208.0" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">20,002</text>
-<text x="494.0" y="193.0" font-size="13" font-weight="600" fill="#3ddc97">versioned</text>
+<text x="494.0" y="193.0" font-size="13" font-weight="600" fill="#3ddc97">VersionedRedisTagAwareAdapter</text>
 <line x1="78" y1="316.0" x2="510.0" y2="316.0" stroke="#26263a" stroke-width="1"/>
 <text x="108.0" y="338.0" font-size="12" fill="#b8b8c8" text-anchor="middle">shared tags only</text>
 <text x="480.0" y="338.0" font-size="12" fill="#b8b8c8" text-anchor="middle">one tag of its own</text>
