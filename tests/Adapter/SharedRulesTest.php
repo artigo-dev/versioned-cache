@@ -167,6 +167,29 @@ final class SharedRulesTest extends TestCase
         self::assertCount($starts, $this->redis->starts, 'read after the mark: fresh for its window, not fetched on every read');
     }
 
+    public function testASetWhoseFetchBeganAFractionOfAMillisecondAfterTheMarkIsNotBehind(): void
+    {
+        $this->appendRule('first');
+        $this->write(new VersionedRedisTagAwareAdapter($this->plain, self::NAMESPACE, rulesCache: false), 'item', ['tag2']);
+        $rules = new InvalidationRules(self::NAMESPACE.':', 2_592_000_000);
+        $rules->absorb((array) $this->plain->xRange(self::RULES_KEY, '-', '+'));
+        [$ms] = InvalidationRules::split($rules->last());
+
+        // a rule of this server, its append returned 0.2 ms into a millisecond;
+        // the stream has lost it since
+        $atMs = floor(microtime(true) * 1000) + 0.2;
+        $this->sharedRules()->written($atMs, ($ms + 1).'-0');
+
+        // a set whose fetch began 0.3 ms later, in the same millisecond
+        self::assertTrue($this->sharedRules()->store($rules, $atMs + 0.3, true));
+
+        $pool = $this->pool($this->redis, 60_000);
+
+        self::assertTrue($pool->getItem('item')->isHit());
+        self::assertTrue($pool->getItem('item')->isHit());
+        self::assertSame([], $this->redis->starts, 'read after the mark: not behind, and not fetched');
+    }
+
     public function testARuleAppendedElsewhereIsSeenAfterTheWindowThroughOneDelta(): void
     {
         $first = $this->pool($this->redis, 100);
@@ -426,18 +449,19 @@ final class SharedRulesTest extends TestCase
                 $shared->written(1_000.0, '1000-0');
                 self::assertSame([2_000.0, '2000-5'], $shared->writtenMark(), \sprintf('%s: an older mark changes nothing', $medium));
 
-                $shared->written(3_000.4, '1500-0');
-                self::assertSame([3_001.0, '2000-5'], $shared->writtenMark(), \sprintf('%s: time and id each keep their newest', $medium));
+                // half a microsecond in: rounded up to the next one
+                $shared->written(3_000.0005, '1500-0');
+                self::assertSame([3_000.001, '2000-5'], $shared->writtenMark(), \sprintf('%s: time and id each keep their newest, to the microsecond', $medium));
 
                 // the largest sequence its bits hold, and one too large for them
                 $shared->written(3_000.0, '4000-1048575');
-                self::assertSame([3_001.0, '4000-1048575'], $shared->writtenMark(), \sprintf('%s: kept as it is', $medium));
+                self::assertSame([3_000.001, '4000-1048575'], $shared->writtenMark(), \sprintf('%s: kept as it is', $medium));
 
                 $shared->written(3_000.0, '4000-5000000');
-                self::assertSame([3_001.0, '4001-0'], $shared->writtenMark(), \sprintf('%s: stored as the next millisecond, later than the rule', $medium));
+                self::assertSame([3_000.001, '4001-0'], $shared->writtenMark(), \sprintf('%s: stored as the next millisecond, later than the rule', $medium));
 
                 $shared->written(1.0, '4000-1048575');
-                self::assertSame([3_001.0, '4001-0'], $shared->writtenMark(), \sprintf('%s: an older write lowers nothing', $medium));
+                self::assertSame([3_000.001, '4001-0'], $shared->writtenMark(), \sprintf('%s: an older write lowers nothing', $medium));
 
                 $shared->forget();
                 $shared->written(10.0, InvalidationRules::NONE);
@@ -472,7 +496,7 @@ final class SharedRulesTest extends TestCase
                     return false;
                 }
 
-                $process = proc_open([\PHP_BINARY, __DIR__.'/Fixtures/mark-writer.php', $directory, self::RULES_KEY, \sprintf('%.3F', $atB), $idB], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, ['REDIS_DSN' => Connection::dsn()] + getenv());
+                $process = proc_open([\PHP_BINARY, __DIR__.'/Fixtures/mark-writer.php', $directory, self::RULES_KEY, \sprintf('%.6F', $atB), $idB], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, ['REDIS_DSN' => Connection::dsn()] + getenv());
 
                 // long enough for its write to land, were nothing holding it off
                 usleep(700_000);
@@ -491,7 +515,7 @@ final class SharedRulesTest extends TestCase
             proc_close($process);
             self::assertStringContainsString('written', $output, $output);
 
-            self::assertSame([ceil($atB), $idB], $a->writtenMark(), 'the later mark stays');
+            self::assertSame([ceil($atB * 1000) / 1000, $idB], $a->writtenMark(), 'the later mark stays');
 
             // a worker whose set was read between the two rules
             $third = new VersionedRedisTagAwareAdapter($this->other, self::NAMESPACE, rulesCacheMs: 60_000, rulesCache: $medium);
@@ -513,7 +537,7 @@ final class SharedRulesTest extends TestCase
 
         [$idA, $atA, $idB, $atB, $readAt] = $this->twoRules();
 
-        $process = proc_open([\PHP_BINARY, '-d', 'apc.enable_cli=1', __DIR__.'/Fixtures/racing-apcu-marks.php', self::NAMESPACE, $idA, \sprintf('%.3F', $atA), $idB, \sprintf('%.3F', $atB), \sprintf('%.3F', $readAt)], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, ['REDIS_DSN' => Connection::dsn()] + getenv());
+        $process = proc_open([\PHP_BINARY, '-d', 'apc.enable_cli=1', __DIR__.'/Fixtures/racing-apcu-marks.php', self::NAMESPACE, $idA, \sprintf('%.6F', $atA), $idB, \sprintf('%.6F', $atB), \sprintf('%.6F', $readAt)], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, ['REDIS_DSN' => Connection::dsn()] + getenv());
         self::assertIsResource($process);
         $output = (string) stream_get_contents($pipes[1]);
         $errors = (string) stream_get_contents($pipes[2]);
@@ -524,7 +548,7 @@ final class SharedRulesTest extends TestCase
         $report = json_decode(trim($output), true);
         self::assertIsArray($report, $output.$errors);
 
-        self::assertEquals([ceil($atB), $idB], $report['mark'] ?? null, 'the later mark stays');
+        self::assertEquals([ceil($atB * 1000) / 1000, $idB], $report['mark'] ?? null, 'the later mark stays');
         self::assertFalse($report['hit'] ?? null, 'a worker whose set lacks the later rule is behind');
         self::assertSame(1, $report['attempts'] ?? null, 'and reloads');
     }
@@ -655,16 +679,25 @@ final class SharedRulesTest extends TestCase
         $this->write(new VersionedRedisTagAwareAdapter($this->plain, self::NAMESPACE, rulesCache: false), 'itemB', ['tagB']);
 
         $idA = $this->plain->xAdd(self::RULES_KEY, '*', ['t' => json_encode(['t' => ['tagA']], \JSON_THROW_ON_ERROR), 'first' => '0']);
-        $atA = microtime(true) * 1000;
+        $atA = self::asPassed(microtime(true) * 1000);
         usleep(5_000);
-        $between = microtime(true) * 1000;
+        $between = self::asPassed(microtime(true) * 1000);
         usleep(5_000);
         $idB = $this->plain->xAdd(self::RULES_KEY, '*', ['t' => json_encode(['t' => ['tagB']], \JSON_THROW_ON_ERROR), 'first' => '0']);
-        $atB = microtime(true) * 1000;
+        $atB = self::asPassed(microtime(true) * 1000);
         self::assertIsString($idA);
         self::assertIsString($idB);
 
         return [$idA, $atA, $idB, $atB, $between];
+    }
+
+    /**
+     * $ms as a process given it on its command line reads it back: the same
+     * value on both sides.
+     */
+    private static function asPassed(float $ms): float
+    {
+        return (float) \sprintf('%.6F', $ms);
     }
 
     /**
