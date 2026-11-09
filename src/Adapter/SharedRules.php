@@ -107,7 +107,8 @@ final class SharedRules
 {
     /**
      * How long an entry nobody touches stays in the store. How old the copy
-     * is comes from the read time stored inside it, not from this.
+     * is comes from the read time stored inside it, not from this. The flag
+     * and the note in APCu have no expiry (see raise()).
      */
     public const TTL_SECONDS = 86_400;
 
@@ -438,6 +439,11 @@ final class SharedRules
     /**
      * Raises the integer APCu holds at $key to $value, unless it holds as
      * much already: of two workers raising it at once, the larger value stays.
+     *
+     * The key is written with no expiry. apcu_cas() keeps the expiry an entry
+     * was created with, so with one the key would vanish a day after it was
+     * first written, however often it changed. The flag is written the same
+     * way, for the same reason (see leadInApcu()).
      */
     private static function raise(string $key, int $value): void
     {
@@ -449,7 +455,7 @@ final class SharedRules
             if (true !== $found) {
                 // nothing there yet: add it. Done when that worked, or when the
                 // store refuses writes (the add failed and still nothing is there)
-                if (apcu_add($key, $value, self::TTL_SECONDS) || !apcu_exists($key)) {
+                if (apcu_add($key, $value) || !apcu_exists($key)) {
                     return;
                 }
 
@@ -644,7 +650,7 @@ final class SharedRules
     {
         $key = self::APCU_PREFIX.$this->key.self::SUFFIX_FLAG;
 
-        if (apcu_add($key, $mine, self::TTL_SECONDS)) {
+        if (apcu_add($key, $mine)) {
             return true;
         }
 
@@ -657,7 +663,7 @@ final class SharedRules
                 apcu_delete($key);
             }
 
-            if (apcu_add($key, $mine, self::TTL_SECONDS)) {
+            if (apcu_add($key, $mine)) {
                 return true;
             }
 

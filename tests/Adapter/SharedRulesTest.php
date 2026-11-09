@@ -553,6 +553,42 @@ final class SharedRulesTest extends TestCase
         self::assertSame(1, $report['attempts'] ?? null, 'and reloads');
     }
 
+    public function testTheFlagAndTheNoteHaveNoExpiryInApcu(): void
+    {
+        $default = SharedRules::of(null, self::RULES_KEY, $this->plain);
+
+        if (null === $default) {
+            self::markTestSkipped('APCu is not enabled for this SAPI (apc.enable_cli).');
+        }
+
+        $rules = new InvalidationRules(self::NAMESPACE.':', 60_000);
+        $rules->absorb(['1000-0' => ['t' => '{"t":["a"]}', 'first' => '1']]);
+        $prefix = 'artigo.versioned.'.$default->getKey();
+
+        try {
+            self::assertTrue($default->lead());
+            $default->written(microtime(true) * 1000, '1000-0');
+            $default->written(microtime(true) * 1000, '1001-0');
+            self::assertTrue($default->store($rules, microtime(true) * 1000));
+
+            // apcu_cas() keeps the expiry an entry was created with, so a flag
+            // or a note created with one would vanish a day later, however
+            // often it changed since
+            foreach (['_flag', '_mark_at_us', '_mark_id'] as $suffix) {
+                $info = apcu_key_info($prefix.$suffix);
+                self::assertIsArray($info, $suffix.' is there');
+                self::assertSame(0, $info['ttl'], $suffix.' has no expiry');
+            }
+
+            $info = apcu_key_info($prefix);
+            self::assertIsArray($info, 'the copy is there');
+            self::assertSame(SharedRules::TTL_SECONDS, $info['ttl'], 'the copy keeps its expiry');
+        } finally {
+            $default->release();
+            $default->forget();
+        }
+    }
+
     public function testTheLastAttemptIsRecordedInEitherMedium(): void
     {
         foreach ($this->media() as $medium => [$shared]) {
