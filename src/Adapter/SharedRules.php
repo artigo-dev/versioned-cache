@@ -499,7 +499,8 @@ final class SharedRules
     /**
      * Takes the reload flag for this instance. Returns true when this instance
      * holds it now, false when another worker holds it, and null when the
-     * store refused to record it (a full APCu, a full or read-only disk).
+     * store refused to record it (APCu while another process expunges it, a
+     * pool on a full or read-only disk).
      *
      * @phpstan-impure any worker of the server may take the flag
      */
