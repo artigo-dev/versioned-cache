@@ -172,11 +172,9 @@ use Symfony\Contracts\Cache\ItemInterface;
  * - **Invalidation made elsewhere becomes visible within `rulesCacheMs` plus
  *   a second**, because a copy of the rules is used for that long, and for
  *   up to a second more while another worker reloads it. A read that cannot
- *   promise that is a miss. While the stream cannot be read, or a reload has
- *   run for more than a second, every worker keeps using the copy it has,
- *   whatever its age, and one worker of the server tries the stream again a
- *   second after the last attempt ended. Pass 0 for exact reads, at the
- *   price of a reload for every read that can take the reload flag.
+ *   promise that is a miss, unless Redis is down or a reload hangs (see
+ *   "When something goes wrong" above). Pass 0 for exact reads, at the price
+ *   of a reload for every read that can take the reload flag.
  * - **`$rulesRetentionSeconds` is the maximum item lifetime**, not only the
  *   default. An item must never outlive the rule that made it stale, or it
  *   would come back from the dead once that rule is trimmed away, so a longer
@@ -209,17 +207,16 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     /**
      * Recorded when reading the item failed, so we do not know which version
      * is stored. No stored item ever has this value, so the write that
-     * follows is refused, and the stored value is deleted instead unless get()
-     * computed it after its own miss (see doSave()).
+     * follows is refused (see doSave()).
      */
     private const EPOCH_UNKNOWN = '?';
 
     /**
      * Recorded when a read had no copy of the invalidation rules, so we cannot
      * tell whether the value computed after it is already outdated. That
-     * value is not stored. If get() computed it after a miss, whatever is in
-     * Redis stays; any other write deletes the key, so the old value is not
-     * served (see doSave()).
+     * value is not stored (see doSave()): stored anyway, it would either be
+     * served after a rule that should have made it outdated, or, with every
+     * rule applied to it, replace a stored value that may still be valid.
      */
     private const MARK_UNJUDGED = 'unjudged';
 
@@ -394,9 +391,8 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private bool $alone = false;
 
-    private bool $aloneWarned = false;
-
-    private bool $storeWarned = false;
+    /** @var array<string, true> the warnings this pool instance has logged */
+    private array $warned = [];
 
     /**
      * Whether the connection may answer reads from a replica; null until it is
@@ -465,8 +461,6 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * caller passed false, or passed nothing and APCu is not available.
      */
     private ?SharedRules $sharedRules;
-
-    private bool $ttlWarned = false;
 
     /**
      * @param int                               $rulesRetentionSeconds how long rules - and therefore items - may live
@@ -540,8 +534,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      *   alone (getItem()), which is where the id becomes known. When the call
      *   ends, by return or by throw, the remembered read is forgotten.
      * - When the callback ran after a miss, the write that follows is marked
-     *   as this pool's own computation. If that write is refused, the stored
-     *   key is left alone rather than deleted (see doSave()).
+     *   as this pool's own computation (see doSave()).
      * - If the read missed only because the rules could not be checked (this
      *   worker has no usable copy while another worker reloads them, or no
      *   copy at all while Redis is down), the value is computed without the
@@ -610,8 +603,8 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             if ($armed) {
                 // forget the read it remembered: its write is done, or will
                 // not come
-                if (null !== $armedId = $this->armedId($key)) {
-                    $this->records->drop($armedId);
+                if (isset($this->armed[$key])) {
+                    $this->records->drop($this->armed[$key]);
                 }
 
                 unset($this->armed[$key]);
@@ -647,15 +640,6 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     private function ownComputation(string $id): bool
     {
         return 0 !== (self::GET_OWN & ($this->gets[$id] ?? 0));
-    }
-
-    /**
-     * The id the read of a get() in progress fetched, once that read has
-     * happened.
-     */
-    private function armedId(string $key): ?string
-    {
-        return $this->armed[$key] ?? null;
     }
 
     public function __clone()
@@ -878,12 +862,8 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         }
 
         // warn once per pool instance about a lifetime the retention cuts short
-        if ($lifetime > $this->rulesRetentionSeconds && !$this->ttlWarned) {
-            $this->ttlWarned = true;
-            $this->logger?->warning('A lifetime of {lifetime}s is above rulesRetentionSeconds ({retention}s) and was capped to it; raise the retention to keep items longer.', [
-                'lifetime' => $lifetime,
-                'retention' => $this->rulesRetentionSeconds,
-            ]);
+        if ($lifetime > $this->rulesRetentionSeconds) {
+            $this->warnOnce('ttl', 'A lifetime of {lifetime}s is above rulesRetentionSeconds ({retention}s) and was capped to it; raise the retention to keep items longer.', ['lifetime' => $lifetime, 'retention' => $this->rulesRetentionSeconds]);
         }
 
         // an item must never outlive the rules: no lifetime, or one beyond the
@@ -914,13 +894,6 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             // the read of this key the pool remembers, if any (only with the
             // guard on)
             $record = 0 < $this->guardWindowMs ? $this->records->of($id) : null;
-
-            // a read that had no copy of the rules, or could not read the
-            // item's epoch, refuses the write that follows it. Once that read
-            // is older than the guard window, it refuses this one write and is
-            // then forgotten, so the write after that is a normal one
-            $lapsed = null !== $record && (self::MARK_UNJUDGED === $record[0] || self::EPOCH_UNKNOWN === $record[1]) && $nowMs - $record[2] > $this->guardWindowMs;
-
             $refusal = null;
 
             if (null !== $record) {
@@ -960,16 +933,17 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             }
 
             if (null !== $refusal) {
-                // past the guard window: this was the one refusal, so the read
-                // is forgotten
-                if ($lapsed) {
+                // a read that had no copy of the rules, or could not read the
+                // item's epoch, refuses the write that follows it. Once that
+                // read is older than the guard window, it refuses this one
+                // write and is then forgotten, so the write after that is a
+                // normal one
+                if (null !== $record && $nowMs - $record[2] > $this->guardWindowMs) {
                     $this->records->drop($id);
                 }
 
                 // get() computed this after its own miss: what Redis holds may
-                // still be valid, so it stays. Any other write was meant to
-                // replace the stored value, so that value goes rather than be
-                // served
+                // still be valid, so it stays
                 if ($this->ownComputation($id)) {
                     $failed[] = $id;
                     $this->logger?->info('Refused to save "{key}": {reason}.', ['key' => $id, 'reason' => $refusal, 'cache-adapter' => get_debug_type($this)]);
@@ -1116,11 +1090,8 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         // remembered even on a hit (see get()). That happens even if the item
         // cannot be checked, because a request left pending would apply to the
         // next read of another key inside the callback
-        $arming = null;
-
         if (null !== $this->pendingArm && 1 === \count($ids)) {
-            $arming = $ids[0];
-            $this->armed[$this->pendingArm] = $arming;
+            $this->armed[$this->pendingArm] = $ids[0];
             $this->pendingArm = null;
         }
 
@@ -1146,7 +1117,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         // outdated one: every item is a miss for now, nothing is deleted, and
         // the write that follows is refused (see MARK_UNJUDGED)
         if (null === $rules) {
-            $this->rememberUnjudged($ids);
+            foreach ($ids as $id) {
+                $this->remember($id, self::MARK_UNJUDGED, '');
+            }
 
             return;
         }
@@ -1194,23 +1167,22 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
             // no item, or a tombstone: a miss, and the computation that
             // follows is guarded
-            if (!\is_array($row) || !\is_string($row[self::FIELD_VALUE] ?? null) || !\is_string($row[self::FIELD_TAGS] ?? null)) {
+            if (!\is_array($row) || !\is_string($row[self::FIELD_VALUE] ?? null) || null === $tagged = self::tagsAndMark($row)) {
                 $this->remember($id, $held, $epoch);
 
                 continue;
             }
 
-            $tags = InvalidationRules::strings(json_decode($row[self::FIELD_TAGS], true));
-            $mark = $row[self::FIELD_MARK] ?? null;
+            [$tags, $mark] = $tagged;
 
             // a rule newer than the item's watermark names it: outdated, a
             // miss, and the computation that follows is guarded
-            if ($rules->invalidates($id, $tags, \is_string($mark) ? $mark : InvalidationRules::NONE)) {
+            if ($rules->invalidates($id, $tags, $mark)) {
                 $this->remember($id, $held, $epoch);
 
                 // if only soft rules reached it, within the grace, it is kept
                 // for takeAgedItem() instead of deleted: a miss either way
-                if (null !== $ageMs = $this->softAge($rules, $id, $tags, \is_string($mark) ? $mark : InvalidationRules::NONE)) {
+                if (null !== $ageMs = $this->softAge($rules, $id, $tags, $mark)) {
                     $this->keepAged($id, $row[self::FIELD_VALUE], $tags, $ageMs);
                 } else {
                     $stale[] = $id;
@@ -1236,7 +1208,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
             // a hit forgets an earlier remembered read of the key, unless a
             // get() is reading it and may recompute it anyway
-            if ($id === $arming || \in_array($id, $this->armed, true)) {
+            if (\in_array($id, $this->armed, true)) {
                 $this->remember($id, $held, $epoch);
             } else {
                 $this->records->drop($id);
@@ -1276,15 +1248,11 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             return false;
         }
 
-        $row = $this->redis->hMGet($id, [self::FIELD_TAGS, self::FIELD_MARK]);
-
-        if (!\is_array($row) || !\is_string($row[self::FIELD_TAGS] ?? null)) {
+        if (null === $tagged = self::tagsAndMark($this->redis->hMGet($id, [self::FIELD_TAGS, self::FIELD_MARK]))) {
             return false;
         }
 
-        $tags = InvalidationRules::strings(json_decode($row[self::FIELD_TAGS], true));
-        $mark = $row[self::FIELD_MARK] ?? null;
-        $mark = \is_string($mark) ? $mark : InvalidationRules::NONE;
+        [$tags, $mark] = $tagged;
 
         if ($rules->invalidates($id, $tags, $mark)) {
             if (null === $this->softAge($rules, $id, $tags, $mark)) {
@@ -1463,17 +1431,13 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         $stale = [];
 
         foreach ($ids as $index => $id) {
-            $row = $rows[$index] ?? null;
-
             // not one of this pool's items, or gone between the walk listing
             // it and this read
-            if (!\is_array($row) || !\is_string($row[self::FIELD_TAGS] ?? null)) {
+            if (null === $tagged = self::tagsAndMark($rows[$index] ?? null)) {
                 continue;
             }
 
-            $tags = InvalidationRules::strings(json_decode($row[self::FIELD_TAGS], true));
-            $mark = $row[self::FIELD_MARK] ?? null;
-            $mark = \is_string($mark) ? $mark : InvalidationRules::NONE;
+            [$tags, $mark] = $tagged;
 
             // what only soft rules reached stays for the grace, as a read
             // keeps it for takeAgedItem()
@@ -1777,17 +1741,21 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * allows it (see SharedRules). The first of these situations that applies
      * decides:
      *
-     * - This worker's copy was read less than $rulesCacheMs ago and is not
-     *   missing an invalidation made on this server: it is used, with no call
-     *   to Redis. Never with exact reads ($rulesCacheMs = 0).
+     * - This worker's copy, or a newer one another worker shared, was read
+     *   less than $rulesCacheMs ago and is not missing an invalidation made on
+     *   this server: it is used, with no call to Redis. Never with exact reads
+     *   ($rulesCacheMs = 0).
      * - Redis is down (the last attempt to fetch the rules failed), or another
      *   worker's reload has run longer than SLOW_RELOAD_MS: the copy is used
-     *   whatever its age. With no copy, every item is a miss computed without
-     *   the lock. One worker tries Redis again once nobody holds the reload
-     *   flag and RETRY_MS has passed since the last attempt ended.
-     * - Nobody holds the reload flag: this worker takes it and reloads the
-     *   copy (see reload()). If that fetch fails, the server is in an outage.
-     * - Another worker's reload has run for at most SLOW_RELOAD_MS: a copy
+     *   whatever its age, even one missing an invalidation made on this
+     *   server. With no copy, every item is a miss computed without the lock.
+     *   One worker tries Redis again once nobody holds the reload flag and
+     *   RETRY_MS has passed since the last attempt ended.
+     * - Nobody holds the reload flag: this worker takes it, reloads the copy
+     *   (see reload()) and uses what it then holds. If that fetch fails, the
+     *   server is in an outage, as in the case above.
+     * - Another worker's reload has run for at most SLOW_RELOAD_MS, or it took
+     *   the flag just before this worker could. Nobody waits for it: a copy
      *   read no more than $rulesCacheMs plus SLOW_RELOAD_MS ago, and not
      *   missing an invalidation made on this server, is used, with exact reads
      *   too. Otherwise every item is a miss computed without the lock, until
@@ -1803,53 +1771,38 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private function rules(): array
     {
-        // this worker's copy is recent and not missing an invalidation made on
-        // this server: use it, without asking anyone
+        // a recent copy: this worker's own
         if (null !== $this->rules && $this->rulesAreFresh()) {
             return [$this->rules, false];
         }
 
-        // another worker may have shared a newer copy: take it over, and use
-        // it if it is recent
+        // or a newer one another worker shared, taken over here
         if (null !== $this->sharedRules && $this->adoptSharedRules($this->sharedRules) && $this->rulesAreFresh()) {
             return [$this->rules, false];
         }
 
-        // the copy is too old, lacks an invalidation made here, or is missing.
-        // Look at the server: did the last attempt to fetch the rules fail (an
-        // outage), and is another worker reloading right now, since when?
+        // did the last attempt to fetch the rules fail, and is another worker
+        // reloading right now, since when?
         [$outage, $endedAtMs] = $this->lastAttempt();
         $startedAtMs = $this->sharedRules?->reloadStartedAt();
         $nowMs = microtime(true) * 1000;
 
-        // Redis is down, or another worker's reload has hung for more than
-        // SLOW_RELOAD_MS: both count as an outage
+        // an outage: Redis is down, or another worker's reload hangs
         if ($outage || (null !== $startedAtMs && $nowMs - $startedAtMs > self::SLOW_RELOAD_MS)) {
-            // nobody is reloading and RETRY_MS has passed since the last
-            // attempt ended: this worker tries Redis again
+            // the one worker that tries Redis again
             if (null === $startedAtMs && $this->retryDue($endedAtMs)) {
                 $this->reload();
             }
 
-            // use whatever copy is held now, however old, even one that lacks
-            // an invalidation made here. With none, every item is a miss,
-            // computed without the lock
             return [$this->rules, null === $this->rules];
         }
 
-        // nobody is reloading: this worker takes the flag and reloads, then
-        // uses what it holds. A reload that failed leaves the server in an
-        // outage, with or without a copy to use; with none, every item is a
-        // miss, computed without the lock
+        // nobody is reloading: this worker does
         if (null === $startedAtMs && $this->reload()) {
             return [$this->rules, null === $this->rules];
         }
 
-        // another worker is reloading, for at most SLOW_RELOAD_MS so far, or
-        // took the flag just before this one could. Nobody waits for it. A
-        // copy read at most SLOW_RELOAD_MS past $rulesCacheMs, and not missing
-        // an invalidation made here, is used. With any other copy, or none,
-        // every item is a miss, computed without the lock
+        // another worker is reloading
         return [$this->rules, !$this->judgesWhileReloading()];
     }
 
@@ -1859,9 +1812,6 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * as read at the moment the fetch began. The new copy is stored for the
      * other workers. When the stream was lost and started again, it replaces
      * theirs even though its ids look older.
-     *
-     * If the store refuses to record the flag, this worker loads the rules on
-     * its own: it fetches, but shares and records nothing.
      *
      * Returns false when another worker holds the flag. Returns true when
      * what this worker holds now is what the read should use: the reloaded
@@ -1875,32 +1825,25 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         $shared = $this->sharedRules;
         $taken = null !== $shared ? $shared->lead() : true;
 
-        // another worker holds the flag: leave the reload to it
         if (false === $taken) {
             return false;
         }
 
         // the store could not record the flag (a full APCu, a full or
         // read-only disk). Left at that, nobody would ever reload, and every
-        // read would be a miss for good. So this worker loads the rules
-        // itself, shares nothing, keeps its outage state to itself, and warns
-        // once per pool instance
+        // read would be a miss for good. So this worker loads the rules on its
+        // own (see $alone), and warns once per pool instance
         $this->alone = null === $taken;
 
         if ($this->alone) {
             $shared = null;
-
-            if (!$this->aloneWarned) {
-                $this->aloneWarned = true;
-                $this->logger?->warning('The rule set store refused the reload flag: this worker loads the invalidation rules on its own and shares nothing until the store can be written.', ['cache-adapter' => get_debug_type($this)]);
-            }
+            $this->warnOnce('alone', 'The rule set store refused the reload flag: this worker loads the invalidation rules on its own and shares nothing until the store can be written.', ['cache-adapter' => get_debug_type($this)]);
         }
 
         try {
             // between this worker's look at the flag and taking it, another
-            // worker may have finished a reload. If it shared a recent copy,
-            // take that over and stop. If it tried and failed less than
-            // RETRY_MS ago, do not try again yet: keep the copy held
+            // worker may have finished a reload: its recent copy is taken
+            // over, and its failed attempt is not repeated before RETRY_MS
             if (null !== $shared) {
                 if ($this->adoptSharedRules($shared) && $this->rulesAreFresh()) {
                     return true;
@@ -2156,12 +2099,20 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private function stored(?bool $stored): void
     {
-        if (null !== $stored || $this->storeWarned) {
-            return;
+        if (null === $stored) {
+            $this->warnOnce('store', 'The rule set store refused the rule set: the other workers of this server keep judging by the older one until it can be written.', ['cache-adapter' => get_debug_type($this)]);
         }
+    }
 
-        $this->storeWarned = true;
-        $this->logger?->warning('The rule set store refused the rule set: the other workers of this server keep judging by the older one until it can be written.', ['cache-adapter' => get_debug_type($this)]);
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function warnOnce(string $name, string $message, array $context): void
+    {
+        if (!isset($this->warned[$name])) {
+            $this->warned[$name] = true;
+            $this->logger?->warning($message, $context);
+        }
     }
 
     /**
@@ -2228,8 +2179,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private function judgesWhileReloading(): bool
     {
-        return null !== $this->rules
-            && null !== $this->rulesReadAt
+        return null !== $this->rulesReadAt
             && microtime(true) * 1000 - $this->rulesReadAt <= $this->rulesCacheMs + self::SLOW_RELOAD_MS
             && !$this->behindLocalInvalidation();
     }
@@ -2243,7 +2193,8 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * because a copy's read time is taken before its fetch begins, and the
      * note's time after Redis replied. A copy that ends at or after the rule
      * holds it too, since the rule was added from Redis's reply. Holding no
-     * copy does not count: there is nothing to use anyway.
+     * copy does not count: there is nothing to use anyway. A copy is never
+     * held without its read time.
      *
      * The local-invalidation note holds the largest time and the largest rule
      * id of the invalidations made here, which may come from two different
@@ -2264,7 +2215,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         [$atMs, $id] = $this->newestWritten();
 
         return null !== $atMs
-            && (null === $this->rulesReadAt || $this->rulesReadAt <= $atMs)
+            && $this->rulesReadAt <= $atMs
             && InvalidationRules::isNewerId($id, $this->rules->last());
     }
 
@@ -2394,21 +2345,20 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
-     * Remembers reads made with no copy of the rules, so the write that
-     * follows each is refused (see doSave()). Nothing can tell which rules a
-     * value computed after such a read has seen. If it were stored anyway, it
-     * would either be served after a rule that should have made it outdated,
-     * or, with every rule applied to it, replace a stored value that may still
-     * be valid. So when get() computed it after its own miss, whatever is in
-     * Redis stays, and a write meant to replace the stored value deletes it.
+     * The tags and the watermark a read found, or null when it found no hash
+     * with tags: no item, a tombstone, or a key that is not an item.
      *
-     * @param list<string> $ids
+     * @return array{list<string>, string}|null
      */
-    private function rememberUnjudged(array $ids): void
+    private static function tagsAndMark(mixed $row): ?array
     {
-        foreach ($ids as $id) {
-            $this->remember($id, self::MARK_UNJUDGED, '');
+        if (!\is_array($row) || !\is_string($row[self::FIELD_TAGS] ?? null)) {
+            return null;
         }
+
+        $mark = $row[self::FIELD_MARK] ?? null;
+
+        return [InvalidationRules::strings(json_decode($row[self::FIELD_TAGS], true)), \is_string($mark) ? $mark : InvalidationRules::NONE];
     }
 
     /**
