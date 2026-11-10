@@ -39,9 +39,10 @@ use Symfony\Component\Cache\Marshaller\MarshallerInterface;
  * a miss. That covers:
  *
  * - a header that sets the reserved bit;
- * - a header that states no content size, a size of 0, or a size above
- *   $maxLength (zstd_uncompress() allocates what the header states before it
- *   inflates anything);
+ * - a header that states no content size, a size of 0, a size above
+ *   $maxLength, or one of 4 GiB or more whatever $maxLength says
+ *   (zstd_uncompress() allocates what the header states before it inflates
+ *   anything);
  * - blocks that do not end exactly where the value does: a frame cut short,
  *   or a second frame, a skippable frame or any other bytes after it;
  * - a frame that does not inflate to the size it states.
@@ -210,8 +211,8 @@ final class ZstdMarshaller implements MarshallerInterface
     }
 
     /**
-     * The content size a frame header states, null where it states none
-     * (RFC 8878, 3.1.1.1).
+     * The content size a frame header states, null where it states none or
+     * one of 4 GiB or more (RFC 8878, 3.1.1.1).
      */
     private static function contentSize(string $frame): ?int
     {
@@ -235,12 +236,16 @@ final class ZstdMarshaller implements MarshallerInterface
             return null;
         }
 
-        $field = unpack([1 => 'C', 2 => 'v', 4 => 'V', 8 => 'P'][$sizeBytes], $frame, $offset);
+        // an eight-byte field is read as two four-byte halves, low first:
+        // unpack('P') throws on a 32-bit PHP
+        $field = unpack([1 => 'C', 2 => 'v', 4 => 'V', 8 => 'V2'][$sizeBytes], $frame, $offset);
         $size = \is_array($field) && \is_int($field[1] ?? null) ? $field[1] : -1;
+        $upper = 8 === $sizeBytes && \is_array($field) ? ($field[2] ?? -1) : 0;
 
-        // a two-byte field counts from 256
         return match (true) {
-            $size < 0 => null,
+            // a non-zero upper half is 4 GiB or more: too large, whatever the cap
+            $size < 0, 0 !== $upper => null,
+            // a two-byte field counts from 256
             2 === $sizeBytes => $size + 256,
             default => $size,
         };

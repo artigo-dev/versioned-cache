@@ -101,11 +101,13 @@ trait FakeServer
     {
         $rule = \is_string($args[1] ?? null) ? $args[1] : '{}';
 
-        // the guarded write: lands where the epoch is the one the read saw
+        // the guarded write: refused where the key holds an epoch other than
+        // the one the read saw; a key without one takes it
         if (str_contains($script, "'HGET', KEYS[1], 'e'")) {
             $key = \is_string($args[0] ?? null) ? $args[0] : '';
+            $held = $this->items[$key]['e'] ?? null;
 
-            if (($this->items[$key]['e'] ?? '') !== ($args[4] ?? null)) {
+            if (null !== $held && $held !== ($args[4] ?? null)) {
                 return 0;
             }
 

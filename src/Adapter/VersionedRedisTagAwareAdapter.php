@@ -60,7 +60,8 @@ use Symfony\Contracts\Cache\ItemInterface;
  * - If an item is invalidated while a value for it is being computed, the
  *   write carries the watermark of the read made before the computation, so
  *   the next read finds it outdated. If the item is deleted meanwhile, the
- *   write is refused. This is the invalidation guard.
+ *   write is refused, as long as the delete is less than $guardWindowSeconds
+ *   old. This is the invalidation guard.
  *
  * Read more in the README: "Tag invalidation that never gets slower", "The
  * rule set a read is judged against", "The shared rule set while it reloads"
@@ -130,12 +131,16 @@ use Symfony\Contracts\Cache\ItemInterface;
  * A write that follows a read is guarded (see get() and MissRecords). Every
  * write gives the item a new epoch, a random token in its own field. A delete
  * leaves a tombstone: for $guardWindowSeconds the key holds a new epoch and
- * nothing else. The write that follows a miss is stored only if the item's
- * epoch is still the one the miss saw. One script does that check and the
- * write, and it is the only script on the write path. A write refused that
- * way answers false. Together with the read's watermark, this means a value
- * computed from data that was deleted or invalidated while it was computed is
- * never stored as fresh. A value is not stored at all when nothing can tell
+ * nothing else. The write that follows a miss is refused if the key holds an
+ * epoch other than the one the miss saw, and stored if it holds that one or
+ * none. One script does that check and the write, and it is the only script
+ * on the write path. A write refused that way answers false. Together with
+ * the read's watermark, this means a value computed from data that was
+ * invalidated while it was computed is never stored as fresh, nor one
+ * computed across a delete less than $guardWindowSeconds before its write.
+ * A delete older than that has left no epoch to refuse it, so the window
+ * has to be longer than the longest computation; a tag invalidation needs
+ * no such bound. A value is not stored at all when nothing can tell
  * which rules it has seen: when it follows a read that had no copy of the
  * rules, when it is written while no copy is held, or when it follows a read
  * of the item that failed. get() still returns it. If get() computed it after
@@ -198,16 +203,17 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
     /**
      * The epoch field: a new random token on every write and every delete. A
-     * write that follows a read is stored only if the item still holds the
-     * token the read saw, so it is refused after a write or a delete in
-     * between.
+     * write that follows a read is refused where the item holds a token other
+     * than the one the read saw, so it is refused after a write or a delete
+     * in between, for as long as that token lives: the guard window at least.
      */
     private const FIELD_EPOCH = 'e';
 
     /**
      * Recorded when reading the item failed, so we do not know which version
-     * is stored. No stored item ever has this value, so the write that
-     * follows is refused (see doSave()).
+     * is stored. The write that follows is refused in PHP, before any script
+     * runs (see doSave()): the guarded write takes a key that holds no epoch,
+     * so it would store that write there.
      */
     private const EPOCH_UNKNOWN = '?';
 
@@ -307,9 +313,13 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         LUA;
 
     /**
-     * The write that follows a read. It writes only if the item's epoch is
-     * still the one the read saw (an empty one, if the item had none), and
-     * then writes what a plain write writes, with the read's watermark. No
+     * The write that follows a read. It refuses where the key holds an epoch
+     * other than the one the read saw (an empty one, if the item had none):
+     * somebody deleted or wrote the item since. Otherwise it writes what a
+     * plain write writes, with the read's watermark. A key that holds no
+     * epoch at all takes the write: every delete and every write leaves one
+     * for at least the guard window, so none came within the window before
+     * this write, and an epoch that ran out by itself refuses nothing. No
      * single hash command can compare one field and set others, hence a
      * script. Its arguments are the value, the tags, the watermark, the epoch
      * the read saw, a new epoch, the TTL and the guard window (both in
@@ -320,9 +330,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * expired.
      */
     private const SCRIPT_GUARDED_WRITE = <<<'LUA'
-        local seen = redis.call('HGET', KEYS[1], 'e') or ''
+        local seen = redis.call('HGET', KEYS[1], 'e')
 
-        if seen ~= ARGV[4] then
+        if seen and seen ~= ARGV[4] then
             return 0
         end
 
@@ -774,9 +784,11 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * which is harmless.
      *
      * Between reading an item's watermark and unlinking it, a writer may put
-     * a fresh item in its place, which is then unlinked too: one extra miss. A
-     * computation that read the item before has its write refused, because
-     * the epoch it saw is gone: the safe direction.
+     * a fresh item in its place, which is then unlinked too: one extra miss.
+     * A delete in that instant loses its tombstone the same way. Either way
+     * the epoch they left is gone, so a computation that read the item before
+     * has its write stored, as after a delete older than the guard window:
+     * the bound the guard has anyway, which a walk from a cron meets rarely.
      *
      * A pool with no namespace has no keys of its own to name, so the walk
      * covers the whole database and checks every hash in it, as Symfony's own
@@ -827,8 +839,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * Writes the items, each in one of three ways.
      *
      * - After a read of this pool that had a copy of the rules: the guarded
-     *   write. It is stored only if the item's epoch is still the one the read
-     *   saw, and it carries the read's watermark.
+     *   write. It is refused if the item holds an epoch other than the one
+     *   the read saw, stored if it holds that one or none, and it carries the
+     *   read's watermark.
      * - After no read of this pool: a plain write, which carries the last
      *   rule id of this worker's copy of the rules as its watermark.
      * - After a read that had no copy of the rules, or that failed to read the
@@ -899,14 +912,16 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             if (null !== $record) {
                 [$recordMark, $seen] = $record;
 
+                // refused here, not by the script: the script takes a key
+                // without an epoch, and would store this write there
                 if (self::EPOCH_UNKNOWN === $seen) {
                     $refusal = 'the read before it could not learn the stored epoch';
                 } elseif (self::MARK_UNJUDGED === $recordMark) {
                     $refusal = 'no invalidation rules were held for the read before it';
                 } else {
                     // the usual write after a read of this pool: the guarded
-                    // write, stored only if the item's epoch is still the one
-                    // the read saw, and carrying the read's watermark
+                    // write, refused where the item holds an epoch other than
+                    // the one the read saw, and carrying the read's watermark
                     $first[$id] = \count($calls);
                     $guarded[$id] = [$id, $value, $encodedTags, $recordMark, $seen, self::epoch(), (string) $ttl, (string) $this->guardWindowMs];
                     $calls[] = ['evalSha', self::guardedWriteSha(), $guarded[$id], 1];
@@ -1058,7 +1073,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             $failed[] = $id;
 
             if (0 === $result) {
-                $this->logger?->info('Refused to save "{key}": it was invalidated while it was computed.', ['key' => $id, 'cache-adapter' => get_debug_type($this)]);
+                $this->logger?->info('Refused to save "{key}": it was deleted or written by somebody else while it was computed.', ['key' => $id, 'cache-adapter' => get_debug_type($this)]);
             }
         }
 
@@ -1446,10 +1461,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             }
         }
 
-        // an unlink is enough, no tombstone: if a live item is unlinked while
-        // a computation of it runs, the computation's write finds no epoch
-        // where it expected one, and is refused. And prune() runs from a cron,
-        // so that race is rare
+        // an unlink is enough, no tombstone: no data changed, and the write of
+        // a computation that read the item carries its read's watermark, which
+        // the rules still judge. A delete or a write of the key in the instant
+        // since the read above loses its epoch here too, and a computation
+        // across it is then stored, as after a delete older than the guard
+        // window. prune() runs from a cron, so that race is rare
         return [] === $stale || $this->unlink($stale);
     }
 

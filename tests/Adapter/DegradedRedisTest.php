@@ -299,6 +299,23 @@ final class DegradedRedisTest extends TestCase
         self::assertSame(0, $redis->exists('degraded:k'), 'a tombstone cannot be put on it, so it goes');
     }
 
+    public function testAWriteAfterAFailedReadOfAKeyWithoutAnEpochIsRefused(): void
+    {
+        // every connection first: opening one sweeps what the others wrote
+        $redis = $this->open(DeadPipelineRedis::class);
+        $reads = $this->open(\Redis::class);
+
+        // the key holds nothing, and the read of it never comes back
+        $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false);
+        $redis->dead = true;
+        $item = $pool->getItem('k');
+        $redis->dead = false;
+
+        // the guarded write would take a key without an epoch: the refusal is the pool's own
+        self::assertFalse($pool->save($item->set('computed after a failed read')));
+        self::assertSame(['e'], array_keys((array) $reads->hGetAll('degraded:k')), 'a tombstone, not the value');
+    }
+
     public function testADoubtfulReadPastTheWindowRefusesTheWriteAfterItOnce(): void
     {
         // every connection first: opening one sweeps what the others wrote

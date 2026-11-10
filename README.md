@@ -540,7 +540,10 @@ pool's keys with `SCAN` in batches of a thousand, reads each item's tags and
 watermark, asks the rules the same question a read asks, and unlinks what a
 read would drop. An item a [soft invalidation](#soft-invalidation) reached
 stays for its grace, as a read keeps it. Tombstones left by the
-[guard](#the-invalidation-guard) are left alone and expire by themselves. A
+[guard](#the-invalidation-guard) are left alone and expire by themselves,
+except one that a delete leaves in the instant between the walk's read of an
+item and its unlink: it goes with the item, and a computation that runs across
+that delete is then stored, as after a delete older than the guard window. A
 rule appended during the walk is not applied this time, and an item written
 during it is newer than every rule in the snapshot, so it cannot be judged
 stale: either way of being out of date keeps an item that could have gone.
@@ -592,19 +595,22 @@ article.
   outright: `save()` answers `false`, and the next read computes afresh.
 
 So the guard closes the race: a value computed across an invalidation is never
-served past it. The price is two more commands on the write that follows a
-miss, three commands instead of one for a delete, and a tombstone per deleted
-key for the window.
+served as fresh past it. The price is two more commands on the write that
+follows a miss, three commands instead of one for a delete, and a tombstone
+per deleted key for the window.
 
 **How it works.** **Every write leaves an epoch**, a random token in a fourth
 field. **A delete leaves a tombstone**: for `guardWindowSeconds` (60) the key
 holds a fresh epoch and nothing else, which every read takes for a miss.
-**The write that follows a read of this pool is one script**, which lands
-only where the epoch is still the one the read saw, and stamps the item with
-the rule its read was judged against rather than with the stream's head. So a
-delete during the computation refuses the write, and a tag invalidation or a
-clear during it is newer than the stamp: the write lands, and the next read
-finds it stale.
+**The write that follows a read of this pool is one script**, which refuses
+where the key holds an epoch other than the one the read saw, lands where it
+holds that one or none, and stamps the item with the rule its read was judged
+against rather than with the stream's head. So a delete during the
+computation refuses the write while its tombstone lasts, and a tag
+invalidation or a clear during it is newer than the stamp: the write lands,
+and the next read finds it stale. A key with no epoch at all was not deleted
+or written within the window, since both leave one for that long: the epoch
+the read saw ran out by itself, and the write lands.
 
 The script goes out as `EVALSHA`; where the server does not hold it — after a
 `SCRIPT FLUSH`, a restart or a failover — it goes again as `EVAL`, once per
@@ -647,9 +653,9 @@ past it the oldest single reads go first and their writes go out plain.
 **What callers notice.**
 
 - `save()` and `commit()` answer `false` for a refused write; the adapter logs
-  one info line, "Refused to save …: it was invalidated while it was
-  computed", and Symfony its usual warning for a failed save. `get()` still
-  returns the value it computed, and on Symfony 8.2 sets
+  one info line, "Refused to save …: it was deleted or written by somebody
+  else while it was computed", and Symfony its usual warning for a failed
+  save. `get()` still returns the value it computed, and on Symfony 8.2 sets
   `ItemInterface::METADATA_SAVE_FAILED`. Symfony does not retry an id reported
   as failed, and the read stays remembered, so saving the same item again is
   refused too: read it again first.
@@ -666,9 +672,21 @@ past it the oldest single reads go first and their writes go out plain.
 
 **Where it stops.**
 
-- A computation longer than the window writes after the tombstone has gone,
-  so a delete during it is not seen. A rule during it still is: the stamp is
-  the read's.
+- A delete is seen by every write made within the guard window after it. If
+  a value can take longer than the guard window to compute, raise the window
+  above it: a computation that outlasts it writes after the tombstone has
+  gone, and a delete early in it is not seen. Tag invalidations and `clear()`
+  are always seen, whatever the computation takes: the stamp is the read's.
+- `prune()` can remove a tombstone that a delete left a moment earlier, in the
+  instant between its read of the item and its unlink. That is the same bound:
+  a computation across that delete is stored.
+- A pool instance with `guardWindowSeconds: 0` on the same keys deletes with
+  `UNLINK`, which takes the tombstone away too, and writes without a new
+  epoch. A guarded instance does not see those deletes and writes: give every
+  instance of a pool the same window.
+- A value computed across a soft invalidation reads as stale, but within the
+  grace it can be served aged, as any value a soft rule reached
+  ([soft invalidation](#soft-invalidation)).
 - One pool shared by coroutines (Swoole, AMPHP): one coroutine's invalidation
   moves another's read on. One pool per request has no such interleaving.
 - `ChainAdapter::get()` reaches the last pool of its chain through `getItem()`
@@ -870,7 +888,7 @@ believed: the same range is asked of the primary before anything is dropped.
 | `HMGET` (a read) | a replica | an item looks older, or missing: a miss where the primary has a hit, never a value the set has invalidated |
 | `XRANGE` (a rule fetch) | a replica | a rule arrives late by the lag, on top of `rulesCacheMs` |
 | `EVAL` (an invalidation, a confirmation) | the primary | nothing |
-| `EVALSHA` (the write that follows a read) | the primary | a read that saw an older epoch, or no tombstone, makes the write refuse: never land where it should not |
+| `EVALSHA` (the write that follows a read) | the primary | a read that saw an older epoch, or missed a tombstone, makes the write refuse while the primary holds the newer one: it never lands where a write after a read of the primary would not |
 | `HSETEX`, `EXPIRE`, `HDEL`, `UNLINK` (writes) | the primary | nothing |
 
 So a lagging replica can make a read stricter, or an invalidation later by the
@@ -1032,9 +1050,9 @@ miss (Symfony's own adapters log the failed unserialize), so moving a pool
 from one to the other is a cold cache. A value that begins with the magic
 number is read as exactly one frame, the way the marshaller writes it, and
 refused, so read as a miss, where it is anything else: where the header sets
-the reserved bit; where it states no size, a size of 0 or more than
-`maxLength` (16 MiB; longer values are stored raw), checked before inflating
-because the extension reserves the stated size first; where the frame's
+the reserved bit; where it states no size, a size of 0, 4 GiB or more, or more
+than `maxLength` (16 MiB; longer values are stored raw), checked before
+inflating because the extension reserves the stated size first; where the frame's
 blocks, followed to the last one, do not end exactly where the value does (a
 frame cut short, a second frame, a skippable frame or any other bytes after
 it), which `zstd_uncompress()` alone would not notice; and where the frame
