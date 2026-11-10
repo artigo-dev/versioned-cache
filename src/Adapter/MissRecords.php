@@ -15,10 +15,10 @@ namespace Artigo\Cache\Adapter;
  * What a pool remembers of the reads that a write may follow. Per id: the
  * watermark the write will carry (the last rule id of the copy of the rules
  * the read used), the epoch the item carried (empty when it had none), and
- * when the read was made. The write that follows is stored only if the
- * item's epoch is still the same. It carries the read's watermark rather
- * than the newest id in the stream, so a rule appended meanwhile still makes
- * it outdated.
+ * when the read was made. The write that follows is refused if the item
+ * holds another epoch by then, and stored if it holds the same one or none.
+ * It carries the read's watermark rather than the newest id in the stream,
+ * so a rule appended meanwhile still makes it outdated.
  *
  * The map is kept in the order the reads were made. Once it holds more than
  * CAP records besides the largest single fetch, the oldest go first. So a

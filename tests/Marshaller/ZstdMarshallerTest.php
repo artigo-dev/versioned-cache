@@ -242,6 +242,25 @@ final class ZstdMarshallerTest extends TestCase
         self::assertSame($value, (new ZstdMarshaller(new PassThroughMarshaller()))->unmarshall($frame));
     }
 
+    public function testAnEightByteSizeIsReadInTwoHalves(): void
+    {
+        // zstd_compress() writes an eight-byte size only past 4 GiB: a frame
+        // stating $upper * 4 GiB plus the value's length, one raw block, the last
+        $value = self::text(1_000);
+        $frame = static fn (int $upper): string => self::MAGIC."\xE0".pack('VV', \strlen($value), $upper) // an eight-byte size, a single segment
+            .substr(pack('V', \strlen($value) << 3 | 1), 0, 3).$value;
+        $marshaller = new ZstdMarshaller(new PassThroughMarshaller(), maxLength: \PHP_INT_MAX);
+
+        self::assertSame($value, zstd_uncompress($frame(0)), 'the extension reads it');
+        self::assertSame($value, $marshaller->unmarshall($frame(0)), 'an upper half of zero: the lower half is the size');
+
+        // refused before anything is inflated, and with no Error on a 32-bit PHP
+        $this->expectException(\DomainException::class);
+        $this->expectExceptionMessage('states no content size or one out of bounds');
+
+        $marshaller->unmarshall($frame(1));
+    }
+
     public function testAValueBeginningWithASkippableFrameIsNotReadAsAFrame(): void
     {
         // only the zstd magic number marks a frame, so the frame behind is not inflated

@@ -19,7 +19,8 @@ use Symfony\Contracts\Cache\ItemInterface;
 
 /**
  * The write that follows a read: it must never store, as fresh, a value
- * computed from data that was deleted or invalidated while it was computed.
+ * computed from data that was invalidated while it was computed, or deleted
+ * less than the guard window before the write.
  *
  * Two adapters over two connections stand for two processes: A reads and
  * computes, B deletes or invalidates meanwhile. A third connection looks at
@@ -301,6 +302,119 @@ final class InvalidationGuardTest extends TestCase
         self::assertFalse($a->getItem('k')->isHit(), 'but it is stamped where its read was, and the rule judges it');
     }
 
+    public function testAComputationThatOutlastsTheTombstoneItsReadSawIsStored(): void
+    {
+        // a delete, then a read that sees its tombstone
+        $this->pool($this->b, 1)->deleteItem('k');
+        self::assertSame(['e'], array_keys((array) $this->raw->hGetAll('guard:k')));
+        $a = $this->pool($this->a, 1);
+        $item = $a->getItem('k');
+
+        // nothing happens while it computes, for longer than the window
+        $this->waitForTheEpochToRunOut();
+
+        self::assertTrue($a->save($item->set('computed after the delete')), 'nothing was deleted or written since the read');
+        self::assertSame('computed after the delete', $this->pool($this->raw)->getItem('k')->get());
+    }
+
+    public function testAComputationThatOutlastsTheEpochOfTheOutdatedItemItReadIsStoredAtOnce(): void
+    {
+        $b = $this->pool($this->b, 1);
+        self::assertTrue($b->save($b->getItem('k')->set('before the rule')->tag('t')));
+        self::assertTrue($b->invalidateTags(['t']));
+
+        // the read finds it outdated and drops it: its epoch stays for the window only
+        $a = $this->pool($this->a, 1);
+        $item = $a->getItem('k');
+        self::assertFalse($item->isHit());
+        self::assertSame(['e'], array_keys((array) $this->raw->hGetAll('guard:k')));
+
+        $this->waitForTheEpochToRunOut();
+
+        self::assertTrue($a->save($item->set('computed after the rule')->tag('t')), 'stored the first time, not computed twice');
+        self::assertSame('computed after the rule', $this->pool($this->raw)->getItem('k')->get(), 'and fresh: its read saw the rule');
+    }
+
+    public function testAnEpochThatRunsOutUnderAYoungReadRefusesNothing(): void
+    {
+        // a delete with a window of a second, and a read near its end that
+        // sees the tombstone
+        $before = $this->serverTime();
+        $this->pool($this->b, 1)->deleteItem('k');
+        $this->waitUntil($before + 0.7);
+        self::assertSame(['e'], array_keys((array) $this->raw->hGetAll('guard:k')));
+        $a = $this->pool($this->a, 1);
+        $read = $this->serverTime();
+        $item = $a->getItem('k');
+
+        // the write comes just after the tombstone ran out
+        $this->waitForTheEpochToRunOut();
+
+        self::assertLessThan($read + 1.0, $this->serverTime(), 'the read is younger than the window');
+        self::assertTrue($a->save($item->set('computed after the delete')));
+        self::assertSame('computed after the delete', $this->pool($this->raw)->getItem('k')->get());
+    }
+
+    public function testADeleteWhoseTombstoneIsStillThereRefusesAComputationLongerThanTheWindow(): void
+    {
+        // the reader's window is a second, the deleter's a minute
+        $a = $this->pool($this->a, 1);
+        $item = $a->getItem('k');
+
+        $this->waitPast(1.2);
+        $this->pool($this->b)->deleteItem('k');
+
+        self::assertFalse($a->save($item->set('computed before the delete')), 'the tombstone is still there, however old the read');
+        self::assertFalse($this->pool($this->raw)->getItem('k')->isHit(), 'and the next read computes afresh');
+    }
+
+    public function testADeleteOlderThanTheWindowAtTheWriteIsNotSeen(): void
+    {
+        // the read sees an epoch: the tombstone of an earlier delete
+        $b = $this->pool($this->b, 1);
+        $b->deleteItem('k');
+        $a = $this->pool($this->a, 1);
+        $item = $a->getItem('k');
+
+        // a delete during the computation, which then outlasts the window
+        $b->deleteItem('k');
+        $this->waitForTheEpochToRunOut();
+
+        // the bound the README states: raise the window above the longest computation
+        self::assertTrue($a->save($item->set('computed before the delete')), 'no epoch is left to tell of the delete');
+        self::assertSame('computed before the delete', $this->pool($this->raw)->getItem('k')->get());
+    }
+
+    public function testAClearDuringAComputationWhoseEpochRanOutIsStoredAndNeverServed(): void
+    {
+        // the read sees the tombstone of a delete, which runs out while it computes
+        $b = $this->pool($this->b, 1);
+        $b->deleteItem('k');
+        $a = $this->pool($this->a, 1);
+        $item = $a->getItem('k');
+
+        self::assertTrue($b->clear());
+        $this->waitForTheEpochToRunOut();
+
+        self::assertTrue($a->save($item->set('computed before the clear')), 'a clear touches no key, so nothing refuses it');
+        self::assertFalse($this->pool($this->raw)->getItem('k')->isHit(), 'but the clear is newer than its stamp');
+    }
+
+    public function testAWriteFromElsewhereRefusesAComputationLongerThanTheWindow(): void
+    {
+        $a = $this->pool($this->a, 1);
+        $item = $a->getItem('k');
+
+        // the computation outlasts the window; meanwhile another pool writes
+        // the item without reading it
+        $this->waitPast(1.2);
+        $through = $this->pool(Connection::open())->getItem('k');
+        self::assertTrue($this->pool($this->b)->save($through->set('newer')));
+
+        self::assertFalse($a->save($item->set('older')), 'the newer value\'s epoch is still there, however old the read');
+        self::assertSame('newer', $this->pool($this->raw)->getItem('k')->get());
+    }
+
     public function testTheBatchPathIsGuarded(): void
     {
         $a = $this->pool($this->a);
@@ -492,6 +606,21 @@ final class InvalidationGuardTest extends TestCase
     {
         while ($this->serverTime() < $deadline) {
             usleep(50_000);
+        }
+    }
+
+    /**
+     * Waits until the epoch of guard:k has run out, five seconds at most. An
+     * expired field shows as gone once it is read.
+     */
+    private function waitForTheEpochToRunOut(): void
+    {
+        $deadline = microtime(true) + 5;
+
+        while (true === $this->raw->hExists('guard:k', 'e')) {
+            self::assertLessThan($deadline, microtime(true), 'the epoch runs out');
+
+            usleep(20_000);
         }
     }
 
