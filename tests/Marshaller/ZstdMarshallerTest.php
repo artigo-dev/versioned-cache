@@ -12,10 +12,10 @@ declare(strict_types=1);
 namespace Artigo\Cache\Tests\Marshaller;
 
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
-use Artigo\Cache\Exception\InvalidArgumentException;
 use Artigo\Cache\Marshaller\ZstdMarshaller;
 use Artigo\Cache\Tests\Connection;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Cache\Exception\InvalidArgumentException;
 use Symfony\Component\Cache\Marshaller\DefaultMarshaller;
 use Symfony\Component\Cache\Marshaller\DeflateMarshaller;
 use Symfony\Component\Cache\Marshaller\MarshallerInterface;
@@ -316,6 +316,18 @@ final class ZstdMarshallerTest extends TestCase
         $this->expectException(InvalidArgumentException::class);
 
         new ZstdMarshaller(new DefaultMarshaller(), maxLength: 0);
+    }
+
+    public function testABadArgumentThrowsSymfonysOwnException(): void
+    {
+        try {
+            new ZstdMarshaller(new DefaultMarshaller(), level: 23);
+            self::fail('A bad level must throw.');
+        } catch (InvalidArgumentException $exception) {
+            // the class Symfony's adapters throw, not one of this package: artigo/cache-stampede owns
+            // Artigo\Cache\Exception\, and two packages defining one class make Composer warn
+            self::assertSame(InvalidArgumentException::class, $exception::class);
+        }
     }
 
     public function testThroughTheAdapterAnItemIsAFrameOnTheServer(): void

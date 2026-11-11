@@ -11,12 +11,12 @@ declare(strict_types=1);
 
 namespace Artigo\Cache\Adapter;
 
-use Artigo\Cache\Exception\InvalidArgumentException;
 use Psr\Cache\CacheItemPoolInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Cache\Adapter\AbstractTagAwareAdapter;
 use Symfony\Component\Cache\CacheItem;
 use Symfony\Component\Cache\Exception\CacheException;
+use Symfony\Component\Cache\Exception\InvalidArgumentException;
 use Symfony\Component\Cache\Marshaller\DefaultMarshaller;
 use Symfony\Component\Cache\Marshaller\MarshallerInterface;
 use Symfony\Component\Cache\PruneableInterface;

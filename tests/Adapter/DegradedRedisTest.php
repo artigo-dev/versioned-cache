@@ -13,12 +13,12 @@ namespace Artigo\Cache\Tests\Adapter;
 
 use Artigo\Cache\Adapter\SharedRules;
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
-use Artigo\Cache\Exception\InvalidArgumentException;
 use Artigo\Cache\Tests\Connection;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
 use Symfony\Component\Cache\CacheItem;
+use Symfony\Component\Cache\Exception\InvalidArgumentException;
 use Symfony\Contracts\Cache\ItemInterface;
 
 /**
