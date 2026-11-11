@@ -11,8 +11,8 @@ declare(strict_types=1);
 
 namespace Artigo\Cache\Marshaller;
 
-use Artigo\Cache\Exception\InvalidArgumentException;
 use Symfony\Component\Cache\Exception\CacheException;
+use Symfony\Component\Cache\Exception\InvalidArgumentException;
 use Symfony\Component\Cache\Marshaller\MarshallerInterface;
 
 /**
