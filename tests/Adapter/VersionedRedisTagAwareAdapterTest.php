@@ -45,6 +45,17 @@ final class VersionedRedisTagAwareAdapterTest extends AdapterTestCase
         self::$redis = Connection::open();
     }
 
+    public function testAClonedPoolWorksOnItsOwn(): void
+    {
+        // Symfony clones a pool in withSubNamespace(); __clone() binds a new
+        // id function, which a readonly property refused on PHP 8.2
+        $pool = $this->createCachePool();
+        $clone = clone $pool;
+
+        self::assertTrue($clone->save($clone->getItem('cloned')->set('v')));
+        self::assertSame('v', $clone->getItem('cloned')->get());
+    }
+
     public function createCachePool(int $defaultLifetime = 0, ?string $testMethod = null): CacheItemPoolInterface
     {
         return new VersionedRedisTagAwareAdapter(self::$redis, 'conformance', $defaultLifetime, rulesCache: false);

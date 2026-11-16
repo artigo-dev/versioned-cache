@@ -463,8 +463,13 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private static array $clockOffsets = [];
 
-    /** @var \Closure(string): string */
-    private readonly \Closure $idOf;
+    /**
+     * Not readonly: __clone() binds it to the clone, and PHP allows that for
+     * a readonly property only from 8.3, while this package runs on 8.2.
+     *
+     * @var \Closure(string): string
+     */
+    private \Closure $idOf;
 
     /**
      * The copy shared with the other workers of this server; null when the
