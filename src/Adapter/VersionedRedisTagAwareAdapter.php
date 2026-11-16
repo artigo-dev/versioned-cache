@@ -1913,8 +1913,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     /**
      * Brings a copy up to date with the stream: XRANGE from the copy's last
      * id, that id included, a batch at a time, until a batch comes back short.
-     * $startedOver is set when the stream no longer held the copy's last id,
-     * so the copy was rebuilt from what the stream holds now.
+     * When the stream no longer holds the copy's last id (trimmed past it,
+     * cleared, deleted, or failed over to a replica that never got it), the
+     * copy is emptied and read again from the start: the answer was only the
+     * stream from that id on, and after a failover the older rules are still
+     * there. $startedOver is set then, so the copy was rebuilt from what the
+     * stream holds now.
      *
      * On a connection that may read from a replica, some answers are asked
      * again of the primary first: one that would rebuild the copy (its last id
@@ -1952,9 +1956,11 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
                 return false;
             }
 
-            // the stream no longer holds the copy's last id: absorb() rebuilds
-            // the copy from this answer
-            if (!$rules->continuedBy($entries)) {
+            // the stream no longer holds the copy's last id: absorb() empties
+            // the copy, and the next turn reads the stream from the start (only
+            // a fetch from an id can find it gone, so this happens once)
+            $restart = !$rules->continuedBy($entries);
+            if ($restart) {
                 $startedOver = true;
             }
 
@@ -1962,7 +1968,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
             // a full batch may have more behind it; stop when a batch is short,
             // or when it did not move the copy forward
-        } while (self::RULES_BATCH <= \count($entries) && $rules->last() !== $from);
+        } while ($restart || (self::RULES_BATCH <= \count($entries) && $rules->last() !== $from));
 
         return true;
     }

@@ -307,6 +307,32 @@ final class RuleSetReloadTest extends TestCase
         self::assertSame([], $this->other->starts, 'a worker holding the lost set adopts it, read later, rather than reload');
     }
 
+    public function testAFailoverThatLostTheNewestRuleReadsTheStreamAgainFromTheStart(): void
+    {
+        // a rule before the item, so it carries a real watermark; then the
+        // rule that outdates it, and the newest rule
+        $this->appendRule('earlier');
+        $pool = $this->pool($this->redis, rulesCacheMs: 0, rulesCache: false);
+        $this->write($pool, 'item', ['tag1']);
+        $this->appendRule('tag1');
+        $this->appendRule('newest');
+
+        // the copy takes in the newest rule through another item, so the
+        // outdated one is not read (and dropped) before the failover
+        $this->write($pool, 'witness', ['other']);
+        self::assertTrue($pool->getItem('witness')->isHit());
+        $newest = $this->streamHead();
+
+        // the failover: the new master never got the newest rule, and another
+        // server's invalidation reached it first
+        $this->plain->xDel(self::RULES_KEY, [$newest]);
+        $this->appendRule('after');
+        $this->redis->forgetRanges();
+
+        self::assertFalse($pool->getItem('item')->isHit(), 'the rule that outdated the item is still in the stream, and still held');
+        self::assertSame([$newest, '-'], $this->redis->starts, 'read from the lost id, then again from the start');
+    }
+
     public function testAFailedReloadStartsAnOutage(): void
     {
         $this->shareCopyAged(10_000);

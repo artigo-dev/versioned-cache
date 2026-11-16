@@ -23,11 +23,14 @@ namespace Artigo\Cache\Adapter;
  *
  * The set follows the server's stream step by step. Each refresh asks for
  * the entries from the last id it holds, that id included. If that id comes
- * back first, everything after it is new. If it does not, the server no
- * longer holds it (the stream was trimmed past it, cleared to a newer rule,
- * or deleted), and what came back is the whole current stream, which
- * replaces what was held. Either way it is one round trip, sized by what
- * changed.
+ * back first, everything after it is new: one round trip, sized by what
+ * changed. If it does not, the server no longer holds it (the stream was
+ * trimmed past it, cleared to a newer rule, deleted, or failed over to a
+ * replica that never got it), and what came back is only the stream from
+ * that id on. After a failover the older rules are still there, and an
+ * invalidation that reached the new primary first may be all the answer
+ * holds, so the answer cannot replace the set: the set is emptied, and the
+ * adapter reads the stream again from the beginning (see absorb()).
  *
  * It also notices when the stream has lost rules. Every entry says whether it
  * started the stream (the adapter's script records that). An item whose
@@ -281,7 +284,8 @@ final class InvalidationRules
     /**
      * Does an XRANGE that started at last() carry on from what is held? It
      * does when it comes back starting with that id, or when nothing was held.
-     * Otherwise absorbing it rebuilds the set from this answer alone.
+     * Otherwise absorbing it empties the set, and the stream has to be read
+     * again from the beginning.
      *
      * @param array<array-key, mixed> $entries id => fields, oldest first
      */
@@ -298,7 +302,10 @@ final class InvalidationRules
 
     /**
      * Merges the entries of an XRANGE that started at last(), that id
-     * included, or at the beginning when nothing was held yet.
+     * included, or at the beginning when nothing was held yet. When the range
+     * does not carry on from what is held (see continuedBy()), the set is
+     * emptied and nothing is taken from it: the entries are only the stream
+     * from that id on.
      *
      * @param array<array-key, mixed> $entries id => fields, oldest first, as the client hands them back
      */
@@ -310,14 +317,20 @@ final class InvalidationRules
             if (null !== $start && $this->continuedBy($entries)) {
                 unset($entries[$start]);
             } else {
-                // the stream no longer holds our last id: what came back is the
-                // whole current stream, and what we held is dropped
+                // The stream no longer holds our last id, and what came back
+                // is only the stream from there on. After a failover to a
+                // replica that never got that rule, the older rules are still
+                // there, and a newer rule may be all the answer holds: rebuilt
+                // from it, the set would forget them. So it starts over empty,
+                // and the adapter reads the stream from the beginning.
                 $this->tags = [];
                 $this->hard = [];
                 $this->prefixes = [];
                 $this->last = self::NONE;
                 $this->first = self::NONE;
                 $this->firstOpened = null;
+
+                return;
             }
         }
 

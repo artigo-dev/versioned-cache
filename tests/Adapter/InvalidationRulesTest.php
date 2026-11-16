@@ -75,7 +75,13 @@ final class InvalidationRulesTest extends TestCase
         $rules->absorb(self::entries(['100-0' => ['t' => ['a']]]));
 
         // the range from 100-0 does not start with 100-0: the server no longer
-        // holds it, so what came back is the whole stream now
+        // holds it, and what came back is only the stream from there on. The
+        // set starts over empty...
+        $rules->absorb(self::entries(['300-0' => ['t' => ['c']]]));
+
+        self::assertSame(InvalidationRules::NONE, $rules->last(), 'nothing is taken from a range that started at a lost id');
+
+        // ...and the stream read again from the beginning replaces it
         $rules->absorb(self::entries(['300-0' => ['t' => ['c']]]));
 
         self::assertSame('300-0', $rules->last());
@@ -169,11 +175,31 @@ final class InvalidationRulesTest extends TestCase
 
         self::assertTrue($rules->invalidates('ns:x', ['z'], '50-0'), 'still judged against the opening rule held from the first fetch');
 
-        // the stream moved on: what came back is the whole stream, and its
-        // oldest entry followed others
+        // the stream moved on: the set starts over, and the stream read again
+        // from the beginning has an oldest entry that followed others
+        $rules->absorb(self::entries(['300-0' => ['t' => ['c'], 'first' => false]]));
         $rules->absorb(self::entries(['300-0' => ['t' => ['c'], 'first' => false]]));
 
         self::assertFalse($rules->invalidates('ns:x', ['z'], '50-0'));
+    }
+
+    public function testAFailoverThatLostTheNewestRuleKeepsTheOlderOnesOnceReadAgain(): void
+    {
+        $rules = $this->rules();
+        $rules->absorb(self::entries(['100-0' => ['t' => ['a']], '200-0' => ['t' => ['b']]]));
+
+        // a failover to a replica that never got 200-0, where 300-0 landed
+        // first: the range from 200-0 holds 300-0 alone, though 100-0 is still
+        // in the stream. Rebuilt from that range, the set would forget 100-0.
+        $rules->absorb(self::entries(['300-0' => ['t' => ['c']]]));
+
+        self::assertSame(InvalidationRules::NONE, $rules->last());
+
+        // read again from the beginning
+        $rules->absorb(self::entries(['100-0' => ['t' => ['a']], '300-0' => ['t' => ['c']]]));
+
+        self::assertSame('300-0', $rules->last());
+        self::assertTrue($rules->invalidates('ns:x', ['a'], '50-0'), 'the older rule is held');
     }
 
     public function testPastTheBoundTheOldestRulesBecomeAFloor(): void
