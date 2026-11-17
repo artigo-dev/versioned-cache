@@ -609,13 +609,15 @@ final class RuleSetReloadTest extends TestCase
     {
         $this->writeKeptAndGone();
 
-        // it holds no set: only the mark tells the others
+        // it holds no set, and a rule from elsewhere lands before its own, so
+        // it can add its rule to none: only the mark tells the others
         $invalidator = $this->pool($this->redis, 60_000);
         $worker = $this->pool($this->other, 60_000);
 
         // the worker's set is read while the invalidation is on its way
-        $this->redis->beforeScript = static function () use ($worker): void {
+        $this->redis->beforeScript = function () use ($worker): void {
             $worker->getItem('kept');
+            $this->appendRule('elsewhere');
         };
 
         self::assertTrue($invalidator->invalidateTags(['gone']));
@@ -634,14 +636,6 @@ final class RuleSetReloadTest extends TestCase
         // another worker of this server invalidates; the copy is behind it
         self::assertTrue($this->pool($this->third)->invalidateTags(['tag2']));
         $this->redis->forgetRanges();
-        $flag = $this->otherWorkerReloads();
-
-        try {
-            self::assertFalse($pool->getItem('item')->isHit(), 'a miss while another worker reloads');
-            self::assertSame([], $this->redis->starts, 'not a fetch of its own');
-        } finally {
-            $flag->release();
-        }
 
         self::assertFalse($pool->getItem('item')->isHit(), 'with the flag free, it reloads');
         self::assertCount(1, $this->redis->starts);
@@ -824,92 +818,200 @@ final class RuleSetReloadTest extends TestCase
         }
     }
 
-    public function testWhileAnotherWorkerReloadsExactReadsAndCopiesBehindAreJudgedOnlyByAYoungCopy(): void
+    public function testWhileAnotherWorkerReloadsExactReadsAreJudgedByAYoungCopy(): void
     {
         $this->shareCopyAged(500);
         $flag = $this->otherWorkerReloads();
 
         try {
             self::assertTrue($this->pool($this->redis, 0)->getItem('item')->isHit(), 'an exact read, judged by a copy half a second old');
-
-            self::assertTrue($this->pool($this->third)->invalidateTags(['tag2']));
-            self::assertFalse($this->pool($this->other, 1_000)->getItem('item')->isHit(), 'a copy behind an invalidation made here is not judged by');
             self::assertSame([], $this->redis->starts);
-            self::assertSame([], $this->other->starts);
         } finally {
             $flag->release();
         }
     }
 
-    public function testWhileAnotherWorkerReloadsAYoungCopyBehindAnInvalidationMissesWithoutTheLock(): void
+    public function testWhileAnotherWorkerReloadsAnOlderCopyWaitsAndIsJudgedByTheReloadedCopy(): void
     {
-        $this->shareCopyAged(0);
+        // an item no rule since has reached; the copy is five seconds old
+        $medium = $this->mediumWhereTheReloadLands(3);
+        $this->appendRule('other');
+        $this->write(new VersionedRedisTagAwareAdapter($this->plain, self::NAMESPACE, rulesCacheMs: 0, rulesCache: false), 'item', ['tag1']);
+        $this->copyInto($medium, 5_000);
+        $this->appendRule('elsewhere');
+        $flag = $this->otherWorkerReloads($medium);
+        $medium->lands = function () use ($medium, $flag): void {
+            $this->copyInto($medium, 0);
+            $flag->release();
+        };
+
         $locks = 0;
         $computes = 0;
-        $pool = $this->pool($this->redis, 60_000);
-        $pool->setCallbackWrapper(static function (callable $callback, ItemInterface $item, bool &$save) use (&$locks): mixed {
-            ++$locks;
+        $pool = $this->pool($this->redis, 1_000, $medium);
+        $pool->setCallbackWrapper(self::countingLock($locks));
+        $value = $pool->get('item', static function () use (&$computes): string {
+            ++$computes;
 
-            return $callback($item, $save);
+            return 'computed';
         });
+
+        self::assertNull($medium->lands, 'the read waited for the reload');
+        self::assertSame('v', $value, 'and the reloaded copy judged it: a hit');
+        self::assertSame(0, $computes, 'nothing computed');
+        self::assertSame(0, $locks);
+        self::assertSame([], $this->redis->starts, 'nor fetched by the waiter');
+    }
+
+    public function testWhileAnotherWorkerReloadsAMissIsComputedUnderTheLockAndStampedFromTheReloadedCopy(): void
+    {
+        $medium = $this->mediumWhereTheReloadLands(3);
+        $last = $this->shareCopyAged(5_000, medium: $medium);
+        $flag = $this->otherWorkerReloads($medium);
+        $medium->lands = function () use ($medium, $flag): void {
+            $this->copyInto($medium, 0);
+            $flag->release();
+        };
+
+        $locks = 0;
+        $computes = 0;
+        $pool = $this->pool($this->redis, 1_000, $medium);
+        $pool->setCallbackWrapper(self::countingLock($locks));
+        $pool->get('item', static function () use (&$computes): string {
+            ++$computes;
+
+            return 'computed';
+        });
+
+        self::assertSame(1, $computes, 'the rule since outdated the item: a miss');
+        self::assertSame(1, $locks, 'computed under the lock');
+        self::assertSame([], $this->redis->starts, 'the waiter fetched nothing');
+        self::assertSame('computed', $this->storedValue());
+        self::assertNotSame($last, $this->plain->hGet(self::ITEM_KEY, 'm'));
+        self::assertSame($this->streamHead(), $this->plain->hGet(self::ITEM_KEY, 'm'), 'stamped with the last id of the reloaded copy, so the rule that outdated the old value does not reach the new one');
+    }
+
+    public function testWhileAnotherWorkerReloadsACopyBehindAnInvalidationWaitsAndTakesTheLock(): void
+    {
+        $medium = $this->mediumWhereTheReloadLands(3);
+        $this->shareCopyAged(0, medium: $medium);
+        $locks = 0;
+        $computes = 0;
+        $pool = $this->pool($this->redis, 60_000, $medium);
+        $pool->setCallbackWrapper(self::countingLock($locks));
         self::assertTrue($pool->getItem('item')->isHit());
 
-        // another worker of this server invalidates: the young copy is behind
-        self::assertTrue($this->pool($this->third)->invalidateTags(['tag2']));
+        // another worker of this server invalidates; a rule from elsewhere
+        // stands between its rule and the shared copy, so nothing is shared
+        // and the young copy is behind
+        self::assertTrue($this->pool($this->third, 60_000, $medium)->invalidateTags(['tag2']));
+        $flag = $this->otherWorkerReloads($medium);
+        $medium->lands = function () use ($medium, $flag): void {
+            $this->copyInto($medium, 0);
+            $flag->release();
+        };
+
+        $pool->get('item', static function () use (&$computes): string {
+            ++$computes;
+
+            return 'computed';
+        });
+
+        self::assertNull($medium->lands, 'the read waited for the reload');
+        self::assertSame(1, $computes, 'a miss, by the rule the reloaded copy holds');
+        self::assertSame(1, $locks, 'computed under the lock');
+        self::assertSame([], $this->redis->starts);
+        self::assertSame($this->streamHead(), $this->plain->hGet(self::ITEM_KEY, 'm'));
+    }
+
+    public function testAReadWaitsForAReloadNoLongerThanUntilItCountsAsHanging(): void
+    {
+        $this->shareCopyAged(5_000);
         $flag = $this->otherWorkerReloads();
 
         try {
-            $pool->get('item', static function () use (&$computes): string {
-                ++$computes;
-
-                return 'computed';
-            });
+            $pool = $this->pool($this->redis, 1_000);
+            $began = microtime(true);
+            $hit = $pool->getItem('item')->isHit();
+            $ms = (microtime(true) - $began) * 1000;
         } finally {
             $flag->release();
         }
 
-        self::assertSame(1, $computes, 'a miss');
-        self::assertSame(0, $locks, 'computed without the lock');
+        self::assertTrue($hit, 'past a second the reload hangs, and the copy judges whatever its age');
+        self::assertGreaterThan(800, $ms, 'the read waited for the reload');
+        self::assertLessThan(1_600, $ms, 'no longer than SLOW_RELOAD_MS');
         self::assertSame([], $this->redis->starts);
     }
 
-    public function testWhileAnotherWorkerReloadsAnOlderCopyMissesWithoutTheLockAndStoresStampedFromIt(): void
+    public function testWhileAnotherWorkerReloadsAnOlderCopyWaitsForItInProcesses(): void
     {
         $directory = $this->directory();
         $startAt = self::startAt();
         $last = $this->shareCopyAged(3_000, $directory, $startAt);
-        $epoch = $this->plain->hGet(self::ITEM_KEY, 'e');
 
+        // the reloader takes 0.4 s; the others read 100 ms into it
         $reports = $this->readInProcesses($directory, $startAt, [
-            ['delayMs' => 0, 'answerAfterMs' => 800],
+            ['delayMs' => 0, 'answerAfterMs' => 400],
+            ['delayMs' => 100, 'get' => true],
+            ['delayMs' => 100, 'get' => true],
             ['delayMs' => 150, 'get' => true],
-            ['delayMs' => 150, 'get' => true],
-            ['delayMs' => 200, 'get' => true],
         ]);
 
+        self::assertSame(1, $reports[0]['attempts']);
+
         foreach (\array_slice($reports, 1) as $report) {
-            self::assertFalse($report['hit'], 'a miss');
-            self::assertFalse($report['locked'], 'computed without the lock');
-            self::assertSame(0, $report['attempts']);
-            self::assertLessThan(150, $report['ms'], 'no wait');
+            // the rule since outdated the item: a miss, judged by a reloaded
+            // copy and computed under the lock, or a hit on what another
+            // waiter computed meanwhile
+            self::assertSame(!$report['hit'], $report['locked']);
+            self::assertGreaterThan(150, $report['ms'], 'waited for the reload');
+            self::assertLessThan(900, $report['ms'], 'and no longer');
         }
 
-        self::assertSame('computed', $this->storedValue(), 'what it computed is stored');
-        self::assertSame($last, $this->plain->hGet(self::ITEM_KEY, 'm'), 'stamped with the last id of the copy, older than the rule since');
-        self::assertNotSame($epoch, $this->plain->hGet(self::ITEM_KEY, 'e'));
+        // the reloaded copy is past its 50 ms window when it lands, so one of
+        // the waiters reloads again, and the others judge by the copy it left
+        self::assertLessThanOrEqual(1, array_sum(array_column(\array_slice($reports, 1), 'attempts')));
+        self::assertContains(false, array_column(\array_slice($reports, 1), 'hit'), 'somebody computed it');
+
+        self::assertSame('computed', $this->storedValue());
+        self::assertNotSame($last, $this->plain->hGet(self::ITEM_KEY, 'm'), 'stamped from the reloaded copy');
     }
 
-    public function testWhileAnotherWorkerReloadsWithNoCopyEveryItemIsAMissAndNothingIsStored(): void
+    public function testWhileAnotherWorkerLoadsTheFirstCopyAWorkerWithNoneWaitsForIt(): void
     {
         $directory = $this->directory();
         $this->write($this->pool($this->third, 50, false), 'item', ['tag1']);
         $before = $this->plain->hGetAll(self::ITEM_KEY);
 
         $reports = $this->readInProcesses($directory, self::startAt(), [
-            ['delayMs' => 0, 'answerAfterMs' => 800],
+            ['delayMs' => 0, 'answerAfterMs' => 400],
+            ['delayMs' => 100, 'get' => true],
+            ['delayMs' => 100, 'get' => true],
             ['delayMs' => 150, 'get' => true],
-            ['delayMs' => 150, 'get' => true],
-            ['delayMs' => 200, 'get' => true],
+        ]);
+
+        foreach (\array_slice($reports, 1) as $report) {
+            self::assertTrue($report['hit'], 'judged by the copy the reloader shared');
+            self::assertFalse($report['locked']);
+            self::assertGreaterThan(150, $report['ms'], 'waited for the load');
+            self::assertLessThan(900, $report['ms']);
+        }
+
+        self::assertLessThanOrEqual(1, array_sum(array_column(\array_slice($reports, 1), 'attempts')), 'at most one of them reloads again, the loaded copy being past its 50 ms window when it lands');
+        self::assertSame($before, $this->plain->hGetAll(self::ITEM_KEY), 'nothing recomputed');
+    }
+
+    public function testWhileAReloadHangsWithNoCopyEveryItemIsAMissWithoutTheLockAndNothingIsStored(): void
+    {
+        $directory = $this->directory();
+        $this->write($this->pool($this->third, 50, false), 'item', ['tag1']);
+        $before = $this->plain->hGetAll(self::ITEM_KEY);
+
+        // the reloader hangs for 2 s; the others read 1.2 s into it
+        $reports = $this->readInProcesses($directory, self::startAt(), [
+            ['delayMs' => 0, 'answerAfterMs' => 2_000],
+            ['delayMs' => 1_200, 'get' => true],
+            ['delayMs' => 1_200, 'get' => true],
         ]);
 
         foreach (\array_slice($reports, 1) as $report) {
@@ -920,6 +1022,68 @@ final class RuleSetReloadTest extends TestCase
         }
 
         self::assertSame($before, $this->plain->hGetAll(self::ITEM_KEY), 'nothing stored');
+    }
+
+    public function testAnInvalidationByARequestThatReadNothingTakesTheSharedCopyAndSharesItsRule(): void
+    {
+        // the server shares a copy that holds the whole stream
+        $this->appendRule('first');
+        $this->write(new VersionedRedisTagAwareAdapter($this->plain, self::NAMESPACE, rulesCacheMs: 0, rulesCache: false), 'item', ['tag1']);
+        self::assertTrue($this->pool($this->redis, 60_000)->getItem('item')->isHit());
+
+        // a request that only invalidates: it has read nothing
+        $invalidator = $this->pool($this->other, 60_000);
+        self::assertTrue($invalidator->invalidateTags(['tag1']));
+        self::assertSame([], $this->other->starts, 'it fetched nothing');
+        self::assertSame($this->streamHead(), $this->sharedLast(), 'its rule went into the shared copy');
+
+        // so nobody on this server is behind: the next worker judges by the
+        // shared copy, with no reload
+        $reader = $this->pool($this->third, 60_000);
+        self::assertFalse($reader->getItem('item')->isHit(), 'the rule is seen at once');
+        self::assertSame([], $this->third->starts, 'with no fetch');
+    }
+
+    public function testAnInvalidationByARequestThatReadNothingSharesNothingAcrossARuleFromElsewhere(): void
+    {
+        $last = $this->shareCopyAged(0);
+
+        // the shared copy ends before the rule appended elsewhere since
+        self::assertTrue($this->pool($this->other, 60_000)->invalidateTags(['tag2']));
+        self::assertSame($last, $this->sharedLast(), 'nothing was added to a copy that would skip a rule');
+
+        $reader = $this->pool($this->third, 60_000);
+        self::assertFalse($reader->getItem('item')->isHit(), 'the shared copy is behind: reloaded');
+        self::assertSame([$last], $this->third->starts);
+    }
+
+    public function testAReloadWhoseReadFromTheStartFailsKeepsTheCopyHeld(): void
+    {
+        $this->appendRule('earlier');
+        $pool = $this->pool($this->redis, rulesCacheMs: 0, rulesCache: false);
+        $this->write($pool, 'kept', ['keep']);
+        $this->write($pool, 'item', ['tag1']);
+        $this->appendRule('tag1');
+        $this->appendRule('newest');
+        $this->write($pool, 'witness', ['other']);
+        self::assertTrue($pool->getItem('witness')->isHit());
+        $newest = $this->streamHead();
+
+        // the failover that lost the newest rule; then the node goes away
+        // between the read from the lost id and the read from the start
+        $this->plain->xDel(self::RULES_KEY, [$newest]);
+        $this->appendRule('after');
+        $this->redis->forgetRanges();
+        $this->redis->duringRange = function (): void {
+            $this->redis->duringRange = function (): void {
+                $this->redis->rangesFail = true;
+            };
+        };
+
+        self::assertTrue($pool->getItem('kept')->isHit(), 'the copy held before the failed reload judges, and holds what it held');
+        self::assertSame([$newest, '-'], $this->redis->starts);
+        self::assertFalse($pool->getItem('item')->isHit(), 'the rule that outdated the item is still held');
+        self::assertSame(1, $this->plain->exists(self::NAMESPACE.':kept'), 'and nothing valid was dropped');
     }
 
     public function testDuringAnOutageWithNoCopyAMissDoesNotQueueBehindTheLock(): void
@@ -1112,19 +1276,29 @@ final class RuleSetReloadTest extends TestCase
     public function testWhileHealthyAnInvalidationMadeElsewhereIsSeenWithinTheWindowAndASecond(): void
     {
         foreach (['the flag free' => false, 'another worker reloading' => true] as $state => $reloading) {
-            $medium = new ArrayAdapter();
-            $this->shareCopyAged(1_100, medium: $medium);
+            $medium = $this->mediumWhereTheReloadLands(3);
+            $this->shareCopyAged(900, medium: $medium);
 
             $flag = $reloading ? $this->otherWorkerReloads($medium) : null;
 
             try {
-                self::assertFalse($this->pool($this->redis, 50, $medium)->getItem('item')->isHit(), \sprintf('%s: past the window and a second, a read sees the rule or misses', $state));
-
-                // within that second, the copy may still judge it
-                $this->copyInto($medium, 900, $this->copy);
+                // within the window and a second, the copy may still judge it
                 $hit = $this->pool($this->other, 50, $medium)->getItem('item')->isHit();
 
                 self::assertSame($reloading, $hit, \sprintf('%s: within it, %s', $state, $reloading ? 'the copy judges' : 'the flag is taken and the set reloaded'));
+
+                // past it, a read sees the rule: it reloads, or waits for the
+                // reload in flight, which lands here at its third look
+                $this->copyInto($medium, 1_100, $this->copy);
+
+                if (null !== $flag) {
+                    $medium->lands = function () use ($medium, $flag): void {
+                        $this->copyInto($medium, 0);
+                        $flag->release();
+                    };
+                }
+
+                self::assertFalse($this->pool($this->redis, 50, $medium)->getItem('item')->isHit(), \sprintf('%s: past the window and a second, a read sees the rule', $state));
             } finally {
                 $flag?->release();
             }
@@ -1292,6 +1466,31 @@ final class RuleSetReloadTest extends TestCase
         self::assertTrue($flag->lead());
 
         return $flag;
+    }
+
+    /**
+     * A medium where another worker's reload lands at the $look-th look at
+     * the reload flag: $lands runs then, once, as that worker would store its
+     * copy and let go of the flag.
+     */
+    private function mediumWhereTheReloadLands(int $look): ReloadLandingMedium
+    {
+        $medium = new ReloadLandingMedium();
+        $medium->looksLeft = $look;
+
+        return $medium;
+    }
+
+    /**
+     * A stampede lock that only counts how often it was taken.
+     */
+    private static function countingLock(int &$locks): \Closure
+    {
+        return static function (callable $callback, ItemInterface $item, bool &$save) use (&$locks): mixed {
+            ++$locks;
+
+            return $callback($item, $save);
+        };
     }
 
     private function sharedRules(): SharedRules
@@ -1476,6 +1675,28 @@ final class RuleSetReloadTest extends TestCase
 /**
  * Counts the warnings a pool logs.
  */
+/**
+ * A rule set store that runs $lands, once, at the looksLeft-th read of the
+ * reload flag made while $lands is set.
+ */
+final class ReloadLandingMedium extends ArrayAdapter
+{
+    public ?\Closure $lands = null;
+
+    public int $looksLeft = 0;
+
+    public function getItem(mixed $key): CacheItem
+    {
+        if (null !== $this->lands && str_ends_with($key, '_flag') && 0 === --$this->looksLeft) {
+            $lands = $this->lands;
+            $this->lands = null;
+            $lands();
+        }
+
+        return parent::getItem($key);
+    }
+}
+
 final class WarningCounter extends AbstractLogger
 {
     public int $warnings = 0;
