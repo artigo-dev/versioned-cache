@@ -334,6 +334,62 @@ final class RuleSetReloadTest extends TestCase
         self::assertSame([$newest, '-'], $this->redis->starts, 'read from the lost id, then again from the start');
     }
 
+    public function testAFailoverThatLostRulesIsLoggedOnce(): void
+    {
+        $this->appendRule('earlier');
+        $pool = $this->pool($this->redis, rulesCacheMs: 0, rulesCache: false);
+        $logger = new LostRulesLogger();
+        $pool->setLogger($logger);
+        $this->write($pool, 'witness', ['other']);
+        $this->appendRule('newest');
+        self::assertTrue($pool->getItem('witness')->isHit());
+        $newest = $this->streamHead();
+
+        $this->plain->xDel(self::RULES_KEY, [$newest]);
+        $this->appendRule('after');
+        $pool->getItem('witness');
+
+        self::assertSame(1, $logger->lost, 'the loss is logged');
+
+        $pool->getItem('witness');
+
+        self::assertSame(1, $logger->lost, 'once: the next reload finds the stream intact');
+    }
+
+    public function testALostStreamIsLogged(): void
+    {
+        $this->appendRule('earlier');
+        $pool = $this->pool($this->redis, rulesCacheMs: 0, rulesCache: false);
+        $logger = new LostRulesLogger();
+        $pool->setLogger($logger);
+        $this->write($pool, 'witness', ['other']);
+        self::assertTrue($pool->getItem('witness')->isHit());
+
+        $this->plain->del(self::RULES_KEY);
+        $pool->getItem('witness');
+
+        self::assertSame(1, $logger->lost);
+    }
+
+    public function testAClearElsewhereIsNotLoggedAsALoss(): void
+    {
+        $this->appendRule('earlier');
+        $pool = $this->pool($this->redis, rulesCacheMs: 0, rulesCache: false);
+        $logger = new LostRulesLogger();
+        $pool->setLogger($logger);
+        $this->write($pool, 'witness', ['other']);
+        self::assertTrue($pool->getItem('witness')->isHit());
+        $held = $this->streamHead();
+
+        // another server clears the pool: its rule, and the stream cut back to it
+        $this->pool($this->other, rulesCacheMs: 0, rulesCache: false)->clear();
+        $this->redis->forgetRanges();
+        $pool->getItem('witness');
+
+        self::assertSame([$held, '-'], $this->redis->starts, 'read from the trimmed id, then again from the start');
+        self::assertSame(0, $logger->lost, 'a trim is not a loss');
+    }
+
     public function testAFailedReloadStartsAnOutage(): void
     {
         $this->shareCopyAged(10_000);
@@ -1817,6 +1873,21 @@ final class ReadingLogger extends AbstractLogger
             }
         } finally {
             --$this->depth;
+        }
+    }
+}
+
+/**
+ * Counts the warnings that say the stream lost rules.
+ */
+final class LostRulesLogger extends AbstractLogger
+{
+    public int $lost = 0;
+
+    public function log($level, string|\Stringable $message, array $context = []): void
+    {
+        if (LogLevel::WARNING === $level && str_contains((string) $message, 'lost rules this server had read')) {
+            ++$this->lost;
         }
     }
 }

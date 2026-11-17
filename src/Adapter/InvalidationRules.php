@@ -282,6 +282,30 @@ final class InvalidationRules
     }
 
     /**
+     * Whether the stream, as this set holds it after starting over (read
+     * again from the start), lost rules that a set ending at $held had read:
+     * it is empty, it was reborn (its first rule opened it), or it still holds
+     * rules older than $held but not $held itself. A trim - the retention, or
+     * a clear(), which cuts the stream back to its own rule - only ever cuts
+     * the oldest rules, so after one the stream begins after $held, and
+     * nothing was lost. Example: a server held up to 1700-0; after a failover
+     * the stream holds 1000-0, 1500-0 and 1800-0 (another server's rule) -
+     * lost. After a clear it holds 1900-0 only - trimmed, not lost.
+     */
+    public function lost(string $held): bool
+    {
+        if (self::NONE === $held) {
+            return false;
+        }
+
+        if (self::NONE === $this->last || true === $this->firstOpened) {
+            return true;
+        }
+
+        return self::isNewerId($held, $this->first);
+    }
+
+    /**
      * Does an XRANGE that started at last() carry on from what is held? It
      * does when it comes back starting with that id, or when nothing was held.
      * Otherwise absorbing it empties the set, and the stream has to be read

@@ -210,7 +210,10 @@ item that expires by its TTL keeps its id in every SET that names it until that
 tag is next invalidated, and the SETs carry no TTL, so eviction cannot reclaim
 them either - which is why `RedisTagAwareAdapter` refuses to run under an
 `allkeys-*` policy at all. This adapter runs under one safely: a lost stream is
-detected, and the items it covered read as a miss.
+detected, and the items it covered read as a miss. A server that finds the
+stream lost rules it had read (a failover to a replica that had not received
+them, an eviction, a flush) logs one warning; a trim or a `clear()` is not a
+loss and logs nothing.
 
 **`rulesRetentionSeconds`** (30 days) is how long invalidation rules are kept,
 and therefore the longest an item may live: an item must never outlive the rule

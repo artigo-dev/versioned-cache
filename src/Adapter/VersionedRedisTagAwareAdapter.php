@@ -2102,6 +2102,8 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         // asked: a replica that lags would answer with a stream that ends
         // early, and nothing held is left to tell
         $primary = false;
+        // the id the copy held when the stream turned out not to hold it
+        $held = null;
 
         do {
             $from = $rules->last();
@@ -2141,6 +2143,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             if ($restart) {
                 $startedOver = true;
                 $primary = $this->readsReplicas();
+                $held = $from;
             }
 
             $rules->absorb($entries);
@@ -2148,6 +2151,17 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             // a full batch may have more behind it; stop when a batch is short,
             // or when it did not move the copy forward
         } while ($restart || (self::RULES_BATCH <= \count($entries) && $rules->last() !== $from));
+
+        // a loss, not a trim (see InvalidationRules::lost()): one warning -
+        // only the reloading worker reads the stream, and the next reload
+        // finds it intact; without a logger nothing at all
+        if (null !== $held && $rules->lost($held)) {
+            $this->report(false, 'The stream of invalidation rules lost rules this server had read (it held {held}; the stream {now}): a failover to a replica that had not received them, an eviction, a flush, or a restart without persistence. The rules were read again from the start.', [
+                'held' => $held,
+                'now' => InvalidationRules::NONE === $rules->last() ? 'is empty' : 'now ends at '.$rules->last(),
+                'cache-adapter' => get_debug_type($this),
+            ]);
+        }
 
         return true;
     }
