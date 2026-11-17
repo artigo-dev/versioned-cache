@@ -15,6 +15,7 @@ use Artigo\Cache\Adapter\InvalidationRules;
 use Artigo\Cache\Adapter\SharedRules;
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
 use Artigo\Cache\Tests\Connection;
+use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
 use Psr\Cache\CacheItemInterface;
 use Psr\Cache\CacheItemPoolInterface;
@@ -943,6 +944,93 @@ final class RuleSetReloadTest extends TestCase
         self::assertSame([], $this->redis->starts);
     }
 
+    public function testAWaiterLooksAgainWhenTheNextReloadFollowsAtOnce(): void
+    {
+        // exact reads: a copy is never fresh, so the next worker reloads the
+        // moment the first one lets go, and the flag is never seen free
+        $medium = $this->mediumWhereTheReloadLands(3);
+        $this->appendRule('other');
+        $this->write(new VersionedRedisTagAwareAdapter($this->plain, self::NAMESPACE, rulesCacheMs: 0, rulesCache: false), 'item', ['tag1']);
+        $this->copyInto($medium, 5_000);
+        $flag = $this->otherWorkerReloads($medium);
+        $next = null;
+        $medium->lands = function () use ($medium, $flag, &$next): void {
+            $this->copyInto($medium, 0);
+            $flag->release();
+            $next = $this->otherWorkerReloads($medium);
+        };
+
+        try {
+            $pool = $this->pool($this->redis, 0, $medium);
+            $began = hrtime(true);
+            $hit = $pool->getItem('item')->isHit();
+            $ms = (hrtime(true) - $began) / 1e6;
+        } finally {
+            $next?->release();
+        }
+
+        self::assertNull($medium->lands, 'the read waited for the first reload');
+        self::assertTrue($hit, 'and the copy it shared judged the read');
+        self::assertLessThan(500, $ms, 'without waiting for the reload that followed');
+        self::assertSame([], $this->redis->starts, 'nor fetching');
+    }
+
+    public function testAFailedFetchIsLoggedOnceTheFlagIsFreeAndTheOutageRecorded(): void
+    {
+        $shared = $this->sharedRules();
+        $logger = new ReadingLogger();
+        $logger->during = static function () use ($shared, $logger): void {
+            $logger->seen[] = [$shared->reloadStartedAt(), $shared->lastAttempt()[0]];
+        };
+        $this->redis->rangesFail = true;
+        $pool = $this->pool($this->redis);
+        $pool->setLogger($logger);
+
+        self::assertFalse($pool->getItem('item')->isHit());
+        self::assertSame([[null, true]], $logger->seen, 'a logger that takes its time keeps no worker of the server waiting for the flag');
+    }
+
+    #[TestWith([true], 'the copy is shared')]
+    #[TestWith([false], 'no shared copy')]
+    public function testALoggerThatReadsThePoolNeitherWaitsForItsOwnReloadNorStartsItAgain(bool $shared): void
+    {
+        $logger = new ReadingLogger();
+        $this->redis->rangesFail = true;
+        $pool = $this->pool($this->redis, 50, $shared ? null : false);
+        $pool->setLogger($logger);
+        $logger->during = static function () use ($pool, $logger): void {
+            $began = hrtime(true);
+            $pool->getItem('throttle')->isHit();
+            $logger->seen[] = (hrtime(true) - $began) / 1e6;
+        };
+
+        self::assertFalse($pool->getItem('item')->isHit());
+        self::assertSame(1, $logger->deepest, 'the read from the logger began no reload of its own');
+        self::assertCount(1, $logger->seen);
+        self::assertCount(1, $this->redis->starts, 'one fetch in all');
+        self::assertLessThan(500, $logger->seen[0], 'nor waited for the one it came from');
+    }
+
+    public function testAReadFromInsideThisPoolsOwnFetchDoesNotWaitForIt(): void
+    {
+        // as an error handler that uses the pool would read, called from
+        // inside the client while the fetch runs
+        $this->shareCopyAged(5_000);
+        $pool = $this->pool($this->redis);
+        $ms = null;
+        $inner = null;
+        $this->redis->duringRange = static function () use ($pool, &$ms, &$inner): void {
+            $began = hrtime(true);
+            $inner = $pool->getItem('item')->isHit();
+            $ms = (hrtime(true) - $began) / 1e6;
+        };
+
+        self::assertFalse($pool->getItem('item')->isHit(), 'the reloaded copy holds the rule');
+        self::assertFalse($inner, 'the copy held could not judge the read from inside: a miss');
+        self::assertLessThan(500, $ms, 'at once');
+        self::assertCount(1, $this->redis->starts, 'and no second fetch');
+    }
+
     public function testWhileAnotherWorkerReloadsAnOlderCopyWaitsForItInProcesses(): void
     {
         $directory = $this->directory();
@@ -1694,6 +1782,42 @@ final class ReloadLandingMedium extends ArrayAdapter
         }
 
         return parent::getItem($key);
+    }
+}
+
+/**
+ * A logger that does something while it logs a warning ($during), and tells
+ * how deep it was re-entered.
+ */
+final class ReadingLogger extends AbstractLogger
+{
+    public ?\Closure $during = null;
+
+    public int $depth = 0;
+
+    public int $deepest = 0;
+
+    /**
+     * @var list<mixed>
+     */
+    public array $seen = [];
+
+    public function log($level, string|\Stringable $message, array $context = []): void
+    {
+        if (LogLevel::WARNING !== $level) {
+            return;
+        }
+
+        $this->deepest = max($this->deepest, ++$this->depth);
+
+        try {
+            // a reload that starts again from inside the logger would never end
+            if ($this->depth <= 3 && null !== $this->during) {
+                ($this->during)();
+            }
+        } finally {
+            --$this->depth;
+        }
     }
 }
 

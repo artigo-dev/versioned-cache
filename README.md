@@ -316,7 +316,8 @@ Redis is struggling and the fetch takes 3 seconds.
   the window judges by it, at once, for the first second of the fetch. One
   whose copy is older, behind an invalidation made on B, or missing waits for
   the fetch (it is one round trip when Redis is well) and is judged by its
-  result. After a second the fetch counts as an outage for everyone else:
+  result; when another worker's reload follows at once, it looks again as
+  soon as the flag changes hands rather than wait out the second. After a second the fetch counts as an outage for everyone else:
   every worker judges by the copy it holds, whatever its age, until Redis
   answers; one that holds none reads every item as a miss, computed without
   the stampede lock. Server B serves the old price until 12:00:03. Requests
@@ -324,7 +325,9 @@ Redis is struggling and the fetch takes 3 seconds.
   second, once. Why a second and not less: Redis runs one command at a time,
   so a long command of anyone sharing it holds the fetch up as well, and the
   requests wait for Redis meanwhile anyway; giving up sooner would bring the
-  stampede back in just those moments.
+  stampede back in just those moments. What a reload has to log (a failed
+  fetch) reaches the logger once the flag is let go, so a slow logger, or one
+  that reads this pool, holds no other worker up and does not wait for itself.
 
 What that promises, in plain words:
 

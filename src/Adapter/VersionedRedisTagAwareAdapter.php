@@ -500,6 +500,14 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     private ?SharedRules $sharedRules;
 
     /**
+     * What a reload in progress has to log, logged when it is over (see
+     * report()); null while this worker is not reloading.
+     *
+     * @var list<array{bool, string, array<string, mixed>}>|null
+     */
+    private ?array $heldBack = null;
+
+    /**
      * @param int                               $rulesRetentionSeconds how long rules - and therefore items - may live
      * @param int                               $rulesCacheMs          how long a copy of the rules is used before it is reloaded
      * @param CacheItemPoolInterface|false|null $rulesCache            where the workers of a server share the copy of the rules (see SharedRules): a pool, false for none, null for APCu where it is enabled
@@ -687,6 +695,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         $this->pendingArm = null;
         $this->aged = [];
         $this->idOf = $this->bindIdOf();
+
+        // a reload in progress is the original's, and so is what it logs
+        $this->heldBack = null;
 
         // rules left to share are for the original to share
         $this->unshared = false;
@@ -1850,7 +1861,8 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             // did the last attempt to fetch the rules fail, and is another
             // worker reloading right now, since when?
             [$outage, $endedAtMs] = $this->lastAttempt();
-            $startedAtMs = $this->sharedRules?->reloadStartedAt();
+            $holder = 0;
+            $startedAtMs = $this->sharedRules?->reloadStartedAt($holder);
             $nowMs = microtime(true) * 1000;
 
             // an outage: Redis is down, or another worker's reload hangs
@@ -1880,20 +1892,30 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             // RELOAD_WAIT_MS in all gives up: a miss without the lock
             $waitUntilMs ??= $nowMs + self::RELOAD_WAIT_MS;
 
-            if (null === $this->sharedRules || !$this->awaitReload($this->sharedRules, $waitUntilMs)) {
+            // (nor does it wait when this pool holds the flag itself: the
+            // read comes from inside its own reload - an error handler that
+            // uses the pool, say - which cannot end before this read returns)
+            if (null === $this->sharedRules || $this->sharedRules->leads() || !$this->awaitReload($this->sharedRules, $waitUntilMs, $holder)) {
                 return [$this->rules, true];
             }
         }
     }
 
     /**
-     * Waits while another worker holds the reload flag: until it lets go, its
-     * reload has run longer than SLOW_RELOAD_MS, or $untilMs has come. Only
-     * the flag is looked at, never the copy, so a turn costs one read of the
-     * store. It pauses before every look, the first included, so a caller
-     * that comes back at once never spins. False when $untilMs came first.
+     * Waits while the worker the caller saw ($holder, 0 for none) holds the
+     * reload flag: until it lets go, its reload has run longer than
+     * SLOW_RELOAD_MS, or $untilMs has come. The flag in other hands means
+     * that reload is over and the next one began: the caller looks again,
+     * because the copy shared in between may judge its read. Without that, a
+     * waiter that looks at the flag every few milliseconds would see it taken
+     * again and again while the reloads follow one another (each copy stale or
+     * behind an invalidation as soon as it is shared), and wait out $untilMs
+     * beside copies it could have used. Only the flag is looked at, never the
+     * copy, so a turn costs one read of the store. It pauses before every
+     * look, the first included, so a caller that comes back at once never
+     * spins. False when $untilMs came first.
      */
-    private function awaitReload(SharedRules $shared, float $untilMs): bool
+    private function awaitReload(SharedRules $shared, float $untilMs, int $holder): bool
     {
         $pauseUs = self::RELOAD_POLL_US;
 
@@ -1901,7 +1923,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             usleep($pauseUs);
             $pauseUs = min(2 * $pauseUs, self::RELOAD_POLL_MAX_US);
 
-            $startedAtMs = $shared->reloadStartedAt();
+            $startedAtMs = $shared->reloadStartedAt($now);
             $nowMs = microtime(true) * 1000;
 
             if (null === $startedAtMs || $nowMs - $startedAtMs > self::SLOW_RELOAD_MS) {
@@ -1910,6 +1932,11 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
             if ($nowMs >= $untilMs) {
                 return false;
+            }
+
+            // another reload than the one waited for: that one is over
+            if ($now !== $holder) {
+                return true;
             }
         }
     }
@@ -1928,6 +1955,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private function reload(): bool
     {
+        // a read of this pool made from inside this reload (an error handler
+        // or a logger that uses the pool) does not start another one
+        if (null !== $this->heldBack) {
+            return false;
+        }
+
         // only the worker that takes the flag reloads. Without a shared copy,
         // this worker is on its own and always may
         $shared = $this->sharedRules;
@@ -1943,12 +1976,16 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         // own (see $alone), and warns once per pool instance
         $this->alone = null === $taken;
 
-        if ($this->alone) {
-            $shared = null;
-            $this->warnOnce('alone', 'The rule set store refused the reload flag: this worker loads the invalidation rules on its own and shares nothing until the store can be written.', ['cache-adapter' => get_debug_type($this)]);
-        }
+        // what this reload has to log waits until the flag is released and
+        // the attempt recorded (see report())
+        $this->heldBack = [];
 
         try {
+            if ($this->alone) {
+                $shared = null;
+                $this->warnOnce('alone', 'The rule set store refused the reload flag: this worker loads the invalidation rules on its own and shares nothing until the store can be written.', ['cache-adapter' => get_debug_type($this)]);
+            }
+
             // between this worker's look at the flag and taking it, another
             // worker may have finished a reload: its recent copy is taken
             // over, and its failed attempt is not repeated before RETRY_MS
@@ -2001,6 +2038,43 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         } finally {
             // release the flag, whatever happened
             $shared?->release();
+
+            // and only now log: the other workers no longer wait for this
+            // reload, and a logger that reads this pool finds the attempt
+            // recorded
+            $heldBack = $this->heldBack ?? [];
+            $this->heldBack = null;
+
+            foreach ($heldBack as [$failure, $message, $context]) {
+                $this->report($failure, $message, $context);
+            }
+        }
+    }
+
+    /**
+     * Logs a failure (as CacheItem::log() does, so without a logger it raises
+     * a warning) or a plain warning - but not while this worker reloads the
+     * rules: then it is kept and logged when the reload is over. A logger may
+     * take its time (a handler that sends the record somewhere) or read this
+     * pool. Inside the reload, the first would keep the flag, and every
+     * worker waiting for it, for as long; the second would find the flag
+     * held and no outage recorded yet, and wait for its own reload or, with
+     * no shared copy, start the reload again without end.
+     *
+     * @param array<string, mixed> $context
+     */
+    private function report(bool $failure, string $message, array $context): void
+    {
+        if (null !== $this->heldBack) {
+            $this->heldBack[] = [$failure, $message, $context];
+
+            return;
+        }
+
+        if ($failure) {
+            CacheItem::log($this->logger, $message, $context);
+        } else {
+            $this->logger?->warning($message, $context);
         }
     }
 
@@ -2047,7 +2121,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
                     }
                 }
             } catch (\Exception $e) {
-                CacheItem::log($this->logger, 'Failed to load the invalidation rules: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+                $this->report(true, 'Failed to load the invalidation rules: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
 
                 return false;
             }
@@ -2055,7 +2129,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             // an error reply (BUSY, LOADING) is a failed fetch, as a broken
             // connection is
             if (!\is_array($entries)) {
-                CacheItem::log($this->logger, 'Failed to load the invalidation rules.', ['cache-adapter' => get_debug_type($this)]);
+                $this->report(true, 'Failed to load the invalidation rules.', ['cache-adapter' => get_debug_type($this)]);
 
                 return false;
             }
@@ -2239,7 +2313,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     {
         if (!isset($this->warned[$name])) {
             $this->warned[$name] = true;
-            $this->logger?->warning($message, $context);
+            $this->report(false, $message, $context);
         }
     }
 

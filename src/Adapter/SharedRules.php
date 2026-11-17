@@ -543,6 +543,15 @@ final class SharedRules
     }
 
     /**
+     * Whether this instance holds the flag itself. Its reload ends only when
+     * the code now running returns, so nothing is gained by waiting for it.
+     */
+    public function leads(): bool
+    {
+        return 0 !== $this->lease;
+    }
+
+    /**
      * Releases the flag if this instance still holds it. If it was held too
      * long and another worker took it over, it stays with that worker.
      */
@@ -570,17 +579,23 @@ final class SharedRules
 
     /**
      * When the reload in progress began, on this server's clock, or null when
-     * nobody holds the flag.
+     * nobody holds the flag. $holder tells the reloads apart: it differs
+     * for every taking of the flag, and is 0 when nobody holds it.
+     *
+     * @param-out int $holder
      *
      * @phpstan-impure any worker of the server may take the flag
      */
-    public function reloadStartedAt(): ?float
+    public function reloadStartedAt(?int &$holder = null): ?float
     {
         $held = $this->read($this->key.self::SUFFIX_FLAG);
+        $holder = 0;
 
         if (!\is_int($held) || 0 === $held || self::expired($held)) {
             return null;
         }
+
+        $holder = $held;
 
         return (float) intdiv($held, self::LEASE_NONCE);
     }
