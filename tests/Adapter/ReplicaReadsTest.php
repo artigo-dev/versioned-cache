@@ -59,6 +59,30 @@ final class ReplicaReadsTest extends TestCase
         self::assertSame(0, $redis->primaryReads, 'a single node is not asked twice');
     }
 
+    public function testAfterAResetTheStreamIsReadFromTheStartOnThePrimary(): void
+    {
+        $cluster = new FakeCluster(\RedisCluster::FAILOVER_DISTRIBUTE_SLAVES);
+        $first = $cluster->addRule('a', opened: true);
+        $cluster->storeItem('replica:item', 'v', ['b'], $first);
+        $cluster->addRule('b');
+        $newest = $cluster->addRule('c');
+        $pool = new VersionedRedisTagAwareAdapter($cluster, 'replica', rulesCacheMs: 0, rulesCache: false);
+
+        // the set takes in every rule through another key, so the outdated
+        // item is not read (and dropped) yet
+        self::assertFalse($pool->getItem('witness')->isHit());
+
+        // a failover loses the newest rule, another server appends one, and
+        // the replica the next reads reach holds only the first rule
+        unset($cluster->stream[$newest]);
+        $cluster->addRule('after');
+        $cluster->replicaHolds = 1;
+        $cluster->primaryReads = 0;
+
+        self::assertFalse($pool->getItem('item')->isHit(), 'the rule that outdated the item came from the primary, not from the replica that lacks it');
+        self::assertSame(2, $cluster->primaryReads, 'the answer that reset the set, and the read from the start');
+    }
+
     public function testAWriteAfterAReplicaReadReachesThePrimary(): void
     {
         $cluster = new FakeCluster(\RedisCluster::FAILOVER_DISTRIBUTE_SLAVES);

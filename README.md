@@ -306,16 +306,19 @@ Redis is struggling and the fetch takes 3 seconds.
 - **"Fetch on your own":** every request on server B fetches the rules itself,
   and a Redis node that hangs makes every one of them wait for its own
   timeout.
-- **What this adapter does:** nobody waits but the worker that reloads. For
-  the first second of its fetch, a worker whose copy is at most a second past
-  the window judges by it; one whose copy is older, behind an invalidation
-  made on B, or missing reads every item as a miss and computes it, without
-  the stampede lock, and stores it stamped with its copy's last rule (with no
-  copy, it stores nothing). After that second the fetch counts as an outage
-  for everyone else: every worker judges by the copy it holds, whatever its
-  age, until Redis answers; one that holds none reads every item as a miss,
-  computed without the stampede lock. Server B serves the old price until
-  12:00:03, and recomputes for at most a second.
+- **What this adapter does:** a worker whose copy is at most a second past
+  the window judges by it, at once, for the first second of the fetch. One
+  whose copy is older, behind an invalidation made on B, or missing waits for
+  the fetch (it is one round trip when Redis is well) and is judged by its
+  result. After a second the fetch counts as an outage for everyone else:
+  every worker judges by the copy it holds, whatever its age, until Redis
+  answers; one that holds none reads every item as a miss, computed without
+  the stampede lock. Server B serves the old price until 12:00:03. Requests
+  that came with a usable copy never waited; the others waited at most a
+  second, once. Why a second and not less: Redis runs one command at a time,
+  so a long command of anyone sharing it holds the fetch up as well, and the
+  requests wait for Redis meanwhile anyway; giving up sooner would bring the
+  stampede back in just those moments.
 
 What that promises, in plain words:
 
@@ -334,10 +337,9 @@ What that promises, in plain words:
   stored. Past the guard window that read still refuses its write, once, and
   is then forgotten.
 
-A reload in flight costs at most a second of misses or of a slightly older
-copy, then staleness, and only the reloader waits for it — for as long as its
-fetch's timeouts allow, so keep them short: a second or two to connect and to
-read:
+A reload in flight costs at most a second of a slightly older copy or of
+waiting, then staleness. The reloader waits for as long as its fetch's
+timeouts allow, so keep them short: a second or two to connect and to read:
 
 ```php
 // in the DSN
@@ -405,10 +407,14 @@ outage among them.
   4. while another worker's reload has run for at most a second, a copy at
      most `rulesCacheMs` plus a second old and not behind judges it — with
      `rulesCacheMs: 0`, a copy up to a second old;
-  5. anything else — an older copy, one behind, none — reads every item as a
-     miss, computed without the stampede lock. With a copy, what is computed
-     is stored, stamped with the copy's last rule, which every rule since
-     judges; with none, nothing is stored.
+  5. anything else — an older copy, one behind, none — waits for that
+     reload: it looks at the flag after 0.1 ms, then after twice as long each
+     time, up to 5 ms, and when the flag is free takes the first of these
+     cases again. Usually that is case 1, with the copy the reloader shared, a
+     round trip after the wait began. If the reload failed it is case 2; if it
+     has run a second, case 2 as well. Only a read that has waited a second in
+     all gives up: every item is then a miss, computed without the stampede
+     lock and, with a copy, stored stamped with the copy's last rule.
 - A copy's age counts from the moment the fetch that read it *began*. A
   failure reported by a reload that began before the last success is ignored.
 - A write that follows no read takes its copy the same way — so it can become
@@ -417,7 +423,9 @@ outage among them.
   value it would replace is deleted (see [the guard](#the-invalidation-guard)).
 - An invalidation made on this server: where the invalidating process's copy
   ends at the rule the new one follows, it adds the rule from the id Redis
-  answered. The reply proves that copy holds everything appended before the
+  answered. A process that holds no copy yet (a request that only
+  invalidates), or an older one than the server shares, takes the shared
+  copy first: one read of the rule set store, no round trip. The reply proves that copy holds everything appended before the
   call, so it is stamped with the moment just before it, and the others take
   it for as fresh as that. A mark beside the shared set records the newest
   rule a process of this server appended, and the time after the reply; a

@@ -234,6 +234,28 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     private const SLOW_RELOAD_MS = 1_000;
 
     /**
+     * In milliseconds. How long a read whose copy cannot judge waits for
+     * another worker's reload before it gives up and computes without the
+     * stampede lock, as it did before it waited. A healthy reload is one round
+     * trip, a millisecond or two, but Redis runs one command at a time: a long
+     * command of anyone sharing it (a large DEL, a slow script, a snapshot's
+     * fork) holds the reload up too, and the reading requests wait for Redis
+     * meanwhile anyway. Giving up sooner would bring the stampede back in just
+     * those moments, so the wait lasts as long as a reload may run before it
+     * counts as hanging (SLOW_RELOAD_MS). Lower it to bound the wait when only
+     * the reload is stuck (the reloading worker stalled, its connection lost).
+     */
+    private const RELOAD_WAIT_MS = 1_000;
+
+    /**
+     * In microseconds. A read that waits for another worker's reload looks at
+     * the reload flag again after this long, then after twice as long each
+     * time, up to RELOAD_POLL_MAX_US.
+     */
+    private const RELOAD_POLL_US = 100;
+    private const RELOAD_POLL_MAX_US = 5_000;
+
+    /**
      * In milliseconds. While Redis is down, one worker of the server tries to
      * read the rules again this long after the last attempt ended.
      */
@@ -551,11 +573,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * - When the callback ran after a miss, the write that follows is marked
      *   as this pool's own computation (see doSave()).
      * - If the read missed only because the rules could not be checked (this
-     *   worker has no usable copy while another worker reloads them, or no
-     *   copy at all while Redis is down), the value is computed without the
-     *   stampede lock. Waiting would not help: a waiting worker's own read
-     *   would miss the same way, and with no copy nothing computed is stored
-     *   for it to find.
+     *   worker holds no copy while Redis is down or a reload hangs), the value
+     *   is computed without the stampede lock. Waiting would not help: a
+     *   waiting worker's own read would miss the same way, and with no copy
+     *   nothing computed is stored for it to find.
      *
      * A get() of a key this pool is already computing, called from inside its
      * callback, changes none of this.
@@ -1705,6 +1726,16 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         // anywhere else would skip what was appended in between, so it is
         // left as it is: the note below keeps every worker of this server from
         // using it until it is reloaded.
+        //
+        // A request that has read nothing yet holds no copy, and one that
+        // read long ago an older one than the server shares: the shared copy
+        // is taken over first, at no round trip, so that the rule can go into
+        // it and be shared. Otherwise this invalidation would leave every
+        // worker of the server behind until one of them reloads.
+        if (null !== $this->sharedRules && !$this->alone && \is_string($previous) && $previous !== $this->rules?->last()) {
+            $this->adoptSharedRules($this->sharedRules);
+        }
+
         if (null !== $this->rules && \is_string($previous) && $previous === $this->rules->last()) {
             $this->rules->append($id, $rule, '1' === ($result[2] ?? null));
 
@@ -1754,10 +1785,11 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      *
      * The copy is null when this worker holds none. With unlocked false, the
      * read checks its items against the copy. With unlocked true, the copy may
-     * not be used, so every item is a miss. A value computed after such a miss
-     * carries the copy's last rule id as its watermark, or, with no copy, is
-     * not stored at all. A lock would then only make the workers computing it
-     * queue one behind another.
+     * not be used, so every item is a miss. That is the case with no copy
+     * while the rules cannot be read: nothing computed is stored then, so a
+     * lock would only make the workers computing a key queue one behind
+     * another. (And for a read that gave up waiting for other workers'
+     * reloads, whose value carries the copy's last rule id as its watermark.)
      *
      * The copy is shared with the other workers of this server where a store
      * allows it (see SharedRules). The first of these situations that applies
@@ -1777,11 +1809,18 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      *   (see reload()) and uses what it then holds. If that fetch fails, the
      *   server is in an outage, as in the case above.
      * - Another worker's reload has run for at most SLOW_RELOAD_MS, or it took
-     *   the flag just before this worker could. Nobody waits for it: a copy
-     *   read no more than $rulesCacheMs plus SLOW_RELOAD_MS ago, and not
-     *   missing an invalidation made on this server, is used, with exact reads
-     *   too. Otherwise every item is a miss computed without the lock, until
-     *   the reload is done.
+     *   the flag just before this worker could. A copy read no more than
+     *   $rulesCacheMs plus SLOW_RELOAD_MS ago, and not missing an invalidation
+     *   made on this server, is used at once, with exact reads too.
+     * - Otherwise (an older copy, one missing an invalidation made on this
+     *   server, none) the read waits for that reload (see awaitReload()) and
+     *   starts again from the top: the copy the reloader shared is used, or
+     *   the outage it ran into applies, or, once it has run SLOW_RELOAD_MS,
+     *   the case of a hanging reload. A reload is one round trip, so that is
+     *   what the wait costs; a computation made instead would cost every such
+     *   worker the computation, and a stampede its lock. Only a read that has
+     *   waited RELOAD_WAIT_MS in all gives up: every item is then a miss
+     *   computed without the lock.
      *
      * Nobody fetches the rules but the worker holding the flag, or a worker
      * whose store refuses to record the flag (see reload()). This never
@@ -1793,39 +1832,86 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private function rules(): array
     {
-        // a recent copy: this worker's own
-        if (null !== $this->rules && $this->rulesAreFresh()) {
-            return [$this->rules, false];
-        }
+        // when this read gives up waiting for other workers' reloads; set by
+        // the first wait
+        $waitUntilMs = null;
 
-        // or a newer one another worker shared, taken over here
-        if (null !== $this->sharedRules && $this->adoptSharedRules($this->sharedRules) && $this->rulesAreFresh()) {
-            return [$this->rules, false];
-        }
-
-        // did the last attempt to fetch the rules fail, and is another worker
-        // reloading right now, since when?
-        [$outage, $endedAtMs] = $this->lastAttempt();
-        $startedAtMs = $this->sharedRules?->reloadStartedAt();
-        $nowMs = microtime(true) * 1000;
-
-        // an outage: Redis is down, or another worker's reload hangs
-        if ($outage || (null !== $startedAtMs && $nowMs - $startedAtMs > self::SLOW_RELOAD_MS)) {
-            // the one worker that tries Redis again
-            if (null === $startedAtMs && $this->retryDue($endedAtMs)) {
-                $this->reload();
+        while (true) {
+            // a recent copy: this worker's own
+            if (null !== $this->rules && $this->rulesAreFresh()) {
+                return [$this->rules, false];
             }
 
-            return [$this->rules, null === $this->rules];
-        }
+            // or a newer one another worker shared, taken over here
+            if (null !== $this->sharedRules && $this->adoptSharedRules($this->sharedRules) && $this->rulesAreFresh()) {
+                return [$this->rules, false];
+            }
 
-        // nobody is reloading: this worker does
-        if (null === $startedAtMs && $this->reload()) {
-            return [$this->rules, null === $this->rules];
-        }
+            // did the last attempt to fetch the rules fail, and is another
+            // worker reloading right now, since when?
+            [$outage, $endedAtMs] = $this->lastAttempt();
+            $startedAtMs = $this->sharedRules?->reloadStartedAt();
+            $nowMs = microtime(true) * 1000;
 
-        // another worker is reloading
-        return [$this->rules, !$this->judgesWhileReloading()];
+            // an outage: Redis is down, or another worker's reload hangs
+            if ($outage || (null !== $startedAtMs && $nowMs - $startedAtMs > self::SLOW_RELOAD_MS)) {
+                // the one worker that tries Redis again
+                if (null === $startedAtMs && $this->retryDue($endedAtMs)) {
+                    $this->reload();
+                }
+
+                return [$this->rules, null === $this->rules];
+            }
+
+            // nobody is reloading: this worker does
+            if (null === $startedAtMs && $this->reload()) {
+                return [$this->rules, null === $this->rules];
+            }
+
+            // another worker is reloading, and this worker's copy is recent
+            // enough to judge meanwhile
+            if ($this->judgesWhileReloading()) {
+                return [$this->rules, false];
+            }
+
+            // it is not: wait for that reload and look again. The copy it
+            // shares judges this read; if it failed, the outage above does; if
+            // it hangs, the slow reload above does. A read that has waited
+            // RELOAD_WAIT_MS in all gives up: a miss without the lock
+            $waitUntilMs ??= $nowMs + self::RELOAD_WAIT_MS;
+
+            if (null === $this->sharedRules || !$this->awaitReload($this->sharedRules, $waitUntilMs)) {
+                return [$this->rules, true];
+            }
+        }
+    }
+
+    /**
+     * Waits while another worker holds the reload flag: until it lets go, its
+     * reload has run longer than SLOW_RELOAD_MS, or $untilMs has come. Only
+     * the flag is looked at, never the copy, so a turn costs one read of the
+     * store. It pauses before every look, the first included, so a caller
+     * that comes back at once never spins. False when $untilMs came first.
+     */
+    private function awaitReload(SharedRules $shared, float $untilMs): bool
+    {
+        $pauseUs = self::RELOAD_POLL_US;
+
+        while (true) {
+            usleep($pauseUs);
+            $pauseUs = min(2 * $pauseUs, self::RELOAD_POLL_MAX_US);
+
+            $startedAtMs = $shared->reloadStartedAt();
+            $nowMs = microtime(true) * 1000;
+
+            if (null === $startedAtMs || $nowMs - $startedAtMs > self::SLOW_RELOAD_MS) {
+                return true;
+            }
+
+            if ($nowMs >= $untilMs) {
+                return false;
+            }
+        }
     }
 
     /**
@@ -1880,7 +1966,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
             // start from this worker's copy, so only the rules added since are
             // fetched, or from an empty one, which loads the whole stream
-            $rules = $this->rules ?? new InvalidationRules($this->poolNamespace, $this->rulesRetentionSeconds * 1000, $this->rulesMaxTags);
+            // A copy of its own: a fetch that fails halfway (the stream read
+            // again from the start after a reset, or a later batch) leaves the
+            // copy held as it was
+            $rules = null !== $this->rules ? clone $this->rules : new InvalidationRules($this->poolNamespace, $this->rulesRetentionSeconds * 1000, $this->rulesMaxTags);
             // the time is taken before the fetch, and the copy's age counts
             // from it. A fetch that begins after the local-invalidation note's
             // time includes that note's rule (see behindLocalInvalidation())
@@ -1935,17 +2024,27 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private function fetchRules(InvalidationRules $rules, bool &$startedOver): bool
     {
+        // once the stream is read again from the start, only the primary is
+        // asked: a replica that lags would answer with a stream that ends
+        // early, and nothing held is left to tell
+        $primary = false;
+
         do {
             $from = $rules->last();
             $start = InvalidationRules::NONE === $from ? '-' : $from;
 
             try {
                 $node = $this->rulesNode();
-                $entries = $node->xRange($this->rulesKey, $start, '+', self::RULES_BATCH);
 
-                // a replica's answer in doubt: ask the primary instead
-                if (\is_array($entries) && $this->readsReplicas() && $this->replicaMayLag($rules, $entries)) {
+                if ($primary) {
                     $entries = self::entriesOf($node->eval(self::SCRIPT_RANGE, [$this->rulesKey, $start, (string) self::RULES_BATCH], 1));
+                } else {
+                    $entries = $node->xRange($this->rulesKey, $start, '+', self::RULES_BATCH);
+
+                    // a replica's answer in doubt: ask the primary instead
+                    if (\is_array($entries) && $this->readsReplicas() && $this->replicaMayLag($rules, $entries)) {
+                        $entries = self::entriesOf($node->eval(self::SCRIPT_RANGE, [$this->rulesKey, $start, (string) self::RULES_BATCH], 1));
+                    }
                 }
             } catch (\Exception $e) {
                 CacheItem::log($this->logger, 'Failed to load the invalidation rules: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
@@ -1967,6 +2066,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             $restart = !$rules->continuedBy($entries);
             if ($restart) {
                 $startedOver = true;
+                $primary = $this->readsReplicas();
             }
 
             $rules->absorb($entries);
