@@ -314,7 +314,7 @@ final class SoftInvalidationTest extends TestCase
         self::assertNotNull($reader->takeAgedItem('soft'), 'for the read that keeps it aged');
     }
 
-    public function testTheServerClockIsReadOnceAndUsedAsAnOffset(): void
+    public function testTheServerClockIsReadOnceAndCarriedOn(): void
     {
         $redis = Connection::openSingleNodeAs(SpyRedis::class);
         $this->write('a', 'before', 'menu');
@@ -328,6 +328,54 @@ final class SoftInvalidationTest extends TestCase
         }
 
         self::assertSame(1, $redis->times, 'one TIME for every read of the process');
+    }
+
+    public function testTheServerClockIsReadAgainOnceTheReadingIsOld(): void
+    {
+        $redis = Connection::openSingleNodeAs(SpyRedis::class);
+        $this->write('a', 'before', 'menu');
+        self::assertTrue($this->pool(600)->invalidateTags(['menu']));
+
+        self::assertNotNull($this->agedBy($redis), 'the first reading');
+
+        $this->ageTheReading(55_000);
+        self::assertNotNull($this->agedBy($redis));
+        self::assertSame(1, $redis->times, 'a reading under a minute old is carried on');
+
+        $this->ageTheReading(5_000);
+        self::assertNotNull($this->agedBy($redis), 'counted from the new reading');
+        self::assertSame(2, $redis->times, 'a reading a minute old is read again');
+    }
+
+    public function testAServerClockThatMovedIsFollowed(): void
+    {
+        $redis = Connection::openSingleNodeAs(SpyRedis::class);
+        $this->write('a', 'before', 'menu');
+        self::assertTrue($this->pool(600)->invalidateTags(['menu']));
+
+        self::assertNotNull($this->agedBy($redis));
+
+        // the server's clock is now past the grace; the reading in hand is still young
+        $redis->aheadMs = 700_000;
+        self::assertNotNull($this->agedBy($redis), 'the reading in hand is carried on');
+
+        $this->ageTheReading(60_000);
+        self::assertNull($this->agedBy($redis), 'past the grace on the clock read again');
+    }
+
+    public function testAnOldReadingIsNotUsedWhenTheClockCannotBeReadAgain(): void
+    {
+        $redis = Connection::openSingleNodeAs(SpyRedis::class);
+        $this->write('a', 'before', 'menu');
+        self::assertTrue($this->pool(600)->invalidateTags(['menu']));
+
+        self::assertNotNull($this->agedBy($redis));
+
+        $redis->timesFail = true;
+        self::assertNotNull($this->agedBy($redis), 'the reading in hand is carried on');
+
+        $this->ageTheReading(60_000);
+        self::assertNull($this->agedBy($redis), 'hard while the clock cannot be read');
     }
 
     public function testARecomputationAcrossASoftInvalidationNeverReadsFresh(): void
@@ -356,6 +404,38 @@ final class SoftInvalidationTest extends TestCase
     {
         $pool = $this->pool();
         self::assertTrue($pool->save($pool->getItem($key)->set($value)->tag($tag)));
+    }
+
+    /**
+     * What a new pool of the process keeps of the softly invalidated "a".
+     *
+     * @return array{value: mixed, tags: list<string>, ageMs: int}|null
+     */
+    private function agedBy(SpyRedis $redis): ?array
+    {
+        $reader = new VersionedRedisTagAwareAdapter($redis, $this->namespace, rulesCacheMs: 0, rulesCache: false, softGraceSeconds: 600);
+        $reader->getItem('a');
+
+        return $reader->takeAgedItem('a');
+    }
+
+    /**
+     * Makes the process's reading of the server's clock that much older, as
+     * if the process had run on meanwhile.
+     */
+    private function ageTheReading(int $ms): void
+    {
+        $clocks = new \ReflectionProperty(VersionedRedisTagAwareAdapter::class, 'serverClocks');
+        $all = $clocks->getValue();
+        self::assertIsArray($all);
+
+        foreach ($all as $rulesKey => $clock) {
+            if (\is_array($clock) && \is_float($clock[1] ?? null) && str_contains((string) $rulesKey, $this->namespace)) {
+                $all[$rulesKey] = [$clock[0], $clock[1] - $ms];
+            }
+        }
+
+        $clocks->setValue(null, $all);
     }
 
     private function exists(string $key): int

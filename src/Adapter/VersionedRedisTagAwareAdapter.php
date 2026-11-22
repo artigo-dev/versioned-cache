@@ -262,6 +262,15 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     private const RETRY_MS = 1_000;
 
     /**
+     * In milliseconds. How long a reading of the Redis server's clock is
+     * carried on by ours before it is read again. The two clocks drift apart,
+     * the server's can be stepped, and a failover hands the rules to a node
+     * with a clock of its own: a long-running process is wrong about the age
+     * of a soft invalidation by at most what builds up in this time.
+     */
+    private const SERVER_CLOCK_MS = 60_000;
+
+    /**
      * Flags per key for a get() in progress. GET_UNLOCKED: the read missed
      * only because the rules could not be checked, so the value is computed
      * without the stampede lock (waiting for another worker would not help).
@@ -477,13 +486,13 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     private array $aged = [];
 
     /**
-     * The Redis server's clock minus ours, in milliseconds, by rules key. Read
-     * once per process, because the age of a soft invalidation is counted on
-     * the server's clock.
+     * The Redis server's clock by rules key: its last reading and our monotonic
+     * clock at that reading, both in milliseconds. Kept for the process,
+     * because the age of a soft invalidation is counted on the server's clock.
      *
-     * @var array<string, float>
+     * @var array<string, array{float, float}>
      */
-    private static array $clockOffsets = [];
+    private static array $serverClocks = [];
 
     /**
      * Not readonly: __clone() binds it to the clone, and PHP allows that for
@@ -2507,16 +2516,18 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
-     * The Redis server's clock in milliseconds. The offset from our clock is
-     * read once per process and pool, and our clock carries it on from there.
-     * Null when it cannot be read, so every invalidation counts as hard until
-     * it can.
+     * The Redis server's clock in milliseconds. A reading is carried on by our
+     * monotonic clock, which a step of the local time does not move, and read
+     * again after SERVER_CLOCK_MS. Null when it cannot be read, so every
+     * invalidation counts as hard until it can: a reading past that age is
+     * not used.
      */
     private function serverNowMs(): ?int
     {
-        if (!isset(self::$clockOffsets[$this->rulesKey])) {
-            $before = microtime(true) * 1000;
+        $nowMs = hrtime(true) / 1e6;
+        $clock = self::$serverClocks[$this->rulesKey] ?? null;
 
+        if (null === $clock || $nowMs - $clock[1] >= self::SERVER_CLOCK_MS) {
             try {
                 $time = match (true) {
                     $this->redis instanceof \RedisCluster, $this->redis instanceof \Relay\Cluster => $this->redis->time($this->rulesKey),
@@ -2533,10 +2544,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
             // the server answered somewhere between the two readings of ours
             $serverMs = (int) $time[0] * 1000 + intdiv((int) $time[1], 1000);
-            self::$clockOffsets[$this->rulesKey] = $serverMs - ($before + microtime(true) * 1000) / 2;
+            $afterMs = hrtime(true) / 1e6;
+            $clock = self::$serverClocks[$this->rulesKey] = [(float) $serverMs, ($nowMs + $afterMs) / 2];
+            $nowMs = $afterMs;
         }
 
-        return (int) (microtime(true) * 1000 + self::$clockOffsets[$this->rulesKey]);
+        return (int) ($clock[0] + $nowMs - $clock[1]);
     }
 
     /**

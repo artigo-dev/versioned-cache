@@ -27,6 +27,12 @@ final class SpyRedis extends \Redis
 
     public int $times = 0;
 
+    /** The server's clock reads that much later, as after a step or a failover to a node ahead */
+    public int $aheadMs = 0;
+
+    /** TIME raises, as when the node cannot be reached */
+    public bool $timesFail = false;
+
     /** @var list<array{string, string}> each script sent: [evalsha or eval, its key] */
     public array $scripts = [];
 
@@ -142,7 +148,17 @@ final class SpyRedis extends \Redis
     {
         ++$this->times;
 
-        return parent::time();
+        if ($this->timesFail) {
+            throw new \RedisException('read error on connection');
+        }
+
+        $time = parent::time();
+
+        if (0 !== $this->aheadMs && \is_array($time)) {
+            $time[0] += intdiv($this->aheadMs, 1000);
+        }
+
+        return $time;
     }
 
     /**
