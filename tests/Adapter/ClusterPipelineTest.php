@@ -463,14 +463,17 @@ final class ClusterPipelineTest extends TestCase
         self::assertFalse($pool->commit());
         self::assertSame($execs + 1, $cluster->execs, 'one pipeline, not answered');
 
-        // a delete: no unlink, which would wait for the same node. On Windows
-        // its raw commands never enter a pipeline
+        // a delete: no unlink, which would wait for the same node. Symfony
+        // may try a failed delete again key by key, so those fail too. On
+        // Windows its raw commands never enter a pipeline
         if ('Windows' !== \PHP_OS_FAMILY) {
-            $cluster->execFailures = 1;
+            $cluster->execFailures = 3;
             $cluster->unlinked = [];
 
             self::assertFalse($this->pool($cluster)->deleteItems(['w1', 'w2']));
             self::assertSame([], $cluster->unlinked);
+
+            $cluster->execFailures = 0;
         }
 
         // a prune whose batch was not answered judged nothing
