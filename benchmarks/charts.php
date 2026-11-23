@@ -22,7 +22,7 @@ declare(strict_types=1);
 namespace Artigo\Cache\Benchmarks;
 
 /*
- * php benchmarks/bench.php items=20000
+ * php -d apc.enable_cli=1 benchmarks/bench.php items=20000
  * 20 000 items, 18 tags each, Redis 8.10, PHP 8.5. Commands executed by Redis
  * to invalidate one tag, by how many items that tag matched.
  */
@@ -36,7 +36,7 @@ const INVALIDATION = [
 ];
 
 /*
- * php benchmarks/bench.php items=20000 · php benchmarks/bench.php items=20000 unique=1
+ * php -d apc.enable_cli=1 benchmarks/bench.php items=20000 · the same with unique=1
  * The same 20 000 items read once each as hits, on Redis 8.10, PHP 8.5, the
  * benchmark in a container on the Redis container's network. Socket reads Redis did - round trips - by whether every item
  * carries a tag of its own (the entity tag applications really use) or only
