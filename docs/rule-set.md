@@ -130,8 +130,8 @@ What that promises, in plain words:
   elsewhere are seen when Redis answers again, and nobody but one request per
   server per second fetches rules.
 - No value computed after a read without rules, or without its epoch, is
-  stored. Past the guard window that read still refuses its write, once, and
-  is then forgotten.
+  stored. Past the guard window that read still refuses every write after it,
+  until the key is read again.
 
 A reload in flight costs at most a second of a slightly older copy or of
 waiting, then staleness. The reloader waits for as long as its fetch's

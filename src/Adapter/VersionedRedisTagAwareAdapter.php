@@ -441,6 +441,13 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private ?bool $readsReplicas = null;
 
+    /**
+     * True once this cluster client refused a raw command inside a pipeline.
+     * phpredis refuses every one there, so a batch that holds one goes out one
+     * command at a time from then on (see clusterPipeline()).
+     */
+    private bool $refusesRawInPipeline = false;
+
     private readonly int $guardWindowMs;
 
     /**
@@ -936,7 +943,6 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         $unlink = [];
         $mark = null;
         $markRead = false;
-        $nowMs = microtime(true) * 1000;
 
         foreach ($marshalled as $id => $value) {
             $id = (string) $id;
@@ -994,17 +1000,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             }
 
             if (null !== $refusal) {
-                // a read that had no copy of the rules, or could not read the
-                // item's epoch, refuses the write that follows it. Once that
-                // read is older than the guard window, it refuses this one
-                // write and is then forgotten, so the write after that is a
-                // normal one
-                if (null !== $record && $nowMs - $record[2] > $this->guardWindowMs) {
-                    $this->records->drop($id);
-                }
-
-                // get() computed this after its own miss: what Redis holds may
-                // still be valid, so it stays
+                // the read stays remembered, however old: the same value saved
+                // again is refused again, until the key is read again. get()
+                // computed this after its own miss: what Redis holds may still
+                // be valid, so it stays
                 if ($this->ownComputation($id)) {
                     $failed[] = $id;
                     $this->logger?->info('Refused to save "{key}": {reason}.', ['key' => $id, 'reason' => $refusal, 'cache-adapter' => get_debug_type($this)]);
@@ -1047,17 +1046,22 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
         // a server that does not have the guarded-write script cached (after a
         // restart, a failover or SCRIPT FLUSH) answers false: the write is
-        // sent again with the script's full body
+        // sent again with the script's full body. A batch the cluster did not
+        // answer at all (null) is not sent again
         $again = [];
 
         foreach ($guarded as $id => $arguments) {
-            if (!\is_int($results[$first[$id]] ?? null)) {
+            $result = $results[$first[$id]] ?? null;
+
+            if (null !== $result && !\is_int($result)) {
                 $again[$id] = ['eval', self::SCRIPT_GUARDED_WRITE, $arguments, 1];
             }
         }
 
+        // with new epochs: the one built with the batch may already be on the
+        // server, from a first run of a batch that was sent again
         if ([] !== $again) {
-            foreach (array_combine(array_keys($again), $this->pipeline(array_values($again))) as $id => $result) {
+            foreach (array_combine(array_keys($again), $this->pipeline($this->freshEpochs(array_values($again)))) as $id => $result) {
                 $results[$first[$id]] = $result;
             }
         }
@@ -1081,15 +1085,15 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             $result = $results[$index] ?? null;
 
             // refused, and a tombstone written instead. The remembered read
-            // stays (unless it was past the guard window), so saving the item
-            // again is refused too
+            // stays, so saving the item again is refused too
             if (isset($dropped[$id])) {
                 $failed[] = $id;
                 $this->logger?->info('Refused to save "{key}": {reason}, so the stored value was dropped instead.', ['key' => $id, 'reason' => $dropped[$id], 'cache-adapter' => get_debug_type($this)]);
 
                 // a value of another type under the key refuses the
-                // tombstone: the key is deleted instead
-                if (1 !== $result) {
+                // tombstone: the key is deleted instead. Not where the
+                // cluster did not answer
+                if (1 !== $result && null !== $result) {
                     $this->unlink([$id]);
                 }
 
@@ -1376,6 +1380,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             return false;
         }
 
+        // the cluster did not answer: nothing is known of the keys, and an
+        // unlink would wait for the same node
+        if (\in_array(null, $results, true)) {
+            return false;
+        }
+
         $raw = [];
 
         foreach ($ids as $index => $id) {
@@ -1489,6 +1499,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         }
 
         $rows = $this->pipeline($calls);
+
+        // a batch the cluster did not answer was not judged
+        if (\in_array(null, $rows, true)) {
+            return false;
+        }
+
         $stale = [];
 
         foreach ($ids as $index => $id) {
@@ -2739,16 +2755,31 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
     /**
      * Whether a write goes out through the client's typed methods rather than
-     * as a raw command: on a cluster that reads from replicas. There phpredis
-     * sends a raw command to the node the last read of its slot went to, a
-     * replica, which refuses a write. A typed write goes to the primary.
-     * Relay's cluster client is given the same typed calls. Where the client
-     * has no hsetex() (phpredis before 6.3), the raw command is all there is.
+     * as a raw command: on a phpredis cluster, and on any cluster that reads
+     * from replicas. phpredis follows a MOVED or ASK for a typed command, and
+     * not an ASK for a raw one, so a raw write of a key whose slot is being
+     * moved fails. A cluster pipeline refuses a raw command, and typed writes
+     * ride it. On a cluster that reads from replicas, phpredis sends a raw
+     * command to the node the last read of its slot went to, a replica, which
+     * refuses a write; a typed write goes to the primary. Not on Windows,
+     * unless the reads go to replicas: there a C long, which the typed
+     * methods pass their integers through, is 32 bits wide (see command()),
+     * so the writes stay raw and go one command at a time (see
+     * clusterPipeline()). Relay's cluster client is given the same typed
+     * calls where it reads from replicas. Where the client has no hsetex()
+     * (phpredis before 6.3), the raw command is all there is.
      */
     private function writesTyped(): bool
     {
-        return ($this->redis instanceof \RedisCluster || $this->redis instanceof \Relay\Cluster)
-            && $this->readsReplicas()
+        if (!$this->redis instanceof \RedisCluster && !$this->redis instanceof \Relay\Cluster) {
+            return false;
+        }
+
+        // a 32-bit PHP, whose C long is 32 bits wide too, never gets here:
+        // the constructor refuses it
+        $wideLong = $this->redis instanceof \RedisCluster && 'Windows' !== \PHP_OS_FAMILY;
+
+        return ($wideLong || $this->readsReplicas())
             && method_exists($this->redis, 'hsetex'); // @phpstan-ignore function.alreadyNarrowedType (the stubs describe phpredis 6.3; an older one has no hsetex())
     }
 
@@ -2888,16 +2919,17 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             // a client may throw on a script the server does not hold, instead
             // of answering false in its slot. Then the batch is sent again one
             // call at a time, where such a refusal comes back as false and is
-            // sent again with the script's full body. Every other call is a
-            // read, or a write that can be repeated as it was. A guarded write
-            // that was stored the first time is refused the second time,
-            // because the item now holds its new epoch: it is reported as
-            // failed though the value is stored, which is the safe direction
-            if (!self::sendsAScript($calls)) {
+            // sent again with the script's full body. Some or all of the batch
+            // ran, so every epoch it set is made anew (see freshEpochs()). A
+            // guarded write that was stored the first time is refused the
+            // second time, because the item now holds its new epoch: it is
+            // reported as failed though the value is stored, which is the safe
+            // direction
+            if (!self::sends($calls, 'evalSha')) {
                 throw $e;
             }
 
-            return $this->oneAtATime($calls);
+            return $this->oneAtATime($this->freshEpochs($calls));
         }
 
         if (!\is_array($results) || \count($results) !== \count($calls)) {
@@ -2940,12 +2972,14 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
+     * Whether any of the calls is to $method.
+     *
      * @param list<array{0: string, ...}> $calls
      */
-    private static function sendsAScript(array $calls): bool
+    private static function sends(array $calls, string $method): bool
     {
         foreach ($calls as $call) {
-            if ('evalSha' === $call[0]) {
+            if ($method === $call[0]) {
                 return true;
             }
         }
@@ -2958,17 +2992,40 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * calls. An answer that is no list, or not one per call, means every call
      * failed, as on a single node.
      *
+     * A pipeline that throws, while its calls are queued or in exec(), is sent
+     * again one command at a time, as a cluster without pipelines sends it.
+     * phpredis refuses a raw command in a pipeline, and aborts the whole
+     * pipeline on a MOVED or ASK, which every command in a slot being moved
+     * may answer for as long as the move lasts; on its own, a typed command
+     * follows the redirect (a raw one does not follow an ASK). What that
+     * throws reaches the caller as on a cluster without pipelines.
+     *
+     * A batch sent again gets new epochs (see freshEpochs()): exec() may throw
+     * after some of its calls ran. It is not sent again when exec() took the
+     * client's read timeout: a node that did not answer within it would keep
+     * each single command waiting as long again. Then every call is answered
+     * null, not false, so that nothing is sent again because of it: no script
+     * as a body, no unlink. A read timeout of 0 sets no such limit.
+     *
      * @param list<array{0: string, ...}> $calls
      *
      * @return list<mixed>
      */
     private function clusterPipeline(\RedisCluster $redis, array $calls): array
     {
+        // this client refuses every raw command in a pipeline: none is opened
+        // for a batch that holds one
+        if ($this->refusesRawInPipeline && self::sends($calls, 'rawCommand')) {
+            return $this->oneAtATime($calls);
+        }
+
         if (false === $redis->multi(\Redis::PIPELINE)) {
             return array_fill(0, \count($calls), false);
         }
 
-        $sent = false;
+        // the call being queued, and when exec() began: null until it does
+        $method = null;
+        $sentAt = null;
 
         try {
             foreach ($calls as $call) {
@@ -2976,16 +3033,35 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
                 $redis->{$method}(...$call);
             }
 
-            $sent = true;
+            $sentAt = hrtime(true);
             $results = $redis->exec();
-        } finally {
+        } catch (\Throwable $e) {
             // a pipeline left open would take the next command into it
-            if (!$sent) {
-                try {
-                    $redis->discard();
-                } catch (\Throwable) {
-                }
+            self::closePipeline($redis);
+
+            if (!$e instanceof \Exception) {
+                throw $e;
             }
+
+            // thrown while queueing: phpredis sends nothing before exec(), but
+            // new epochs cost nothing and need no such promise. phpredis
+            // refuses a raw command there, and every one alike
+            if (null === $sentAt) {
+                if ('rawCommand' === $method && $e instanceof \RedisClusterException) {
+                    $this->refusesRawInPipeline = true;
+                }
+
+                return $this->oneAtATime($this->freshEpochs($calls));
+            }
+
+            // no answer at all: null, which the callers tell from false
+            if (self::waitedOut($redis, hrtime(true) - $sentAt)) {
+                CacheItem::log($this->logger, 'A cluster pipeline failed after the read timeout and was not sent again: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+
+                return array_fill(0, \count($calls), null);
+            }
+
+            return $this->oneAtATime($this->freshEpochs($calls));
         }
 
         if (!\is_array($results) || \count($results) !== \count($calls)) {
@@ -2993,6 +3069,79 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         }
 
         return array_values($results);
+    }
+
+    /**
+     * Drops what a failed pipeline still holds. phpredis closes a pipeline
+     * itself when exec() fails, and on some refusals while queueing, and
+     * discard() warns on a client no longer in one: so the mode is asked first.
+     */
+    private static function closePipeline(\RedisCluster $redis): void
+    {
+        try {
+            if (\Redis::ATOMIC !== $redis->getMode()) {
+                $redis->discard();
+            }
+        } catch (\Throwable) {
+            // nothing else to try: the batch is sent one command at a time
+        }
+    }
+
+    /**
+     * Whether a failed exec() lasted the client's read timeout. A timeout of
+     * 0, or one that cannot be read, sets no limit.
+     */
+    private static function waitedOut(\RedisCluster $redis, int|float $elapsedNs): bool
+    {
+        try {
+            $timeout = $redis->getOption(\Redis::OPT_READ_TIMEOUT);
+        } catch (\Throwable) {
+            return false;
+        }
+
+        return is_numeric($timeout) && 0 < (float) $timeout && $elapsedNs >= (float) $timeout * 1e9;
+    }
+
+    /**
+     * The calls with a new epoch wherever one of them sets one: the epoch
+     * field of an HSETEX, a plain write's or a tombstone's, and the new epoch
+     * of a guarded write. A batch sent again after some of it ran must not put
+     * back an epoch that a delete in between replaced: a write whose read saw
+     * that epoch would then be stored across the delete. A new one refuses
+     * it.
+     *
+     * @param list<array{0: string, ...}> $calls
+     *
+     * @return list<array{0: string, ...}>
+     */
+    private function freshEpochs(array $calls): array
+    {
+        // a raw command's name comes after its address on a cluster or array
+        $name = $this->redis instanceof \Redis || $this->redis instanceof \Relay\Relay ? 1 : 2;
+
+        foreach ($calls as $index => $call) {
+            $arguments = $call[2] ?? null;
+
+            if ('hSetEx' === $call[0] && \is_array($arguments) && isset($arguments[self::FIELD_EPOCH])) {
+                $arguments[self::FIELD_EPOCH] = self::epoch();
+                $call[2] = $arguments;
+            } elseif (('evalSha' === $call[0] || 'eval' === $call[0]) && \in_array($call[1] ?? null, [self::guardedWriteSha(), self::SCRIPT_GUARDED_WRITE], true) && \is_array($arguments) && isset($arguments[5])) {
+                // [key, value, tags, watermark, epoch seen, new epoch, ttl, window]
+                $arguments[5] = self::epoch();
+                $call[2] = $arguments;
+            } elseif ('rawCommand' === $call[0] && 'HSETEX' === ($call[$name] ?? null)) {
+                // HSETEX key PX ms FIELDS n, then the fields and their values
+                for ($field = $name + 6; $field + 1 < \count($call); $field += 2) {
+                    if (self::FIELD_EPOCH === $call[$field]) {
+                        $call[$field + 1] = self::epoch();
+                    }
+                }
+            }
+
+            $calls[$index] = $call;
+        }
+
+        return $calls;
     }
 
     /**

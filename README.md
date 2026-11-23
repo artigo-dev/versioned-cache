@@ -442,6 +442,18 @@ cluster's three masters are no different from one: the adapter runs on a
 single node, a cluster, ext-redis' `RedisArray` and through Relay, with or
 without a client-side key prefix (`OPT_PREFIX`), and CI covers each.
 
+On a cluster, phpredis 6.3 sends one command per round trip: a `getItems()` of
+100 keys is 100 round trips. With phpredis's cluster pipelines (not yet
+released), the adapter sends each batch as one pipeline, one round trip per
+master: on three masters 3 instead of 100, and 6 instead of 200 for 100 misses
+and the batch write after them. A `get()` loop reads one key per call and
+does not change. While a slot is being moved, phpredis gives up any pipeline
+that touches it, and the adapter sends that batch again one command at a
+time. On Windows a batch that holds a plain write, a delete or the drop of an
+outdated item goes one command at a time, because phpredis passes the numbers
+of its typed calls through a 32-bit integer there; reads, and a batch of
+guarded writes alone (scripts), are still pipelined.
+
 ```php
 // a cluster of three masters, every command routed by its key
 $redis = RedisAdapter::createConnection('redis:?host[127.0.0.1:7110]&host[127.0.0.1:7111]&host[127.0.0.1:7112]&redis_cluster=1');

@@ -81,9 +81,14 @@ write after it is not stored either, by the same rule. (With
 plain one. With no rule set held, `get()`'s own computation after its miss
 still leaves the key as it was, and any other write unlinks the value it
 would replace.)
-Such a doubtful read refuses the write after it even past the guard window,
-once, by the same rule, and is then forgotten, so the write after that is a
-normal one; `reset()` forgets it at once. A plain hit forgets the
+Such a doubtful read refuses every write after it, however old it is, until
+the key is read again: a save tried again may be the same value, computed from
+what that read could not see. The end of the `get()` that made the read
+forgets it, and `reset()` forgets it at once; so do a thousand newer reads,
+which push it out, and a save after that is a plain write again. A caller
+that keeps one item and saves it again and again without reading it writes a
+tombstone each time, which deletes a value another process stored in between:
+misses, never a stale value. A plain hit forgets the
 read before it; so does a write that lands and the pool's own
 delete of the key. The pool's own `invalidateTags()` and `clear()` move the
 reads that had seen the stream up to them on to the new rule: a value

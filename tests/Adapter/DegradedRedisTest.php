@@ -19,6 +19,7 @@ use Symfony\Component\Cache\Adapter\ArrayAdapter;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
 use Symfony\Component\Cache\CacheItem;
 use Symfony\Component\Cache\Exception\InvalidArgumentException;
+use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\ItemInterface;
 
 /**
@@ -316,14 +317,76 @@ final class DegradedRedisTest extends TestCase
         self::assertSame(['e'], array_keys((array) $reads->hGetAll('degraded:k')), 'a tombstone, not the value');
     }
 
-    public function testADoubtfulReadPastTheWindowRefusesTheWriteAfterItOnce(): void
+    /**
+     * A stampede lock may save the value itself and leave $save true when that
+     * save fails, so Symfony saves it once more: the second save is the same
+     * write, and is refused as the first was.
+     */
+    public function testAWriteAfterADoubtfulReadPastTheWindowIsRefusedWhenSavedTwice(): void
+    {
+        $reads = [
+            'a read without rules' => [BrokenRulesRedis::class, static function (\Redis $redis, bool $failing): void {
+                \assert($redis instanceof BrokenRulesRedis);
+                $redis->broken = $failing;
+            }],
+            'a read that learned no epoch' => [DeadPipelineRedis::class, static function (\Redis $redis, bool $failing): void {
+                \assert($redis instanceof DeadPipelineRedis);
+                $redis->dead = $failing;
+            }],
+        ];
+        $meanwhile = [
+            'an invalidation' => static fn (VersionedRedisTagAwareAdapter $other, string $key): bool => $other->invalidateTags(['t']),
+            'a delete' => static fn (VersionedRedisTagAwareAdapter $other, string $key): bool => $other->deleteItem($key),
+        ];
+
+        foreach ($reads as $read => [$class, $fail]) {
+            // every connection first: opening one sweeps what the others wrote
+            $redis = $this->open($class);
+            $plain = $this->open(\Redis::class);
+            $other = new VersionedRedisTagAwareAdapter($plain, 'degraded', rulesCacheMs: 0, rulesCache: false, guardWindowSeconds: 1);
+            self::assertTrue($other->invalidateTags(['unrelated']));
+
+            foreach ($meanwhile as $change => $apply) {
+                $key = 'k'.md5($read.$change);
+                self::assertTrue($other->save($other->getItem($key)->set('old')->tag('t')));
+
+                $pool = new VersionedRedisTagAwareAdapter($redis, 'degraded', rulesCacheMs: 0, rulesCache: false, guardWindowSeconds: 1);
+                $pool->setCallbackWrapper(static function (callable $callback, ItemInterface $item, bool &$save, CacheInterface $pool): mixed {
+                    $value = $callback($item, $save);
+
+                    if ($item instanceof CacheItem && $pool instanceof VersionedRedisTagAwareAdapter && !$pool->save($item->set($value))) {
+                        $save = true;
+                    }
+
+                    return $value;
+                });
+
+                $fail($redis, true);
+                $value = $pool->get($key, static function (ItemInterface $item) use ($redis, $fail, $other, $apply, $key): string {
+                    $fail($redis, false);
+                    $item->tag('t');
+                    // the computation outlasts the window, and the item changes under it
+                    usleep(1_100_000);
+                    self::assertTrue($apply($other, $key));
+
+                    return 'computed before the change';
+                });
+
+                self::assertSame('computed before the change', $value, \sprintf('%s, %s: the caller gets its value', $read, $change));
+                self::assertFalse($other->getItem($key)->isHit(), \sprintf('%s, %s: neither save stored it', $read, $change));
+            }
+        }
+    }
+
+    public function testADoubtfulReadPastTheWindowRefusesEveryWriteAfterItUntilTheNextRead(): void
     {
         // every connection first: opening one sweeps what the others wrote
         $broken = $this->open(BrokenRulesRedis::class);
         $dead = $this->open(DeadPipelineRedis::class);
         $writer = new VersionedRedisTagAwareAdapter($broken, 'degraded', rulesCacheMs: 0, rulesCache: false, guardWindowSeconds: 1);
         self::assertTrue($writer->invalidateTags(['other']));
-        self::assertTrue($writer->save($writer->getItem('unknown')->set('old')));
+        self::assertTrue($writer->save($writer->getItem('unjudged')->set('old')->tag('t')));
+        self::assertTrue($writer->save($writer->getItem('unknown')->set('old')->tag('t')));
 
         // a read that reached no verdict, and one that learned no epoch
         $unjudged = new VersionedRedisTagAwareAdapter($broken, 'degraded', rulesCacheMs: 0, rulesCache: false, guardWindowSeconds: 1);
@@ -336,19 +399,25 @@ final class DegradedRedisTest extends TestCase
         $noEpoch = $unknown->getItem('unknown');
         $dead->dead = false;
 
-        // saves that come long after them, past the window
+        // a computation that outlasts the window, and an invalidation of its
+        // item while it runs
         usleep(1_100_000);
+        self::assertTrue($writer->invalidateTags(['t']));
 
-        self::assertFalse($unjudged->save($noVerdict->set('later')), 'past the window a read still refuses the write after it');
-        self::assertFalse($unknown->save($noEpoch->set('later')));
-        self::assertSame(['e'], array_keys((array) $broken->hGetAll('degraded:unjudged')), 'a save after it deletes');
-        self::assertSame(['e'], array_keys((array) $broken->hGetAll('degraded:unknown')));
+        foreach (['unjudged' => [$unjudged, $noVerdict], 'unknown' => [$unknown, $noEpoch]] as $key => [$pool, $item]) {
+            self::assertFalse($pool->save($item->set('computed before the rule')->tag('t')), \sprintf('%s: past the window a read still refuses the write after it', $key));
+            self::assertSame(['e'], array_keys((array) $broken->hGetAll('degraded:'.$key)), \sprintf('%s: a save after it deletes', $key));
 
-        // once: then the read is forgotten, and the write after that lands
-        self::assertTrue($unjudged->save($noVerdict->set('later')));
-        self::assertTrue($unknown->save($noEpoch->set('later')));
-        self::assertSame('later', $unjudged->getItem('unjudged')->get());
-        self::assertSame('later', $unknown->getItem('unknown')->get());
+            // the same write tried again at once
+            self::assertFalse($pool->save($item), \sprintf('%s: and refuses it again', $key));
+            self::assertSame(['e'], array_keys((array) $broken->hGetAll('degraded:'.$key)), \sprintf('%s: nothing stored', $key));
+
+            // a read of the key ends it: the write after that lands
+            $again = $pool->getItem($key);
+            self::assertFalse($again->isHit());
+            self::assertTrue($pool->save($again->set('later')), \sprintf('%s: after the next read', $key));
+            self::assertSame('later', $pool->getItem($key)->get());
+        }
     }
 
     public function testAComputationThatOutlastsTheWindowAfterAReadWithoutRulesIsNotStored(): void

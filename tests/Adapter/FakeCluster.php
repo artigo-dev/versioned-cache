@@ -12,18 +12,21 @@ declare(strict_types=1);
 namespace Artigo\Cache\Tests\Adapter;
 
 /**
- * A cluster client with no cluster behind it, as phpredis 6.3 has one: no
- * pipeline(), so every call goes out on its own. Reads come from a replica
- * where $failover says so (see FakeServer).
+ * A cluster client with no cluster behind it, as the phpredis in use has one.
+ * A subclass inherits pipeline() where the release has it, so it pipelines
+ * there (see FakePipeline); phpredis 6.3 has none, and every call goes out on
+ * its own. Reads come from a replica where $failover says so (see FakeServer).
  */
 final class FakeCluster extends \RedisCluster
 {
+    use FakePipeline;
     use FakeServer;
 
     /** How many reads went out one at a time */
     public int $direct = 0;
 
-    public int $multis = 0;
+    /** How many raw commands were sent or queued */
+    public int $raw = 0;
 
     public function __construct(private readonly int $failover = \RedisCluster::FAILOVER_NONE)
     {
@@ -48,7 +51,7 @@ final class FakeCluster extends \RedisCluster
      */
     public function eval(string $script, array $args = [], int $num_keys = 0): mixed
     {
-        return $this->evaluate($script, $args);
+        return $this->answer($this->evaluate($script, $args));
     }
 
     /**
@@ -58,19 +61,21 @@ final class FakeCluster extends \RedisCluster
      */
     public function evalsha(string $sha1, array $args = [], int $num_keys = 0): mixed
     {
-        return false;
+        return $this->answer(false);
     }
 
     /**
      * @param array<mixed> $keys
      *
-     * @return array<string, string|false>
+     * @return static|array<string, string|false>
      */
-    public function hmget(string $key, array $keys): array
+    public function hmget(string $key, array $keys): static|array
     {
-        ++$this->direct;
+        if (null === $this->queued) {
+            ++$this->direct;
+        }
 
-        return $this->row($key, $keys);
+        return $this->answer($this->row($key, $keys));
     }
 
     /**
@@ -93,14 +98,16 @@ final class FakeCluster extends \RedisCluster
             throw new \RedisClusterException('Unable to send command to the specified node');
         }
 
-        return 1;
+        ++$this->raw;
+
+        return $this->answer(1);
     }
 
     /**
      * @param array<mixed>      $fields
      * @param array<mixed>|null $expiry
      */
-    public function hsetex(string $key, array $fields, ?array $expiry = null): int
+    public function hsetex(string $key, array $fields, ?array $expiry = null): static|int
     {
         $this->items[$key] = [];
 
@@ -108,21 +115,45 @@ final class FakeCluster extends \RedisCluster
             $this->items[$key][(string) $field] = \is_scalar($value) ? (string) $value : '';
         }
 
-        return 1;
+        return $this->answer(1);
     }
 
-    public function expire(string $key, int $timeout, ?string $mode = null): bool
+    public function expire(string $key, int $timeout, ?string $mode = null): static|bool
     {
-        return true;
+        return $this->answer(true);
+    }
+
+    public function hdel(string $key, string $member, string ...$other_members): static|int
+    {
+        foreach ([$member, ...$other_members] as $field) {
+            unset($this->items[$key][$field]);
+        }
+
+        return $this->answer(1 + \count($other_members));
     }
 
     /**
-     * phpredis 6.3 refuses a pipeline on a cluster; counted, and refused.
+     * @param array<mixed> $fields
+     *
+     * @return static|list<int>
      */
-    public function multi(int $value = \Redis::MULTI): \RedisCluster|bool
+    public function hpexpire(string $key, int $ttl, array $fields, ?string $mode = null): static|array
     {
-        ++$this->multis;
+        return $this->answer(array_fill(0, \count($fields), 1));
+    }
 
-        return false;
+    /**
+     * A pipeline where phpredis has cluster pipelines; counted, and refused,
+     * where it has none (6.3, which the adapter does not ask).
+     */
+    public function multi(int $value = \Redis::MULTI): static|bool
+    {
+        if (!self::pipelinesClusters()) {
+            ++$this->multis;
+
+            return false;
+        }
+
+        return $this->openPipeline();
     }
 }

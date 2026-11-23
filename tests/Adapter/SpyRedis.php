@@ -42,6 +42,9 @@ final class SpyRedis extends \Redis
     /** A pipeline with an unanswered EVALSHA raises at exec(), as a client may */
     public bool $execRaisesOnAForgottenScript = false;
 
+    /** Runs once in an exec() about to raise, after the pipeline ran: what others do meanwhile */
+    public ?\Closure $beforeExecRaises = null;
+
     /** XRANGE raises, as when the node holding the stream cannot be reached */
     public bool $rangesFail = false;
 
@@ -135,6 +138,11 @@ final class SpyRedis extends \Redis
         $results = parent::exec();
 
         if ($this->execRaisesOnAForgottenScript && \is_array($results) && \in_array(false, $results, true)) {
+            if (null !== $meanwhile = $this->beforeExecRaises) {
+                $this->beforeExecRaises = null;
+                $meanwhile();
+            }
+
             throw new \RedisException('NOSCRIPT No matching script. Please use EVAL.');
         }
 

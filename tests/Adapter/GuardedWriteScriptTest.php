@@ -14,6 +14,7 @@ namespace Artigo\Cache\Tests\Adapter;
 use Artigo\Cache\Adapter\VersionedRedisTagAwareAdapter;
 use Artigo\Cache\Tests\Connection;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Cache\CacheItem;
 
 /**
  * How the write that follows a read reaches the server: by sha1, as EVALSHA,
@@ -92,6 +93,44 @@ final class GuardedWriteScriptTest extends TestCase
         self::assertSame([['evalsha', 'gws:a'], ['evalsha', 'gws:b'], ['evalsha', 'gws:a'], ['evalsha', 'gws:b'], ['eval', 'gws:a'], ['eval', 'gws:b']], $this->redis->scripts);
         self::assertTrue($pool->getItem('a')->isHit());
         self::assertTrue($pool->getItem('b')->isHit());
+    }
+
+    /**
+     * The batch that such a client makes throw ran first, so it is sent again
+     * with new epochs: a read of the first run, then a delete, then the repeat,
+     * and the write after the read is still refused.
+     */
+    public function testABatchSentAgainRefusesAWriteWhoseReadSawItsFirstRun(): void
+    {
+        $writer = $this->pool();
+        $reader = $this->pool();
+        $other = $this->pool();
+        $read = null;
+
+        // one guarded write, which makes exec() throw, and one plain write
+        $guarded = $writer->getItem('guarded');
+        $plain = $other->getItem('k');
+        $writer->saveDeferred($guarded->set('v'));
+        $writer->saveDeferred($plain->set('first')->tag('t'));
+
+        $this->redis->spoilNextSha = true;
+        $this->redis->execRaisesOnAForgottenScript = true;
+        $this->redis->beforeExecRaises = function () use ($reader, $other, &$read): void {
+            $this->redis->execRaisesOnAForgottenScript = false;
+
+            // a rule outdates the plain write's item, a reader misses on it,
+            // seeing the epoch of the first run, and a delete lands
+            self::assertTrue($other->invalidateTags(['t']));
+            $read = $reader->getItem('k');
+            self::assertFalse($read->isHit());
+            self::assertTrue($other->deleteItem('k'));
+        };
+
+        self::assertTrue($writer->commit(), 'sent again one at a time');
+        self::assertInstanceOf(CacheItem::class, $read);
+
+        self::assertFalse($reader->save($read->set('computed before the delete')->tag('t')), 'refused');
+        self::assertFalse($this->pool()->getItem('k')->isHit());
     }
 
     private function pool(): VersionedRedisTagAwareAdapter

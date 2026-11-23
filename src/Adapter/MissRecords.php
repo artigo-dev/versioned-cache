@@ -14,9 +14,9 @@ namespace Artigo\Cache\Adapter;
 /**
  * What a pool remembers of the reads that a write may follow. Per id: the
  * watermark the write will carry (the last rule id of the copy of the rules
- * the read used), the epoch the item carried (empty when it had none), and
- * when the read was made. The write that follows is refused if the item
- * holds another epoch by then, and stored if it holds the same one or none.
+ * the read used), and the epoch the item carried (empty when it had none).
+ * The write that follows is refused if the item holds another epoch by then,
+ * and stored if it holds the same one or none.
  * It carries the read's watermark rather than the newest id in the stream,
  * so a rule appended meanwhile still makes it outdated.
  *
@@ -37,7 +37,7 @@ final class MissRecords
     public const CAP = 1_000;
 
     /**
-     * @var array<string, array{string, string, float}> id => [watermark, epoch, read at in milliseconds]
+     * @var array<string, array{string, string}> id => [watermark, epoch]
      */
     private array $records = [];
 
@@ -60,7 +60,7 @@ final class MissRecords
     public function take(string $id, string $mark, string $epoch): void
     {
         unset($this->records[$id]);
-        $this->records[$id] = [$mark, $epoch, microtime(true) * 1000];
+        $this->records[$id] = [$mark, $epoch];
 
         if ($this->cap < \count($this->records)) {
             unset($this->records[array_key_first($this->records)]);
@@ -68,7 +68,7 @@ final class MissRecords
     }
 
     /**
-     * @return array{string, string, float}|null [watermark, epoch, read at in milliseconds]
+     * @return array{string, string}|null [watermark, epoch]
      */
     public function of(string $id): ?array
     {
@@ -99,9 +99,9 @@ final class MissRecords
      */
     public function restamp(string $previous, string $id): void
     {
-        foreach ($this->records as $recordId => [$mark, $epoch, $atMs]) {
+        foreach ($this->records as $recordId => [$mark, $epoch]) {
             if ($mark === $previous) {
-                $this->records[$recordId] = [$id, $epoch, $atMs];
+                $this->records[$recordId] = [$id, $epoch];
             }
         }
     }

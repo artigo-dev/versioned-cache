@@ -80,7 +80,14 @@ node that owns the bare key.
 - **Standalone and cluster:** every command is routed by its key by the
   client itself; the adapter prefixes the keys of its raw commands and
   leaves the address — the key a cluster hashes for the slot — bare, as a
-  prefixed address would be prefixed twice.
+  prefixed address would be prefixed twice. On a phpredis cluster the writes
+  go out as typed calls, which follow a `MOVED` or `ASK`. A raw command by
+  key follows neither: phpredis 6.3.0 throws, on a `MOVED` until a typed
+  command of the same slot has updated the client's map, so during a
+  resharding a raw write of a key already moved fails. On Windows a phpredis
+  cluster's writes stay raw commands, as the typed calls carry their numbers
+  in 32 bits there (unless the reads go to replicas): writes of keys already
+  moved fail while their slot is moved, and are reported failed.
 - **`RedisArray`:** no raw command of its own and nothing to pipeline across
   nodes, so every call goes one at a time to the node that owns its key, and
   every command naming the rules stream to the node that owns it.
@@ -88,11 +95,28 @@ node that owns the bare key.
   to tell which one it is holding. After a guarded write, Relay's in-process
   cache is told to take in the server's invalidation, so another connection's
   cached miss is not served past it.
-- **A cluster with phpredis cluster pipelines**
-  ([phpredis#2798](https://github.com/phpredis/phpredis/pull/2798),
-  unreleased): the adapter sends one pipeline across the slots;
-  `ClusterPipelineTest` pins that path. Without them, a cluster gets one
-  command per round trip.
+- **A cluster with phpredis's cluster pipelines** (not yet released): the
+  adapter sends each batch as one pipeline across the slots, one round trip
+  per master. A `getItems()` of 100 keys on three masters is 3 round trips
+  instead of 100, and 100 misses with the batch write after them 6 instead of
+  200; a `get()` loop does not change, one key per round trip. phpredis
+  refuses a raw command in a cluster pipeline, which the typed writes avoid;
+  on Windows the raw writes go one command at a time. phpredis gives up a
+  whole pipeline on a `MOVED` or `ASK`, which a slot being moved answers, and
+  the adapter then sends the batch again one command at a time, which follows
+  the redirect: during a resharding a batch is slower, not a miss. A guarded
+  write that had landed in the first run is then refused the second time:
+  `save()` or `commit()` answers false and the log says the item was deleted
+  or written by somebody else, though the value is stored. That is the safe
+  direction. A pipeline that failed only after the client's read timeout is
+  not sent again: every call of it failed, at the cost of one timeout.
+  Symfony then tries a failed delete once more key by key, a timeout for each
+  key on that master. That needs a read timeout: with `read_timeout=0`,
+  Symfony's default, a failed pipeline is always sent again, and a node that
+  does not answer is waited for twice. With `failover=slaves`, phpredis sends
+  a pipeline's reads to the primaries.
+  `ClusterPipelineTest` pins that path. Without cluster pipelines, a cluster
+  gets one command per round trip.
 
 So the adapter runs on a single node, a cluster, an array and through Relay,
 with or without a client-side prefix, and CI covers every one of those legs
