@@ -45,7 +45,7 @@ to drop the set. So on a connection that may read from replicas, that answer
 is asked again of the primary — the same `XRANGE`, as a one-line `EVAL` — and
 only the primary's answer may drop anything; so is a fetch that ends before a
 rule this server just appended. On such a connection the writes go out as
-typed `hsetex()`, `expire()`, `hdel()` and `hpexpire()` calls: phpredis sends
+typed `hsetex()`, `expire()`, `hdel()` and `hexpire()` calls: phpredis sends
 a raw command to the node the last read of its slot went to, a replica, which
 refuses it. **`failover=slaves` therefore needs phpredis 6.3 or later**, the
 first with `hsetex()`; an older one keeps the raw command, and its writes fail
@@ -84,10 +84,19 @@ node that owns the bare key.
   go out as typed calls, which follow a `MOVED` or `ASK`. A raw command by
   key follows neither: phpredis 6.3.0 throws, on a `MOVED` until a typed
   command of the same slot has updated the client's map, so during a
-  resharding a raw write of a key already moved fails. On Windows a phpredis
-  cluster's writes stay raw commands, as the typed calls carry their numbers
-  in 32 bits there (unless the reads go to replicas): writes of keys already
-  moved fail while their slot is moved, and are reported failed.
+  resharding a raw write of a key already moved fails. On Windows the writes
+  go out the same way: phpredis passes a typed call's numbers through 32 bits
+  there, which hold the whole seconds the writes carry. But with phpredis
+  6.3.0 on Windows and a client timeout (`timeout` or `read_timeout` above 0;
+  a Symfony DSN has `timeout=30` unless it says otherwise), a command that
+  meets a redirect fails with "Timed out attempting to find data in the
+  correct node!", because phpredis's redirect timer overflows there. So
+  during a resharding a read of a key already moved misses for as long as its
+  slot is being moved, a `getItems()` holding one such key misses entirely,
+  the first read of each slot after the hand-over misses once, and writes and
+  deletes of keys already moved fail and are reported failed. Without a
+  timeout the redirects are followed. It is a phpredis bug, fixed in phpredis
+  after 6.3.0 and 6.4.0RC1, and not yet released.
 - **`RedisArray`:** no raw command of its own and nothing to pipeline across
   nodes, so every call goes one at a time to the node that owns its key, and
   every command naming the rules stream to the node that owns it.
@@ -100,11 +109,11 @@ node that owns the bare key.
   per master. A `getItems()` of 100 keys on three masters is 3 round trips
   instead of 100, and 100 misses with the batch write after them 6 instead of
   200; a `get()` loop does not change, one key per round trip. phpredis
-  refuses a raw command in a cluster pipeline, which the typed writes avoid;
-  on Windows the raw writes go one command at a time. phpredis gives up a
-  whole pipeline on a `MOVED` or `ASK`, which a slot being moved answers, and
-  the adapter then sends the batch again one command at a time, which follows
-  the redirect: during a resharding a batch is slower, not a miss. A guarded
+  refuses a raw command in a cluster pipeline, which the typed writes avoid.
+  phpredis gives up a whole pipeline on a `MOVED` or `ASK`, which a slot
+  being moved answers, and the adapter then sends the batch again one command
+  at a time, which follows the redirect (on Windows only without a client
+  timeout): during a resharding a batch is slower, not a miss. A guarded
   write that had landed in the first run is then refused the second time:
   `save()` or `commit()` answers false and the log says the item was deleted
   or written by somebody else, though the value is stored. That is the safe

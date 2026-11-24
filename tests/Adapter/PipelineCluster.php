@@ -192,8 +192,9 @@ final class PipelineCluster extends \RedisCluster
 
     /**
      * Refused inside a pipeline, as phpredis refuses every command addressed
-     * by key or node there. Outside one, HSETEX and HDEL change the item and
-     * an expiry is taken as set.
+     * by key or node there. Outside one, an HSETEX changes the item. The
+     * adapter writes this client through typed calls; only the tests send it
+     * raw commands.
      *
      * @param array<mixed>|string $key_or_address
      */
@@ -223,19 +224,9 @@ final class PipelineCluster extends \RedisCluster
             for ($i = 0; $i + 1 < \count($pairs); $i += 2) {
                 $this->items[$key][$pairs[$i]] = $pairs[$i + 1];
             }
-
-            return 1;
         }
 
-        if ('HDEL' === $command) {
-            foreach ($strings as $field) {
-                unset($this->items[$key][$field]);
-            }
-
-            return \count($strings);
-        }
-
-        return 'HPEXPIRE' === $command ? [1] : 1;
+        return 1;
     }
 
     /**
@@ -272,7 +263,7 @@ final class PipelineCluster extends \RedisCluster
      *
      * @return static|list<int>
      */
-    public function hpexpire(string $key, int $ttl, array $fields, ?string $mode = null): static|array
+    public function hexpire(string $key, int $ttl, array $fields, ?string $mode = null): static|array
     {
         return $this->answer(array_fill(0, \count($fields), 1));
     }

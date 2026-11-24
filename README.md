@@ -449,10 +449,17 @@ master: on three masters 3 instead of 100, and 6 instead of 200 for 100 misses
 and the batch write after them. A `get()` loop reads one key per call and
 does not change. While a slot is being moved, phpredis gives up any pipeline
 that touches it, and the adapter sends that batch again one command at a
-time. On Windows a batch that holds a plain write, a delete or the drop of an
-outdated item goes one command at a time, because phpredis passes the numbers
-of its typed calls through a 32-bit integer there; reads, and a batch of
-guarded writes alone (scripts), are still pipelined.
+time. Windows is no different: phpredis passes the numbers of its typed calls
+through a 32-bit integer there, and the writes carry whole seconds, which
+fit. With phpredis 6.3.0 on Windows and a client timeout (a Symfony DSN has
+`timeout=30` unless it says otherwise), though, a command that meets a
+redirect fails ("Timed out attempting to find data in the correct node!"),
+because phpredis's redirect timer overflows there. So during a resharding a
+read of a key already moved misses, a batch read holding one misses entirely,
+the first read of each slot after the hand-over misses once, and writes of
+keys already moved are reported failed. Without a timeout the redirects are
+followed. It is a phpredis bug, fixed in phpredis after 6.3.0 and 6.4.0RC1,
+and not yet released.
 
 ```php
 // a cluster of three masters, every command routed by its key

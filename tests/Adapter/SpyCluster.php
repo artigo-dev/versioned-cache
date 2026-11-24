@@ -72,9 +72,9 @@ final class SpyCluster extends \RedisCluster
     }
 
     /**
-     * The same, reading from the primaries only, as a client the adapter sends
-     * raw writes to does: phpredis sends a raw command to the node the last
-     * read of its slot went to, which may be a replica.
+     * The same, reading from the primaries only, for the tests that send raw
+     * commands: phpredis sends a raw command to the node the last read of its
+     * slot went to, which may be a replica.
      */
     public static function openPrimaries(): self
     {

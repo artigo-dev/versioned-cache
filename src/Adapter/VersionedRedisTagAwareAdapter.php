@@ -2708,7 +2708,8 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         foreach ($ids as $id) {
             if ($typed) {
                 $calls[] = ['hDel', $id, self::FIELD_VALUE, self::FIELD_TAGS, self::FIELD_MARK];
-                $calls[] = ['hpexpire', $id, $this->guardWindowMs, [self::FIELD_EPOCH], 'LT'];
+                // whole seconds, as the window is set: a C long holds them
+                $calls[] = ['hexpire', $id, intdiv($this->guardWindowMs, 1000), [self::FIELD_EPOCH], 'LT'];
 
                 continue;
             }
@@ -2758,16 +2759,16 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * as a raw command: on a phpredis cluster, and on any cluster that reads
      * from replicas. phpredis follows a MOVED or ASK for a typed command, and
      * not an ASK for a raw one, so a raw write of a key whose slot is being
-     * moved fails. A cluster pipeline refuses a raw command, and typed writes
-     * ride it. On a cluster that reads from replicas, phpredis sends a raw
-     * command to the node the last read of its slot went to, a replica, which
-     * refuses a write; a typed write goes to the primary. Not on Windows,
-     * unless the reads go to replicas: there a C long, which the typed
-     * methods pass their integers through, is 32 bits wide (see command()),
-     * so the writes stay raw and go one command at a time (see
-     * clusterPipeline()). Relay's cluster client is given the same typed
-     * calls where it reads from replicas. Where the client has no hsetex()
-     * (phpredis before 6.3), the raw command is all there is.
+     * moved fails (on Windows with a client timeout, phpredis 6.3.0 follows
+     * neither: see docs/operations.md). A cluster pipeline refuses a raw
+     * command, and typed writes ride it. On a cluster that reads from
+     * replicas, phpredis sends a raw command to the node the last read of its
+     * slot went to, a replica, which refuses a write; a typed write goes to
+     * the primary. The typed writes carry whole seconds and no milliseconds,
+     * so they arrive intact on Windows too (see command()). Relay's cluster
+     * client is given the same typed calls where it reads from replicas.
+     * Where the client has no hsetex() (phpredis before 6.3), the raw command
+     * is all there is.
      */
     private function writesTyped(): bool
     {
@@ -2775,23 +2776,23 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             return false;
         }
 
-        // a 32-bit PHP, whose C long is 32 bits wide too, never gets here:
-        // the constructor refuses it
-        $wideLong = $this->redis instanceof \RedisCluster && 'Windows' !== \PHP_OS_FAMILY;
-
-        return ($wideLong || $this->readsReplicas())
+        return ($this->redis instanceof \RedisCluster || $this->readsReplicas())
             && method_exists($this->redis, 'hsetex'); // @phpstan-ignore function.alreadyNarrowedType (the stubs describe phpredis 6.3; an older one has no hsetex())
     }
 
     /**
      * A write command by its wire name, addressed by key where a cluster or
-     * an array routes by it.
+     * an array routes by it: how a single node, an array and a cluster
+     * without typed writes (see writesTyped()) are written.
      *
-     * Everything travels as a string on purpose. phpredis marshals the
+     * Everything travels as a string on purpose. phpredis 6.3.0 marshals the
      * integers of its typed methods through a C long, which is 32 bits wide
-     * on Windows, and a millisecond TTL a month long does not survive the
-     * trip: HSETEX refuses the expiry outright and PEXPIRE, handed what is
-     * now a negative number, deletes the key it was meant to keep. The
+     * on Windows, and a TTL of 2^31 milliseconds or more (about 24.86 days)
+     * does not survive the trip: HSETEX refuses the expiry outright and
+     * PEXPIRE, handed what is now a negative number, deletes the key it was
+     * meant to keep. Only milliseconds are at risk: 2^31 seconds are 68
+     * years, so a TTL in seconds arrives intact, which is why the typed
+     * writes carry seconds. phpredis after 6.3.0 passes either intact. The
      * protocol is strings anyway.
      *
      * A raw command goes out exactly as written, while a typed call and a
@@ -2998,7 +2999,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * pipeline on a MOVED or ASK, which every command in a slot being moved
      * may answer for as long as the move lasts; on its own, a typed command
      * follows the redirect (a raw one does not follow an ASK). What that
-     * throws reaches the caller as on a cluster without pipelines.
+     * throws reaches the caller as on a cluster without pipelines. The
+     * adapter's own writes are raw only where the client has no hsetex()
+     * (see writesTyped()), which every phpredis with cluster pipelines has;
+     * the refusal is still handled, for a client that pipelines without it.
      *
      * A batch sent again gets new epochs (see freshEpochs()): exec() may throw
      * after some of its calls ran. It is not sent again when exec() took the

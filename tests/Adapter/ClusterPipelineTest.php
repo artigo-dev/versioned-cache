@@ -166,10 +166,6 @@ final class ClusterPipelineTest extends TestCase
     }
 
     /**
-     * phpredis passes the integers of its typed methods through a C long,
-     * which is 32 bits wide on Windows; there the writes stay raw and go one
-     * at a time.
-     *
      * @param \Closure(): (PipelineCluster|SpyCluster) $open
      */
     #[DataProvider('clients')]
@@ -189,19 +185,9 @@ final class ClusterPipelineTest extends TestCase
             $writer->saveDeferred($item->set('v'));
         }
 
-        [$multis, $execs, $raw, $typed] = [$cluster->multis, $cluster->execs, $cluster->raw, $cluster->typed];
+        [$execs, $raw, $typed] = [$cluster->execs, $cluster->raw, $cluster->typed];
 
         self::assertTrue($writer->commit());
-
-        if ('Windows' === \PHP_OS_FAMILY) {
-            self::assertSame($multis + 1, $cluster->multis, 'refused in the one pipeline it was queued in');
-            self::assertSame($execs, $cluster->execs);
-            self::assertSame($raw + 2 * self::KEYS, $cluster->raw, 'then sent one command at a time');
-            self::assertSame(self::KEYS, self::hits($this->pool($cluster), $keys));
-
-            return;
-        }
-
         self::assertSame($execs + 1, $cluster->execs, 'every write in one pipeline');
         self::assertSame($raw, $cluster->raw, 'none of them raw');
         self::assertSame($typed + self::KEYS, $cluster->typed);
@@ -223,12 +209,6 @@ final class ClusterPipelineTest extends TestCase
      */
     public function testAPlainWriteSentAgainRefusesAWriteWhoseReadSawItsFirstRun(): void
     {
-        // on Windows the writes are raw commands, which never enter a cluster
-        // pipeline: none of them is sent twice
-        if ('Windows' === \PHP_OS_FAMILY) {
-            self::markTestSkipped('On Windows the writes do not enter a cluster pipeline.');
-        }
-
         $cluster = new PipelineCluster();
         $reader = $this->pool($cluster);
         $other = $this->pool($cluster);
@@ -265,12 +245,6 @@ final class ClusterPipelineTest extends TestCase
      */
     public function testATombstoneSentAgainRefusesAWriteWhoseReadSawItsFirstRun(): void
     {
-        // on Windows the writes are raw commands, which never enter a cluster
-        // pipeline: none of them is sent twice
-        if ('Windows' === \PHP_OS_FAMILY) {
-            self::markTestSkipped('On Windows the writes do not enter a cluster pipeline.');
-        }
-
         $cluster = new PipelineCluster();
         $reader = $this->pool($cluster);
         $other = $this->pool($cluster);
@@ -369,11 +343,6 @@ final class ClusterPipelineTest extends TestCase
      */
     public function testABatchSentAgainAfterARefusalWhileQueuedRefusesAWriteWhoseReadSawItsFirstRun(): void
     {
-        // on Windows the plain write is itself a raw command, refused first
-        if ('Windows' === \PHP_OS_FAMILY) {
-            self::markTestSkipped('On Windows the writes do not enter a cluster pipeline.');
-        }
-
         $cluster = new PipelineCluster();
         $pool = $this->pool($cluster);
         $reader = $this->pool($cluster);
@@ -408,12 +377,6 @@ final class ClusterPipelineTest extends TestCase
      */
     public function testARefusedSaveWhoseTombstoneWasNotAnsweredUnlinksNothing(): void
     {
-        // on Windows the tombstone is raw commands, which never enter a
-        // cluster pipeline
-        if ('Windows' === \PHP_OS_FAMILY) {
-            self::markTestSkipped('On Windows the writes do not enter a cluster pipeline.');
-        }
-
         $cluster = new PipelineCluster();
         $pool = $this->pool($cluster);
         $cluster->readTimeout = 0.05;
@@ -464,17 +427,14 @@ final class ClusterPipelineTest extends TestCase
         self::assertSame($execs + 1, $cluster->execs, 'one pipeline, not answered');
 
         // a delete: no unlink, which would wait for the same node. Symfony
-        // may try a failed delete again key by key, so those fail too. On
-        // Windows its raw commands never enter a pipeline
-        if ('Windows' !== \PHP_OS_FAMILY) {
-            $cluster->execFailures = 3;
-            $cluster->unlinked = [];
+        // may try a failed delete again key by key, so those fail too
+        $cluster->execFailures = 3;
+        $cluster->unlinked = [];
 
-            self::assertFalse($this->pool($cluster)->deleteItems(['w1', 'w2']));
-            self::assertSame([], $cluster->unlinked);
+        self::assertFalse($this->pool($cluster)->deleteItems(['w1', 'w2']));
+        self::assertSame([], $cluster->unlinked);
 
-            $cluster->execFailures = 0;
-        }
+        $cluster->execFailures = 0;
 
         // a prune whose batch was not answered judged nothing
         $cluster->execFailures = 1;
@@ -497,7 +457,8 @@ final class ClusterPipelineTest extends TestCase
     /**
      * phpredis follows an ASK for a typed command and not for a raw one, so
      * a phpredis cluster is written through typed calls, with or without
-     * pipelines; on Windows the writes stay raw (see above).
+     * pipelines, on Windows too: they carry whole seconds, which its 32-bit
+     * C long holds.
      */
     public function testAClusterIsWrittenThroughTypedCalls(): void
     {
@@ -505,13 +466,6 @@ final class ClusterPipelineTest extends TestCase
         $item = $this->pool($cluster)->getItem('k');
 
         self::assertTrue($this->pool($cluster)->save($item->set('v')));
-
-        if ('Windows' === \PHP_OS_FAMILY) {
-            self::assertSame(2, $cluster->raw, 'HSETEX and PEXPIRE, raw');
-
-            return;
-        }
-
         self::assertSame(0, $cluster->raw);
         self::assertArrayHasKey('v', $cluster->items[$this->namespace.':k'] ?? [], 'stored by a typed HSETEX');
     }
@@ -526,7 +480,9 @@ final class ClusterPipelineTest extends TestCase
     }
 
     /**
-     * The clients the adapter sends raw writes to: reading from the primaries.
+     * The clients these tests send raw commands to: reading from the
+     * primaries, as phpredis sends a raw command to the node the last read of
+     * its slot went to.
      *
      * @return iterable<string, array{\Closure(): (PipelineCluster|SpyCluster)}>
      */

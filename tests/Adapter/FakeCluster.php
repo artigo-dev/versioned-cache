@@ -28,6 +28,9 @@ final class FakeCluster extends \RedisCluster
     /** How many raw commands were sent or queued */
     public int $raw = 0;
 
+    /** @var list<array{string, int, array<mixed>, ?string}> the typed field expiries sent: method, TTL, fields, condition */
+    public array $fieldExpiries = [];
+
     public function __construct(private readonly int $failover = \RedisCluster::FAILOVER_NONE)
     {
         // no seeds, no connection: everything below answers from memory
@@ -137,8 +140,24 @@ final class FakeCluster extends \RedisCluster
      *
      * @return static|list<int>
      */
+    public function hexpire(string $key, int $ttl, array $fields, ?string $mode = null): static|array
+    {
+        $this->fieldExpiries[] = ['hexpire', $ttl, $fields, $mode];
+
+        return $this->answer(array_fill(0, \count($fields), 1));
+    }
+
+    /**
+     * Recorded like hexpire(), so a test sees which of the two was sent.
+     *
+     * @param array<mixed> $fields
+     *
+     * @return static|list<int>
+     */
     public function hpexpire(string $key, int $ttl, array $fields, ?string $mode = null): static|array
     {
+        $this->fieldExpiries[] = ['hpexpire', $ttl, $fields, $mode];
+
         return $this->answer(array_fill(0, \count($fields), 1));
     }
 
