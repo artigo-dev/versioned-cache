@@ -144,8 +144,10 @@ jobs:
 
             - name: Start a three master cluster
               run: |
+                  # Redis 8.12 starts a cluster node without TLS only when told
+                  # that its bus port is reachable by trusted hosts alone
                   for port in 7000 7001 7002; do
-                    docker run -d --name "redis-$port" --net host redis:8-alpine redis-server --port "$port" --cluster-enabled yes --cluster-config-file "nodes-$port.conf" --save ''
+                    docker run -d --name "redis-$port" --net host redis:8-alpine redis-server --port "$port" --cluster-enabled yes --cluster-bus-port-protected-mode no --cluster-config-file "nodes-$port.conf" --save ''
                   done
                   for i in $(seq 1 30); do
                     docker run --rm --net host redis:8-alpine redis-cli -p 7000 ping && break

@@ -118,9 +118,14 @@ DOCKERFILE
     start "$PROXY" "$TOXIPROXY_IMAGE" -host=0.0.0.0
     # three masters with a replica each in one container, as compose.tests.yaml's
     # cluster-replicas profile, announcing the address the network gave it
+    # Redis 8.12 starts a cluster node without TLS only when told that its bus
+    # port is reachable by trusted hosts alone; an older one does not know the option
     start "$CLUSTER" "$REDIS_IMAGE" sh -c 'ip=$(hostname -i | cut -d" " -f1);
+        bus="--cluster-bus-port-protected-mode no";
+        redis-server --port 7199 $bus --save "" --daemonize yes >/dev/null 2>&1; sleep 0.5;
+        if redis-cli -p 7199 ping >/dev/null 2>&1; then redis-cli -p 7199 shutdown nosave >/dev/null 2>&1; else bus=""; fi;
         for port in 7110 7111 7112 7113 7114 7115; do
-            redis-server --port $port --cluster-enabled yes --cluster-config-file nodes-$port.conf \
+            redis-server --port $port --cluster-enabled yes $bus --cluster-config-file nodes-$port.conf \
                 --cluster-announce-ip $ip --maxmemory-policy volatile-ttl --save "" --daemonize yes;
         done;
         until redis-cli -p 7115 ping >/dev/null 2>&1; do sleep 0.2; done;
