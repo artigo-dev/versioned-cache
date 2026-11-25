@@ -141,6 +141,13 @@ past it the oldest single reads go first and their writes go out plain.
   `UNLINK`, which takes the tombstone away too, and writes without a new
   epoch. A guarded instance does not see those deletes and writes: give every
   instance of a pool the same window.
+- A delete the server refuses for want of memory (`noeviction` at
+  `maxmemory`) leaves no new epoch: Redis refuses the tombstone's `HSETEX`
+  and still runs its `HDEL`, and no epoch can be written until memory frees.
+  The delete answers `false` and the key keeps the epoch it had, so a
+  computation that read the item before is stored once memory frees, as after
+  a delete that did not happen. A value of another type under the key is the
+  one refusal that unlinks the key instead.
 - A value computed across a soft invalidation reads as stale, but within the
   grace it can be served aged, as any value a soft rule reached
   ([soft invalidation](soft-invalidation.md)).

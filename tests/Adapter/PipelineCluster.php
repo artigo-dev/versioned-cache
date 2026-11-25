@@ -42,6 +42,9 @@ final class PipelineCluster extends \RedisCluster
     /** How long a failing exec() takes before it throws, as a node that does not answer */
     public int $failureTakesMs = 0;
 
+    /** A failing exec() throws as for a reply cut short, rather than as for a redirect */
+    public bool $failureCutsAReply = false;
+
     /** Runs once inside the next failing exec(), after its calls ran: what others do meanwhile */
     public ?\Closure $whileFailing = null;
 
@@ -51,6 +54,27 @@ final class PipelineCluster extends \RedisCluster
     /** Runs once when the next raw command is refused: what others do meanwhile, outside this pipeline */
     public ?\Closure $whileRefusing = null;
 
+    /**
+     * Runs after each typed HSETEX, given its key and fields, outside the
+     * pipeline it is queued in: what others do between two commands of one
+     * batch.
+     *
+     * @var (\Closure(string, array<mixed>): void)|null
+     */
+    public ?\Closure $afterTypedWrite = null;
+
+    /** How many times the connection was closed */
+    public int $closes = 0;
+
+    /** How many of the next exec() calls answer false, as for a pipeline that did not go out whole */
+    public int $execsAnswerFalse = 0;
+
+    /** How many of the next pipelines are refused: multi() answers false */
+    public int $multisAnswerFalse = 0;
+
+    /** How many times a key's type was asked */
+    public int $types = 0;
+
     /** @var array<string, string> the scripts sent as a body, by sha1 */
     private array $scripts = [];
 
@@ -59,21 +83,35 @@ final class PipelineCluster extends \RedisCluster
         // no seeds, no connection: everything below answers from memory
     }
 
-    public function pipeline(): static
+    public function pipeline(): static|false
     {
         return $this->multi(\Redis::PIPELINE);
     }
 
-    public function multi(int $value = \Redis::MULTI): static
+    public function multi(int $value = \Redis::MULTI): static|false
     {
+        if (0 < $this->multisAnswerFalse) {
+            --$this->multisAnswerFalse;
+
+            return false;
+        }
+
         return $this->openPipeline();
     }
 
     /**
-     * @return list<mixed>
+     * @return list<mixed>|false
      */
-    public function exec(): array
+    public function exec(): array|false
     {
+        if (0 < $this->execsAnswerFalse) {
+            --$this->execsAnswerFalse;
+            ++$this->execs;
+            $this->queued = null;
+
+            return false;
+        }
+
         if (0 === $this->execFailures) {
             return $this->execQueued();
         }
@@ -89,6 +127,11 @@ final class PipelineCluster extends \RedisCluster
         if (null !== $meanwhile = $this->whileFailing) {
             $this->whileFailing = null;
             $meanwhile();
+        }
+
+        // a reply cut short throws a \RedisException on a cluster too
+        if ($this->failureCutsAReply) {
+            throw new \RedisException('socket error on read socket');
         }
 
         throw new \RedisClusterException('Pipelined commands were redirected, aborting pipeline');
@@ -241,7 +284,39 @@ final class PipelineCluster extends \RedisCluster
             $this->items[$key][(string) $field] = \is_scalar($value) ? (string) $value : '';
         }
 
+        if (null !== $meanwhile = $this->afterTypedWrite) {
+            // the others' commands are not part of this pipeline
+            $queued = $this->queued;
+            $this->queued = null;
+            $meanwhile($key, $fields);
+            $this->queued = $queued;
+        }
+
         return $this->answer(1);
+    }
+
+    public function type(string $key): static|int
+    {
+        ++$this->types;
+
+        return $this->answer(isset($this->items[$key]) ? \Redis::REDIS_HASH : \Redis::REDIS_NOT_FOUND);
+    }
+
+    public function close(): bool
+    {
+        ++$this->closes;
+
+        return true;
+    }
+
+    public function getlasterror(): ?string
+    {
+        return null;
+    }
+
+    public function clearlasterror(): bool
+    {
+        return true;
     }
 
     public function expire(string $key, int $timeout, ?string $mode = null): static|bool

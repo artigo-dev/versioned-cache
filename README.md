@@ -257,8 +257,21 @@ the reload takes 3 seconds:
 The reloader waits as long as its connection's timeouts allow, so keep them to
 a second or two (`redis://127.0.0.1?timeout=1&read_timeout=1.5`): left at
 their defaults, Symfony gives the connect 30 seconds and phpredis waits a
-minute for a reply. `rulesCache` takes any PSR-6 pool in place of APCu, one
-per server, or `false` to keep the set per instance.
+minute for a reply (`read_timeout=0` means PHP's `default_socket_timeout`).
+`rulesCache` takes any PSR-6 pool in place of APCu, one per server, or `false`
+to keep the set per instance.
+
+A read timeout can leave a phpredis connection out of step: phpredis 6.3
+keeps the socket open after some failures, reads the late reply as the next
+command's answer, and every reply after it one command late; phpredis
+releases after 6.3 close the socket themselves. So where such a reply may be
+left, the adapter closes the connection and the client opens a new one, and
+does on it what it would have done without the close: on a single node a
+pipeline holding a guarded write that failed quickly is sent again once, and
+a cluster pipeline that failed quickly is sent again one command at a time.
+After a failure that waited out the read timeout the adapter sends nothing of
+that batch again. See
+[Timeouts and lost connections](docs/operations.md#timeouts-and-lost-connections).
 
 ```php
 use Symfony\Component\Cache\Adapter\FilesystemAdapter;
@@ -434,7 +447,13 @@ invalidated? Say `product-42` is invalidated at 12:00:00.000 and a replica is
 
 A rule fetch that looks as if the stream had been lost is asked again of the
 primary before anything is dropped, and reading from replicas needs phpredis
-6.3 or later. Every command names a single key but three: a prune's `SCAN`,
+6.3 or later, the first with the typed writes it takes. phpredis 6.3 does not
+send `READONLY` again to a replica it reconnects to, though: once the adapter
+has closed a cluster connection, which it does only after a `SCAN` or a
+`TIME` that failed or a reply cut short, `failover=slaves` reads no replica
+again for the life of that client. Each such read fails after the client's
+timeout plus its read timeout and is a miss, while writes go on; the adapter
+logs it once. Every command names a single key but three: a prune's `SCAN`,
 which walks the masters one by one, the `TIME` that reads the server's clock
 for a soft invalidation, sent to the node that holds the rules stream, and an
 `UNLINK` of several items, which a cluster client splits by slot. So a

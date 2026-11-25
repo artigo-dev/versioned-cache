@@ -397,6 +397,33 @@ final class ClusterPipelineTest extends TestCase
     }
 
     /**
+     * A pipeline the cluster refused to open, or whose exec() answered false,
+     * was not answered: nothing is known of the keys, so a delete fails and
+     * nothing is unlinked. The next delete writes its tombstone.
+     */
+    public function testAPipelineThatWasNotAnsweredUnlinksNothing(): void
+    {
+        $cluster = new PipelineCluster();
+        $pool = $this->pool($cluster);
+        self::assertTrue($pool->save($this->pool($cluster)->getItem('k')->set('v')));
+        $key = $this->namespace.':k';
+
+        // the delete, and Symfony's retry of it
+        foreach (['execsAnswerFalse', 'multisAnswerFalse'] as $knob) {
+            $cluster->{$knob} = 2;
+
+            self::assertFalse($pool->deleteItem('k'), $knob);
+            self::assertSame([], $cluster->unlinked, $knob);
+        }
+
+        self::assertSame(0, $cluster->types, 'nothing asked of the keys after them');
+
+        self::assertTrue($pool->deleteItem('k'));
+        self::assertSame(['e'], array_keys($cluster->items[$key] ?? []), 'a tombstone');
+        self::assertSame([], $cluster->unlinked);
+    }
+
+    /**
      * A node that did not answer within the read timeout would keep every
      * single command waiting as long: such a batch is not sent again.
      */
@@ -442,8 +469,9 @@ final class ClusterPipelineTest extends TestCase
         self::assertFalse($this->pool($cluster)->prune());
         self::assertTrue($this->pool($cluster)->prune(), 'and judges it the next time');
 
-        // faster than the timeout, or with no timeout known: sent again
-        foreach ([[0.05, 0], [0.0, 60]] as [$timeout, $takes]) {
+        // faster than the timeout, or within PHP's default_socket_timeout
+        // where the read timeout is 0: sent again
+        foreach ([[10.0, 0], [0.0, 60]] as [$timeout, $takes]) {
             $cluster->readTimeout = $timeout;
             $cluster->failureTakesMs = $takes;
             $cluster->execFailures = 1;

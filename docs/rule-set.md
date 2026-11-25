@@ -148,7 +148,10 @@ $redis->setOption(\Redis::OPT_READ_TIMEOUT, 1.5);
 
 Left at their defaults, Symfony gives the connect 30 seconds and phpredis waits
 `default_socket_timeout`, a minute, for a reply, and so would the reloader. A
-fetch that fails puts the server in an outage (below).
+fetch that fails puts the server in an outage (below), and a fetch that timed
+out closes its connection, which phpredis 6.3 may otherwise leave a reply out
+of step (see
+[Timeouts and lost connections](operations.md#timeouts-and-lost-connections)).
 
 **Why the set is shared at all.** Under PHP-FPM every request is a fresh
 process. A process that holds no rules would have to load the whole stream —

@@ -62,6 +62,9 @@ use Symfony\Contracts\Cache\ItemInterface;
  *   the next read finds it outdated. If the item is deleted meanwhile, the
  *   write is refused, as long as the delete is less than $guardWindowSeconds
  *   old. This is the invalidation guard.
+ * - If a command fails on the wire, its connection is closed where a late
+ *   reply may be left on it. After a failure that waited out the read
+ *   timeout, the adapter sends nothing of that batch again (see failed()).
  *
  * Read more in the README: "Tag invalidation that never gets slower", "The
  * rule set a read is judged against", "The shared rule set while it reloads"
@@ -260,6 +263,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * read the rules again this long after the last attempt ended.
      */
     private const RETRY_MS = 1_000;
+
+    /**
+     * A failure counts as having waited out the read timeout from this share
+     * of it on: phpredis gives up a hair before or after the exact limit.
+     */
+    private const TIMEOUT_SHARE = 0.95;
 
     /**
      * In milliseconds. How long a reading of the Redis server's clock is
@@ -938,6 +947,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
         $calls = [];
         $first = [];
+        $spans = [];
         $guarded = [];
         $dropped = [];
         $unlink = [];
@@ -1038,6 +1048,8 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             foreach ($this->plainWrite($id, $value, $encodedTags, $mark, $ttl) as $call) {
                 $calls[] = $call;
             }
+
+            $spans[$id] = \count($calls) - $first[$id];
         }
 
         // every write of the batch, in one round trip where the connection
@@ -1091,19 +1103,24 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
                 $this->logger?->info('Refused to save "{key}": {reason}, so the stored value was dropped instead.', ['key' => $id, 'reason' => $dropped[$id], 'cache-adapter' => get_debug_type($this)]);
 
                 // a value of another type under the key refuses the
-                // tombstone: the key is deleted instead. Not where the
-                // cluster did not answer
-                if (1 !== $result && null !== $result) {
+                // tombstone: the key is deleted instead. Not for any other
+                // refusal, nor where the batch was not answered
+                if ($this->holdsAnotherType($id, $result, $results[$index + 1] ?? null)) {
                     $this->unlink([$id]);
                 }
 
                 continue;
             }
 
-            // a plain write failed unless the server answered 1
+            // a plain write is stored only where every one of its commands
+            // was: the epoch may land while the data does not
             if (!isset($guarded[$id])) {
-                if (1 !== $result) {
-                    $failed[] = $id;
+                foreach (\array_slice($results, $index, $spans[$id] ?? 1) as $answer) {
+                    if (1 !== $answer && true !== $answer) {
+                        $failed[] = $id;
+
+                        break;
+                    }
                 }
 
                 continue;
@@ -1313,7 +1330,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             return false;
         }
 
-        if (null === $tagged = self::tagsAndMark($this->redis->hMGet($id, [self::FIELD_TAGS, self::FIELD_MARK]))) {
+        // an array routes the read itself; a failure is put down to the node
+        // that owns the key
+        $redis = $this->redis;
+        $node = $redis instanceof \RedisArray ? ($this->ownerOf($id) ?? []) : $redis;
+
+        if (null === $tagged = self::tagsAndMark($this->send($node, static fn (): mixed => $redis->hMGet($id, [self::FIELD_TAGS, self::FIELD_MARK])))) {
             return false;
         }
 
@@ -1344,8 +1366,14 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * last, only ever raised (GT), so the key lives at least as long as every
      * field in it: the tombstone's epoch, or the fields of a write stored
      * after the data was removed. Redis removes the key once its last field
-     * has expired. A value of another type under the key makes the first
-     * command fail, and is unlinked instead.
+     * has expired. A value of another type under the key makes the first two
+     * commands fail, and is unlinked instead, once its type, asked, says so:
+     * a cluster answers false for any error reply. Any other failure of the
+     * first is a failed delete, and answers false; so is a batch that was not
+     * answered. A server out of memory refuses the epoch and still runs the
+     * HDEL: the key keeps the epoch it had, where an unlink would leave it
+     * none, and a write computed before the delete is stored once memory
+     * frees either way.
      *
      * @param list<string> $ids
      */
@@ -1380,21 +1408,30 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             return false;
         }
 
-        // the cluster did not answer: nothing is known of the keys, and an
+        // the batch was not answered: nothing is known of the keys, and an
         // unlink would wait for the same node
         if (\in_array(null, $results, true)) {
             return false;
         }
 
         $raw = [];
+        $ok = true;
 
         foreach ($ids as $index => $id) {
-            if (1 !== ($results[3 * $index] ?? null)) {
+            $epochSet = $results[3 * $index] ?? null;
+
+            if (1 === $epochSet) {
+                continue;
+            }
+
+            if ($this->holdsAnotherType($id, $epochSet, $results[3 * $index + 1] ?? null)) {
                 $raw[] = $id;
+            } else {
+                $ok = false;
             }
         }
 
-        return [] === $raw || $this->unlink($raw);
+        return ([] === $raw || $this->unlink($raw)) && $ok;
     }
 
     /**
@@ -1547,13 +1584,18 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
         // a cluster is walked master by master, through the one client that
         // also routes the reads and the unlinks afterwards
-        if ($this->redis instanceof \RedisCluster || $this->redis instanceof \Relay\Cluster) {
-            foreach ($this->redis->_masters() as $master) {
+        $redis = $this->redis;
+
+        if ($redis instanceof \RedisCluster || $redis instanceof \Relay\Cluster) {
+            foreach ($redis->_masters() as $master) {
                 $address = self::address($master) ?? throw new CacheException(\sprintf('The cluster named a master as %s, which cannot be scanned.', get_debug_type($master)));
                 $cursor = null;
 
                 do {
-                    $keys = self::scanned($this->redis->scan($cursor, $address, $pattern, self::PRUNE_BATCH), $cursor);
+                    // sent to a given node, so it may leave a late reply (see failed())
+                    $keys = self::scanned($this->send($redis, static function () use ($redis, &$cursor, $address, $pattern): mixed {
+                        return $redis->scan($cursor, $address, $pattern, self::PRUNE_BATCH);
+                    }, true), $cursor);
 
                     foreach ($keys as $key) {
                         yield $strip > 0 ? substr($key, $strip) : $key;
@@ -1568,7 +1610,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             $cursor = null;
 
             do {
-                $keys = self::scanned($node->scan($cursor, $pattern, self::PRUNE_BATCH), $cursor);
+                $keys = self::scanned($this->send($node, static function () use ($node, &$cursor, $pattern): mixed {
+                    return $node->scan($cursor, $pattern, self::PRUNE_BATCH);
+                }), $cursor);
 
                 foreach ($keys as $key) {
                     yield $strip > 0 ? substr($key, $strip) : $key;
@@ -1734,9 +1778,11 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         // is at or before the rule the new one follows
         $beforeMs = microtime(true) * 1000;
 
-        // if Redis fails, the invalidation failed: log it and say so
+        // if Redis fails, the invalidation failed: log it and say so. The rule
+        // may still have been appended, which only invalidates more
         try {
-            $result = $this->rulesNode()->eval(self::SCRIPT_INVALIDATE, $arguments, 1);
+            $node = $this->rulesNode();
+            $result = $this->send($node, static fn (): mixed => $node->eval(self::SCRIPT_INVALIDATE, $arguments, 1));
         } catch (\Exception $e) {
             CacheItem::log($this->logger, 'Failed to append the invalidation rule: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
 
@@ -2136,15 +2182,17 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
             try {
                 $node = $this->rulesNode();
+                $range = [$this->rulesKey, $start, (string) self::RULES_BATCH];
+                $fromPrimary = fn (): ?array => self::entriesOf($this->send($node, static fn (): mixed => $node->eval(self::SCRIPT_RANGE, $range, 1)));
 
                 if ($primary) {
-                    $entries = self::entriesOf($node->eval(self::SCRIPT_RANGE, [$this->rulesKey, $start, (string) self::RULES_BATCH], 1));
+                    $entries = $fromPrimary();
                 } else {
-                    $entries = $node->xRange($this->rulesKey, $start, '+', self::RULES_BATCH);
+                    $entries = $this->send($node, fn (): mixed => $node->xRange($this->rulesKey, $start, '+', self::RULES_BATCH));
 
                     // a replica's answer in doubt: ask the primary instead
                     if (\is_array($entries) && $this->readsReplicas() && $this->replicaMayLag($rules, $entries)) {
-                        $entries = self::entriesOf($node->eval(self::SCRIPT_RANGE, [$this->rulesKey, $start, (string) self::RULES_BATCH], 1));
+                        $entries = $fromPrimary();
                     }
                 }
             } catch (\Exception $e) {
@@ -2545,11 +2593,12 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
         if (null === $clock || $nowMs - $clock[1] >= self::SERVER_CLOCK_MS) {
             try {
-                $time = match (true) {
-                    $this->redis instanceof \RedisCluster, $this->redis instanceof \Relay\Cluster => $this->redis->time($this->rulesKey),
-                    $this->redis instanceof \RedisArray => $this->ownerOf($this->rulesKey)?->time(),
-                    default => $this->redis->time(),
-                };
+                $client = $this->clientFor($this->rulesKey);
+                $rulesKey = $this->rulesKey;
+                // a cluster sends it to the node that holds the key, which may
+                // leave a late reply (see failed())
+                $byNode = $client instanceof \RedisCluster || $client instanceof \Relay\Cluster;
+                $time = $this->send($client, static fn (): mixed => $client instanceof \RedisCluster || $client instanceof \Relay\Cluster ? $client->time($rulesKey) : $client->time(), $byNode);
             } catch (\Exception) {
                 return null;
             }
@@ -2642,10 +2691,14 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         }
 
         // a short-lived item: its data fields expire with its own TTL, while
-        // the epoch and the key live for the guard window
+        // the epoch and the key live for the guard window. The epoch goes
+        // first: a guarded write of another worker that lands between the two
+        // then finds it and is refused, where after the data it would replace
+        // this write's value and keep it. Between the two the key holds the
+        // new epoch beside the old data, which reads as before this write
         return [
-            ...$this->fieldWrite($id, $fields, $ttl, null),
             ...$this->fieldWrite($id, [self::FIELD_EPOCH => self::epoch()], $this->guardWindowMs, $this->guardWindowMs),
+            ...$this->fieldWrite($id, $fields, $ttl, null),
         ];
     }
 
@@ -2730,15 +2783,57 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private function unlink(array $ids): bool
     {
-        try {
-            $this->redis->unlink($ids);
-        } catch (\Exception $e) {
-            CacheItem::log($this->logger, 'Failed to delete items: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+        $redis = $this->redis;
 
-            return false;
+        // an array sends each node its own keys, node after node in the order
+        // of its hosts, and stops at the first node that fails. The same here,
+        // one node per call, so a failure is put down to the node whose call
+        // failed and not to the others
+        $batches = [[[], $ids]];
+
+        if ($redis instanceof \RedisArray) {
+            $byHost = [];
+
+            foreach ($ids as $id) {
+                $host = $redis->_target($id);
+                $byHost[\is_string($host) ? $host : ''][] = $id;
+            }
+
+            // a key no node is found for: the array is left to refuse it
+            if (!isset($byHost[''])) {
+                $batches = [];
+
+                foreach ((array) $redis->_hosts() as $host) {
+                    if (\is_string($host) && isset($byHost[$host])) {
+                        $node = $redis->_instance($host);
+                        $batches[] = [$node instanceof \Redis ? $node : [], $byHost[$host]];
+                        unset($byHost[$host]);
+                    }
+                }
+
+                // a host the array does not list goes last, through the array
+                foreach ($byHost as $keys) {
+                    $batches[] = [[], $keys];
+                }
+            }
         }
 
-        return true;
+        $ok = true;
+
+        foreach ($batches as [$node, $keys]) {
+            try {
+                $answer = $this->send($redis instanceof \RedisArray ? $node : $redis, static fn (): mixed => $redis->unlink($keys));
+            } catch (\Exception $e) {
+                CacheItem::log($this->logger, 'Failed to delete items: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+
+                return false;
+            }
+
+            // a cluster answers false for an error reply
+            $ok = false !== $answer && $ok;
+        }
+
+        return $ok;
     }
 
     /**
@@ -2836,17 +2931,221 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private function rulesNode(): \Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster
     {
+        return $this->clientFor($this->rulesKey);
+    }
+
+    /**
+     * The connection a command naming $key goes out on: the client itself, or
+     * the node of an array that owns the key.
+     */
+    private function clientFor(string $key): \Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster
+    {
         if (!$this->redis instanceof \RedisArray) {
             return $this->redis;
         }
 
-        return $this->ownerOf($this->rulesKey) ?? throw new CacheException(\sprintf('No node of the array owns "%s".', $this->rulesKey));
+        return $this->ownerOf($key) ?? throw new CacheException(\sprintf('No node of the array owns "%s".', $key));
+    }
+
+    /**
+     * Runs $call, a command or a pipeline, and answers what it answers. What a
+     * phpredis client throws goes to failed() for the connection it went out
+     * on ($connections: the client, or the node of an array the call went to;
+     * none where that node is not known), and is then thrown on; $waitedOut
+     * says whether the failure waited out the read timeout. $leavesLateReply
+     * marks a command that on a cluster may leave a late reply when it fails:
+     * a raw command, and one sent to a given node (SCAN, TIME).
+     *
+     * @template T
+     *
+     * @param \Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster|list<\Redis> $connections
+     * @param \Closure(): T                                                 $call
+     *
+     * @param-out bool $waitedOut
+     *
+     * @return T
+     */
+    private function send(\Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster|array $connections, \Closure $call, bool $leavesLateReply = false, ?bool &$waitedOut = null): mixed
+    {
+        $waitedOut = false;
+        $startedAt = hrtime(true);
+
+        try {
+            return $call();
+        } catch (\RedisException|\RedisClusterException $e) {
+            $elapsedNs = hrtime(true) - $startedAt;
+
+            foreach (\is_array($connections) ? $connections : [$connections] as $connection) {
+                $waitedOut = $this->failed($connection, $e, $elapsedNs, $leavesLateReply) || $waitedOut;
+            }
+
+            throw $e;
+        }
+    }
+
+    /**
+     * After a command failed on the wire: the one place a connection is
+     * closed. Answers whether the failure waited out the read timeout.
+     *
+     * phpredis 6.3 keeps the socket open after some failures, then reads the
+     * reply that comes late as the next command's answer, and every reply
+     * after it one command late, until the socket closes. On a single node
+     * that follows a raw command, a typed EVAL or EVALSHA, a SCAN, any reply
+     * cut short, and a pipeline that did not go out whole, for which exec()
+     * answers false without throwing ($e is null then). On a cluster it
+     * follows a raw command, a command sent to a given node (SCAN, TIME) and
+     * a reply cut short, which throws a \RedisException there too. Later
+     * phpredis releases close the socket themselves. So the connection is
+     * closed, and the client opens a new one for its next command. Not
+     * otherwise:
+     *
+     * - A typed cluster command that fails throws a RedisClusterException
+     *   after phpredis has closed that node's socket itself. Closing the whole
+     *   client would open every node again, and phpredis 6.3 does not send
+     *   READONLY to a replica it opens again: the reads a cluster sends to
+     *   its replicas would then fail, each after the client's timeouts.
+     * - An error reply that phpredis throws on a single node (OOM, READONLY,
+     *   LOADING, BUSY, NOPERM) was read to its end, and is the client's last
+     *   error word for word. But a failure that also waited out the read
+     *   timeout, or that follows another exception, may have left a reply
+     *   behind: a pipeline whose first reply timed out and whose later ones
+     *   were error replies.
+     * - A \Redis whose socket is already closed is left alone: its close()
+     *   would connect again first, only to close.
+     *
+     * The rule after a failure: what follows is what follows without the
+     * close, on the new connection. A pipeline of guarded writes that failed
+     * quickly is sent again once, one call at a time with new epochs, and so
+     * is a cluster pipeline; an EVALSHA that failed quickly is followed by an
+     * EVAL. After a failure that waited out the read timeout the adapter
+     * sends nothing of that batch again, because a node that did not answer
+     * would keep every second try waiting as long: no second try, no EVAL.
+     * Symfony makes its own retries item by item, as with any adapter.
+     */
+    private function failed(object $client, ?\Throwable $e, int|float $elapsedNs, bool $leavesLateReply = false): bool
+    {
+        // Relay's clients throw exceptions of their own and never get here
+        if (!$client instanceof \Redis && !$client instanceof \RedisCluster) {
+            return false;
+        }
+
+        $waitedOut = self::waitedOut($client, $elapsedNs);
+
+        $close = match (true) {
+            null === $e => true,
+            $client instanceof \RedisCluster => $e instanceof \RedisException || $leavesLateReply,
+            default => $waitedOut || null !== $e->getPrevious() || !self::isErrorReply($client, $e),
+        };
+
+        if (!$close) {
+            return $waitedOut;
+        }
+
+        self::disconnect($client);
+
+        // phpredis 6.3 sends no READONLY to a replica it opens again, so the
+        // reads a cluster sends to its replicas alone (failover=slaves) fail
+        // from now on, each after the client's timeouts, until the client is
+        // made again; the writes go to the primaries and are not touched.
+        // Where reads may also go to the primary (failover=distribute), the
+        // replica's redirect is followed
+        if ($client instanceof \RedisCluster
+            && version_compare((string) phpversion('redis'), '6.4.0RC1', '<')
+            && \RedisCluster::FAILOVER_DISTRIBUTE_SLAVES === self::slaveFailover($client)
+        ) {
+            $this->warnOnce('replicas', 'Closed the connection to the cluster after a failed command: phpredis {version} does not send READONLY again when it reconnects to a replica, so the reads sent to the replicas fail from now on, until the client is created again.', ['version' => phpversion('redis'), 'cache-adapter' => get_debug_type($this)]);
+        }
+
+        return $waitedOut;
+    }
+
+    /**
+     * Whether what a phpredis client threw is an error reply of the server:
+     * then the message is the reply, kept as the client's last error. phpredis
+     * keeps only error replies and connect errors as the last error, and
+     * throws its own words for a timeout, a reset or a closed socket, so an
+     * error left from an earlier command is never taken for one of those.
+     */
+    private static function isErrorReply(\Redis $client, \Throwable $e): bool
+    {
+        try {
+            $last = $client->getLastError();
+        } catch (\Throwable) {
+            return false;
+        }
+
+        return \is_string($last) && '' !== $last && $last === $e->getMessage();
+    }
+
+    /**
+     * Closes $client's connection, dropping a pipeline it holds open first.
+     * phpredis's close() and discard() on a \Redis whose socket is already
+     * closed first connect it again (and AUTH and SELECT) only to close it,
+     * so such a client is left as it is: it has no socket to be out of step.
+     * RedisCluster::close() never connects.
+     */
+    private static function disconnect(\Redis|\RedisCluster $client): void
+    {
+        try {
+            if ($client instanceof \Redis && !$client->isConnected()) {
+                return;
+            }
+
+            // a pipeline left open would take the next command into it
+            if (\Redis::ATOMIC !== $client->getMode()) {
+                $client->discard();
+            }
+
+            $client->close();
+        } catch (\Throwable) {
+            // nothing else to try: the next command finds out
+        }
+    }
+
+    private static function slaveFailover(\RedisCluster $client): mixed
+    {
+        try {
+            return $client->getOption(\RedisCluster::OPT_SLAVE_FAILOVER);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Whether a tombstone was refused because the key holds a value of
+     * another type: both of its hash commands answered false, and the key's
+     * type, asked once, is neither a hash nor absent. Both commands answer
+     * false for any error reply a cluster gives for them (READONLY, LOADING,
+     * NOPERM...), so the answers alone prove nothing. A server out of memory
+     * refuses only the epoch and still runs the HDEL, and a batch that was not
+     * answered answers null.
+     */
+    private function holdsAnotherType(string $id, mixed $epochSet, mixed $dataDropped): bool
+    {
+        if (false !== $epochSet || false !== $dataDropped) {
+            return false;
+        }
+
+        try {
+            $client = $this->clientFor($id);
+            $type = $this->send($client, static fn (): mixed => $client->type($id));
+        } catch (\Exception) {
+            return false;
+        }
+
+        // phpredis answers a constant, Relay may answer the type's name
+        if (\is_int($type)) {
+            return !\in_array($type, [\Redis::REDIS_NOT_FOUND, \Redis::REDIS_HASH], true);
+        }
+
+        return \is_string($type) && !\in_array($type, ['none', 'hash'], true);
     }
 
     /**
      * Runs [method, ...arguments] calls through one round trip where the
      * connection allows it, and one at a time where it does not. The answers
-     * come back in the order of the calls.
+     * come back in the order of the calls; null where nothing was answered
+     * and nothing is to be sent again because of it.
      *
      * @param list<array{0: string, ...}> $calls
      *
@@ -2854,36 +3153,47 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private function pipeline(array $calls): array
     {
-        if ($this->redis instanceof \RedisArray) {
-            // no raw command of its own, and nothing to pipeline across nodes:
-            // every call goes to whichever node owns the key it names
+        $redis = $this->redis;
+
+        if ($redis instanceof \RedisArray) {
+            // nothing to pipeline across nodes: every call goes to the node
+            // that owns the key it names, and a failure is put down to that node
             $results = [];
 
             foreach ($calls as $call) {
                 $method = array_shift($call);
 
-                // a script runs on the node that owns its key, the first argument
+                // a script runs on the node that owns its key, the first of its
+                // arguments
                 if ('evalSha' === $method || 'eval' === $method) {
-                    $results[] = $this->scriptOnOwningNode($method, $call);
+                    // [script or sha1, [key, ...arguments], 1]
+                    $script = \is_string($call[0] ?? null) ? $call[0] : '';
+                    $arguments = \is_array($call[1] ?? null) ? $call[1] : [];
+                    $node = $this->ownerOf(\is_string($arguments[0] ?? null) ? $arguments[0] : '');
+                    $results[] = null !== $node ? $this->send($node, static fn (): mixed => 'eval' === $method ? $node->eval($script, $arguments, 1) : $node->evalsha($script, $arguments, 1)) : false;
 
                     continue;
                 }
 
-                if ('rawCommand' !== $method) {
-                    $results[] = $this->redis->{$method}(...$call);
+                // [key, command, ...]: the array has no raw command of its own,
+                // so the node the key names is asked
+                if ('rawCommand' === $method) {
+                    $arguments = [];
+
+                    foreach ($call as $argument) {
+                        $arguments[] = \is_scalar($argument) ? (string) $argument : '';
+                    }
+
+                    $node = $this->ownerOf(array_shift($arguments) ?? '');
+                    $results[] = null !== $node ? $this->send($node, static fn (): mixed => $node->rawCommand(...$arguments)) : false;
 
                     continue;
                 }
 
-                $arguments = [];
-
-                foreach ($call as $argument) {
-                    $arguments[] = \is_scalar($argument) ? (string) $argument : '';
-                }
-
-                // [key, command, ...]: the key is what says which node to ask
-                $key = array_shift($arguments) ?? '';
-                $results[] = $this->onOwningNode($key, ...$arguments);
+                // any other call goes through the array, which routes it by its key
+                $key = $call[0] ?? null;
+                $node = \is_string($key) ? $this->ownerOf($key) : null;
+                $results[] = $this->send($node ?? [], static fn (): mixed => $redis->{$method}(...$call));
             }
 
             return $results;
@@ -2891,31 +3201,38 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
         // phpredis pipelines across a cluster's slots where it has cluster
         // pipelines at all, which a release with pipeline() does
-        if ($this->redis instanceof \RedisCluster && method_exists($this->redis, 'pipeline')) {
-            return $this->clusterPipeline($this->redis, $calls);
+        if ($redis instanceof \RedisCluster && method_exists($redis, 'pipeline')) {
+            return $this->clusterPipeline($redis, $calls);
         }
 
-        // a single node speaks pipelining; a cluster, or a connection that
-        // simply declines, gets one command at a time
-        $pipe = null;
-
-        if ($this->redis instanceof \Redis) {
-            $pipe = $this->redis->multi(\Redis::PIPELINE);
-        } elseif ($this->redis instanceof \Relay\Relay) {
-            $pipe = $this->redis->multi(\Relay\Relay::PIPELINE);
-        }
-
-        if (!\is_object($pipe)) {
+        // a single node speaks pipelining; a cluster gets one command at a time
+        if (!$redis instanceof \Redis && !$redis instanceof \Relay\Relay) {
             return $this->oneAtATime($calls);
         }
 
-        foreach ($calls as $call) {
-            $method = array_shift($call);
-            $pipe->{$method}(...$call);
-        }
+        $waitedOut = false;
+        // whether exec() went out: before it, nothing was sent
+        $sent = false;
+        $startedAt = hrtime(true);
 
         try {
-            $results = $pipe->exec();
+            $answer = $this->send($redis, static function () use ($redis, $calls, &$sent): ?array {
+                $pipe = $redis instanceof \Redis ? $redis->multi(\Redis::PIPELINE) : $redis->multi(\Relay\Relay::PIPELINE);
+
+                // a connection that declines: one command at a time
+                if (!\is_object($pipe)) {
+                    return null;
+                }
+
+                foreach ($calls as $call) {
+                    $method = array_shift($call);
+                    $pipe->{$method}(...$call);
+                }
+
+                $sent = true;
+
+                return [$pipe->exec()];
+            }, false, $waitedOut);
         } catch (\Exception $e) {
             // a client may throw on a script the server does not hold, instead
             // of answering false in its slot. Then the batch is sent again one
@@ -2925,17 +3242,29 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             // guarded write that was stored the first time is refused the
             // second time, because the item now holds its new epoch: it is
             // reported as failed though the value is stored, which is the safe
-            // direction
-            if (!self::sends($calls, 'evalSha')) {
+            // direction. Not after a failure that waited out the read timeout
+            // (see failed()), nor where the batch never went out: a connect
+            // that failed would fail once more for every call
+            if (!$sent || $waitedOut || !self::sends($calls, 'evalSha')) {
                 throw $e;
             }
 
             return $this->oneAtATime($this->freshEpochs($calls));
         }
 
+        if (null === $answer) {
+            return $this->oneAtATime($calls);
+        }
+
+        $results = $answer[0];
+
         if (!\is_array($results) || \count($results) !== \count($calls)) {
-            // the connection went away under the batch: every call failed
-            return array_fill(0, \count($calls), false);
+            // the batch did not go out whole, or the connection went away
+            // under it: nothing was answered, and nothing is sent again or
+            // unlinked because of it
+            $this->failed($redis, null, hrtime(true) - $startedAt);
+
+            return array_fill(0, \count($calls), null);
         }
 
         return array_values($results);
@@ -2943,7 +3272,9 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
     /**
      * Runs [method, ...arguments] calls one round trip each, the answers in
-     * the order of the calls.
+     * the order of the calls. A call that throws ends the batch, but for an
+     * EVALSHA that failed quickly: it answers false, and the script is sent
+     * again as a body (see failed()).
      *
      * @param list<array{0: string, ...}> $calls
      *
@@ -2951,17 +3282,21 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      */
     private function oneAtATime(array $calls): array
     {
+        // pipeline() sends an array's calls node by node itself
+        $redis = $this->redis;
+        \assert(!$redis instanceof \RedisArray);
         $results = [];
 
         foreach ($calls as $call) {
             $method = array_shift($call);
+            $waitedOut = false;
 
             try {
-                $results[] = $this->redis->{$method}(...$call);
+                $results[] = $this->send($redis, static fn (): mixed => $redis->{$method}(...$call), 'rawCommand' === $method, $waitedOut);
             } catch (\Exception $e) {
                 // Relay throws where phpredis answers false: a script the
                 // node does not hold is sent again with its full body
-                if ('evalSha' !== $method) {
+                if ($waitedOut || 'evalSha' !== $method) {
                     throw $e;
                 }
 
@@ -2990,8 +3325,8 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
 
     /**
      * One pipeline across the slots of a cluster, answered in the order of the
-     * calls. An answer that is no list, or not one per call, means every call
-     * failed, as on a single node.
+     * calls. An answer that is no list, or not one per call, means nothing was
+     * answered: null for every call, as on a single node.
      *
      * A pipeline that throws, while its calls are queued or in exec(), is sent
      * again one command at a time, as a cluster without pipelines sends it.
@@ -3003,13 +3338,16 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * adapter's own writes are raw only where the client has no hsetex()
      * (see writesTyped()), which every phpredis with cluster pipelines has;
      * the refusal is still handled, for a client that pipelines without it.
+     * Nothing has gone out while the calls are queued, and a refusal or a
+     * redirect is a whole reply, so neither closes the connection; a reply
+     * cut short does (see failed()).
      *
      * A batch sent again gets new epochs (see freshEpochs()): exec() may throw
      * after some of its calls ran. It is not sent again when exec() took the
-     * client's read timeout: a node that did not answer within it would keep
-     * each single command waiting as long again. Then every call is answered
-     * null, not false, so that nothing is sent again because of it: no script
-     * as a body, no unlink. A read timeout of 0 sets no such limit.
+     * client's read timeout (see waitedOut()): a node that did not answer
+     * within it would keep each single command waiting as long again. Then
+     * every call is answered null, not false, so that nothing is sent again
+     * because of it: no script as a body, no unlink.
      *
      * @param list<array{0: string, ...}> $calls
      *
@@ -3023,8 +3361,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             return $this->oneAtATime($calls);
         }
 
+        // a pipeline refused, or an answer that is no list or not one per
+        // call: nothing was answered
         if (false === $redis->multi(\Redis::PIPELINE)) {
-            return array_fill(0, \count($calls), false);
+            return array_fill(0, \count($calls), null);
         }
 
         // the call being queued, and when exec() began: null until it does
@@ -3058,8 +3398,13 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
                 return $this->oneAtATime($this->freshEpochs($calls));
             }
 
+            $elapsedNs = hrtime(true) - $sentAt;
+            $waitedOut = $e instanceof \RedisException || $e instanceof \RedisClusterException
+                ? $this->failed($redis, $e, $elapsedNs)
+                : self::waitedOut($redis, $elapsedNs);
+
             // no answer at all: null, which the callers tell from false
-            if (self::waitedOut($redis, hrtime(true) - $sentAt)) {
+            if ($waitedOut) {
                 CacheItem::log($this->logger, 'A cluster pipeline failed after the read timeout and was not sent again: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
 
                 return array_fill(0, \count($calls), null);
@@ -3069,7 +3414,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         }
 
         if (!\is_array($results) || \count($results) !== \count($calls)) {
-            return array_fill(0, \count($calls), false);
+            return array_fill(0, \count($calls), null);
         }
 
         return array_values($results);
@@ -3092,18 +3437,31 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
     }
 
     /**
-     * Whether a failed exec() lasted the client's read timeout. A timeout of
-     * 0, or one that cannot be read, sets no limit.
+     * Whether a failed command lasted the client's read timeout, give or take
+     * TIMEOUT_SHARE. A read timeout of 0 is not "no limit": phpredis then waits
+     * as long as PHP's default_socket_timeout, and only a negative one of
+     * those waits for ever. A timeout that cannot be read sets no limit.
+     *
+     * The timeout is the one the client reports. On phpredis 6.3,
+     * RedisCluster::setOption(OPT_READ_TIMEOUT) changes that report and not
+     * the sockets already open, so a cluster told a longer timeout after it
+     * connected waits less than it reports, and such a failure is not counted.
      */
-    private static function waitedOut(\RedisCluster $redis, int|float $elapsedNs): bool
+    private static function waitedOut(\Redis|\RedisCluster $client, int|float $elapsedNs): bool
     {
         try {
-            $timeout = $redis->getOption(\Redis::OPT_READ_TIMEOUT);
+            $timeout = $client->getOption(\Redis::OPT_READ_TIMEOUT);
         } catch (\Throwable) {
             return false;
         }
 
-        return is_numeric($timeout) && 0 < (float) $timeout && $elapsedNs >= (float) $timeout * 1e9;
+        $seconds = is_numeric($timeout) ? (float) $timeout : 0.0;
+
+        if (0.0 >= $seconds) {
+            $seconds = (float) \ini_get('default_socket_timeout');
+        }
+
+        return 0.0 < $seconds && $elapsedNs >= self::TIMEOUT_SHARE * $seconds * 1e9;
     }
 
     /**
@@ -3146,34 +3504,6 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         }
 
         return $calls;
-    }
-
-    /**
-     * Runs a script on the node of a RedisArray that owns its key: [script or
-     * sha1, [key, ...arguments], 1].
-     *
-     * @param array<mixed> $call
-     */
-    private function scriptOnOwningNode(string $method, array $call): mixed
-    {
-        \assert($this->redis instanceof \RedisArray);
-
-        $arguments = $call[1] ?? null;
-        $key = \is_array($arguments) && \is_string($arguments[0] ?? null) ? $arguments[0] : '';
-        $node = $this->ownerOf($key);
-
-        return null !== $node ? $node->{$method}(...$call) : false;
-    }
-
-    /**
-     * Sends one raw command to the node of a RedisArray that owns the key,
-     * the array itself having no rawCommand() to route for us.
-     */
-    private function onOwningNode(string $key, string ...$arguments): mixed
-    {
-        $node = $this->ownerOf($key);
-
-        return null !== $node ? $node->rawCommand(...$arguments) : false;
     }
 
     /**

@@ -53,6 +53,20 @@ once a read of the same slot has gone to a replica. Relay's cluster client is
 given the same typed calls; CI runs Relay against three masters, but not
 reading from replicas, so that path is untested.
 
+phpredis 6.3 does not send `READONLY` again when it opens a replica's socket
+anew. The adapter closes a cluster connection only where a late reply may be
+left on it: after a `SCAN` or a `TIME` that failed, or a reply cut short (see
+[Timeouts and lost connections](#timeouts-and-lost-connections)); a typed
+command that fails, a read or a write that timed out, has its node's socket
+closed by phpredis alone and touches no replica. After such a close, every
+read `failover=slaves` sends to a replica fails, after the client's timeout
+plus its read timeout (2.5 s with `timeout=1&read_timeout=1.5`), until the
+client is made again: under PHP-FPM, for the rest of the request. Those reads
+are misses, never a wrong value, and the writes, which go to the primaries,
+carry on; the adapter logs it once per pool. With `failover=distribute` the
+replica's redirect is followed and the reads go on. Later phpredis releases
+send `READONLY` again.
+
 ## Clients: standalone, cluster, `RedisArray`, key prefix, Relay
 
 **The setup.** Every command the adapter issues names a single key but three:
@@ -120,16 +134,96 @@ node that owns the bare key.
   direction. A pipeline that failed only after the client's read timeout is
   not sent again: every call of it failed, at the cost of one timeout.
   Symfony then tries a failed delete once more key by key, a timeout for each
-  key on that master. That needs a read timeout: with `read_timeout=0`,
-  Symfony's default, a failed pipeline is always sent again, and a node that
-  does not answer is waited for twice. With `failover=slaves`, phpredis sends
-  a pipeline's reads to the primaries.
+  key on that master (see
+  [Timeouts and lost connections](#timeouts-and-lost-connections)). With
+  `read_timeout=0`, Symfony's default, the limit is PHP's
+  `default_socket_timeout`. With `failover=slaves`, phpredis sends a
+  pipeline's reads to the primaries.
   `ClusterPipelineTest` pins that path. Without cluster pipelines, a cluster
   gets one command per round trip.
 
 So the adapter runs on a single node, a cluster, an array and through Relay,
 with or without a client-side prefix, and CI covers every one of those legs
 (see [Requirements](../README.md#requirements)).
+
+## Timeouts and lost connections
+
+**The setup.** A command that does not get its reply within the client's read
+timeout throws. phpredis 6.3 then keeps the socket open after some failures:
+on a single node after a raw command, a typed `EVAL` or `EVALSHA`, a `SCAN`,
+any reply cut short, and a pipeline that did not go out whole (its `exec()`
+answers false without throwing); on a cluster after a raw command by key, a
+command sent to a given node (`SCAN`, `TIME`) and a reply cut short. The
+reply that comes late is read as the next command's answer, and every reply
+after it one command late, without an error, until the socket closes.
+phpredis releases after 6.3 close the socket themselves.
+
+**The question.** After a command that timed out, can a read answer with
+another key's value, or a delete lose its tombstone?
+
+**Example.** A worker's guarded write of `a` waits out its read timeout of
+0.3 s, and Redis answers 0.5 s later. Its next read, of `b`, gets the write's
+late reply, a miss, and leaves `b`'s own reply on the socket; its read of `c`
+then gets `b`'s value, as a hit, and every read after it the value of the key
+read before.
+
+| | after a command that failed on the wire |
+|---|---|
+| phpredis 6.3, socket kept | every later answer one command late: other keys' values served as hits, tombstones unlinked on answers meant for other commands |
+| **this adapter** | the connection closed where a late reply may be left; the client opens a new one for its next command |
+
+**How it works.** Every command the adapter sends goes through one place, and
+when a phpredis client throws there, the connection is closed where a late
+reply may be left on it:
+
+- On a single node, after any failure but an error reply of the server
+  (`OOM`, `READONLY`, `LOADING`, `BUSY`, `NOPERM`) that phpredis raises: that
+  reply was read to its end, and phpredis keeps it as the last error, word for
+  word, which a timeout, a reset or a closed socket never is. But an error
+  reply that also waited out the read timeout, or follows another exception,
+  may have left a reply behind (a pipeline whose first reply timed out and
+  whose later ones were errors), and closes the connection too.
+- On a cluster, after a `SCAN` or a `TIME` sent to a node, a raw command, or a
+  reply cut short. A typed command that fails has its node's socket closed by
+  phpredis itself; closing the client as well would open every node again,
+  and with phpredis 6.3 the replicas would not be read again (see
+  [Replicas](#replicas)). One gap is left on phpredis 6.3: while a slot is
+  being moved, a typed command whose `ASKING` times out throws "Can't
+  communicate with any node in the cluster" with that node's socket still
+  open and the late `+OK` on it, which the adapter does not handle; later
+  phpredis releases close that socket themselves.
+- On an array, each node is a single node of its own. An unlink across nodes
+  goes to each node on its own, in the order the array would send them, so a
+  failure closes only the node whose command failed.
+- A `\Redis` whose socket is already closed is left alone, as its `close()`
+  would connect again first, only to close.
+
+A connection is closed for every user of the client: a pipeline or a `MULTI`
+that other code holds open on it is dropped with it, as the closed socket
+would drop it anyway.
+
+**The rule after a failure.** What follows is what follows without the close,
+on the new connection. On a single node, a pipeline holding a guarded write
+that failed quickly is sent again once, one call at a time with new epochs; a
+cluster pipeline that failed quickly is sent again one command at a time; an
+`EVALSHA` that failed quickly is followed by an `EVAL`. Nothing is sent again
+after a failure that waited out the read timeout, since a node that did not
+answer would keep every second try waiting as long, nor where the batch never
+went out (a connect that failed) or was not answered at all (a pipeline that
+did not go out whole): no second try, no `EVAL`, and no unlink in place of a
+tombstone. Symfony still makes its own retries item by item, as it does with
+any adapter, and each of those waits for a node that does not answer. On
+phpredis 6.3 a pipeline also waits the read timeout once per queued reply
+inside `exec()`.
+
+A read timeout of 0 is not "no limit": phpredis then waits PHP's
+`default_socket_timeout`, a minute by default, and a failure counts from 95 %
+of that. On phpredis 6.3, `RedisCluster::setOption(OPT_READ_TIMEOUT)` changes
+the timeout the client reports, not the sockets it has open.
+
+Relay's clients throw exceptions of their own, so the adapter closes none of
+their connections. A pipeline of theirs that was not answered is treated as
+any other: nothing is unlinked and no script body follows.
 
 ## The hash encoding: memory per item
 

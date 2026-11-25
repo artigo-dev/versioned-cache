@@ -198,6 +198,61 @@ final class RedisArrayTest extends TestCase
     }
 
     /**
+     * An unlink across nodes goes to each node on its own, so a node that
+     * fails is the only one closed: the node that answered keeps its
+     * connection, and its key is deleted. Like the array, the adapter stops
+     * at the first node that fails: a node after it gets only Symfony's retry
+     * of its keys, a node before it the unlink and the retry.
+     */
+    public function testAFailedUnlinkClosesOnlyTheNodeThatFailed(): void
+    {
+        $parts = parse_url(Connection::dsn());
+
+        if (!\is_array($parts) || 'redis' !== ($parts['scheme'] ?? null) || !isset($parts['host']) || isset($parts['query']) || isset($parts['pass'])) {
+            self::markTestSkipped(\sprintf('An array needs a plain single-node DSN, "%s" given.', Connection::dsn()));
+        }
+
+        $healthy = $parts['host'].':'.($parts['port'] ?? 6379);
+
+        // the same server on a port nothing listens on: every call to it fails at once
+        $dead = $parts['host'].':1';
+
+        foreach ([[[$healthy, $dead], 2], [[$dead, $healthy], 1]] as [$hosts, $unlinks]) {
+            $array = new \RedisArray($hosts, [
+                'lazy_connect' => true,
+                'connect_timeout' => 1.0,
+                'distributor' => static fn (string $key): int => (int) (str_contains($key, 'dead') === ($dead === $hosts[1])),
+            ]);
+            $node = $array->_instance($healthy);
+            self::assertInstanceOf(\Redis::class, $node);
+            self::assertTrue($node->select((int) trim($parts['path'] ?? '', '/')));
+
+            // the distributor looks for "dead" in the key, which random hex can spell
+            do {
+                $namespace = 'array'.bin2hex(random_bytes(3));
+            } while (str_contains($namespace, 'dead'));
+
+            $this->namespaces[] = $namespace;
+            $pool = new VersionedRedisTagAwareAdapter($array, $namespace, rulesCacheMs: 0, rulesCache: false, guardWindowSeconds: 0);
+            self::assertTrue($pool->save($pool->getItem('k')->set('v')));
+            $client = $node->client('id');
+            $commands = self::commandsOf($node);
+
+            self::assertFalse($pool->deleteItems(['k', 'dead']));
+            $after = self::commandsOf($node);
+            self::assertSame($client, $node->client('id'), 'the node that answered was not closed');
+
+            // a server too old to count a connection's commands is not asked;
+            // the first count was a command too
+            if (null !== $commands) {
+                self::assertSame($commands + 1 + $unlinks, $after, \sprintf('%d unlink(s) on %s', $unlinks, implode(', ', $hosts)));
+            }
+
+            self::assertFalse($pool->getItem('k')->isHit());
+        }
+    }
+
+    /**
      * How many keys match $pattern on each node, as the server names them.
      *
      * @return array<string, int> host => keys
@@ -212,6 +267,17 @@ final class RedisArrayTest extends TestCase
         }
 
         return $counts;
+    }
+
+    /**
+     * How many commands the server ran for this connection before this one,
+     * or null where it does not count them.
+     */
+    private static function commandsOf(\Redis $node): ?int
+    {
+        $info = $node->client('info');
+
+        return \is_array($info) && \is_int($info['tot-cmds'] ?? null) ? $info['tot-cmds'] : null;
     }
 
     private function pool(\RedisArray $array, string $namespace): VersionedRedisTagAwareAdapter
