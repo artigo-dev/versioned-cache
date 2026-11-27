@@ -350,6 +350,7 @@ final class RuleSetReloadTest extends TestCase
         $pool->getItem('witness');
 
         self::assertSame(1, $logger->lost, 'the loss is logged');
+        self::assertSame([LogLevel::WARNING], $logger->levels, 'as a warning: the stream kept some rules and lost others');
 
         $pool->getItem('witness');
 
@@ -369,6 +370,7 @@ final class RuleSetReloadTest extends TestCase
         $pool->getItem('witness');
 
         self::assertSame(1, $logger->lost);
+        self::assertSame([LogLevel::INFO], $logger->levels, 'as a note: a restart without persistence leaves an empty stream');
     }
 
     public function testAClearElsewhereIsNotLoggedAsALoss(): void
@@ -1878,16 +1880,20 @@ final class ReadingLogger extends AbstractLogger
 }
 
 /**
- * Counts the warnings that say the stream lost rules.
+ * Counts the lines that say the stream lost rules, and keeps their levels.
  */
 final class LostRulesLogger extends AbstractLogger
 {
     public int $lost = 0;
 
+    /** @var list<string> */
+    public array $levels = [];
+
     public function log($level, string|\Stringable $message, array $context = []): void
     {
-        if (LogLevel::WARNING === $level && str_contains((string) $message, 'lost rules this server had read')) {
+        if (str_contains((string) $message, 'lost rules this server had read')) {
             ++$this->lost;
+            $this->levels[] = \is_string($level) ? $level : get_debug_type($level);
         }
     }
 }

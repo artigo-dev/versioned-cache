@@ -13,6 +13,7 @@ namespace Artigo\Cache\Adapter;
 
 use Psr\Cache\CacheItemPoolInterface;
 use Psr\Log\LoggerInterface;
+use Psr\Log\LogLevel;
 use Symfony\Component\Cache\Adapter\AbstractTagAwareAdapter;
 use Symfony\Component\Cache\CacheItem;
 use Symfony\Component\Cache\Exception\CacheException;
@@ -528,7 +529,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      * What a reload in progress has to log, logged when it is over (see
      * report()); null while this worker is not reloading.
      *
-     * @var list<array{bool, string, array<string, mixed>}>|null
+     * @var list<array{bool, string, array<string, mixed>, string}>|null
      */
     private ?array $heldBack = null;
 
@@ -2116,15 +2117,15 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             $heldBack = $this->heldBack ?? [];
             $this->heldBack = null;
 
-            foreach ($heldBack as [$failure, $message, $context]) {
-                $this->report($failure, $message, $context);
+            foreach ($heldBack as [$failure, $message, $context, $level]) {
+                $this->report($failure, $message, $context, $level);
             }
         }
     }
 
     /**
      * Logs a failure (as CacheItem::log() does, so without a logger it raises
-     * a warning) or a plain warning - but not while this worker reloads the
+     * a warning) or a plain line at $level - but not while this worker reloads the
      * rules: then it is kept and logged when the reload is over. A logger may
      * take its time (a handler that sends the record somewhere) or read this
      * pool. Inside the reload, the first would keep the flag, and every
@@ -2134,10 +2135,10 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
      *
      * @param array<string, mixed> $context
      */
-    private function report(bool $failure, string $message, array $context): void
+    private function report(bool $failure, string $message, array $context, string $level = LogLevel::WARNING): void
     {
         if (null !== $this->heldBack) {
-            $this->heldBack[] = [$failure, $message, $context];
+            $this->heldBack[] = [$failure, $message, $context, $level];
 
             return;
         }
@@ -2145,7 +2146,7 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
         if ($failure) {
             CacheItem::log($this->logger, $message, $context);
         } else {
-            $this->logger?->warning($message, $context);
+            $this->logger?->log($level, $message, $context);
         }
     }
 
@@ -2225,15 +2226,20 @@ final class VersionedRedisTagAwareAdapter extends AbstractTagAwareAdapter implem
             // or when it did not move the copy forward
         } while ($restart || (self::RULES_BATCH <= \count($entries) && $rules->last() !== $from));
 
-        // a loss, not a trim (see InvalidationRules::lost()): one warning -
+        // a loss, not a trim (see InvalidationRules::lost()): one line -
         // only the reloading worker reads the stream, and the next reload
-        // finds it intact; without a logger nothing at all
+        // finds it intact; without a logger nothing at all. An empty stream
+        // is what a restart without persistence leaves, the items gone with
+        // it: a note. A stream that kept some rules and lost others is a
+        // warning
         if (null !== $held && $rules->lost($held)) {
+            $empty = InvalidationRules::NONE === $rules->last();
+
             $this->report(false, 'The stream of invalidation rules lost rules this server had read (it held {held}; the stream {now}): a failover to a replica that had not received them, an eviction, a flush, or a restart without persistence. The rules were read again from the start.', [
                 'held' => $held,
-                'now' => InvalidationRules::NONE === $rules->last() ? 'is empty' : 'now ends at '.$rules->last(),
+                'now' => $empty ? 'is empty' : 'now ends at '.$rules->last(),
                 'cache-adapter' => get_debug_type($this),
-            ]);
+            ], $empty ? LogLevel::INFO : LogLevel::WARNING);
         }
 
         return true;
